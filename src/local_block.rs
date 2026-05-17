@@ -152,4 +152,76 @@ mod tests {
         assert_eq!(queue.len(), 1);
         assert_ne!(hash, HashType::default());
     }
+
+    #[test]
+    fn capacity_is_enforced() {
+        let keypair = Keypair::generate();
+        let mut queue = LocalBlock::new(1);
+        let mut first = Block::default();
+        first.body.last_epoch = HashType([1; 32]);
+        first.body.nonce = Nonce::new(1);
+        first.sign(&keypair.secret);
+        let mut second = Block::default();
+        second.body.last_epoch = HashType([1; 32]);
+        second.body.nonce = Nonce::new(2);
+        second.sign(&keypair.secret);
+
+        assert!(queue.enqueue_block(first).is_ok());
+        assert_eq!(
+            queue.enqueue_block(second),
+            Err(BlossomError::BlockQueueFull)
+        );
+    }
+
+    #[test]
+    fn dequeue_drops_stale_blocks() {
+        let keypair = Keypair::generate();
+        let mut queue = LocalBlock::new(2);
+        let mut stale = Block::default();
+        stale.body.last_epoch = HashType([1; 32]);
+        stale.body.nonce = Nonce::new(1);
+        stale.sign(&keypair.secret);
+        queue.enqueue_block(stale).unwrap();
+
+        assert!(matches!(
+            queue.dequeue_block(None, HashType([1; 32]), Nonce::new(2), 0),
+            Ok(None)
+        ));
+        assert!(queue.is_empty());
+    }
+
+    #[test]
+    fn dequeue_keeps_future_blocks() {
+        let keypair = Keypair::generate();
+        let mut queue = LocalBlock::new(2);
+        let mut future = Block::default();
+        future.body.last_epoch = HashType([1; 32]);
+        future.body.nonce = Nonce::new(3);
+        future.sign(&keypair.secret);
+        queue.enqueue_block(future).unwrap();
+
+        assert!(matches!(
+            queue.dequeue_block(None, HashType([1; 32]), Nonce::new(2), 0),
+            Err(BlossomError::InvalidBlockNonce { expected, actual })
+                if expected == Nonce::new(2) && actual == Nonce::new(3)
+        ));
+        assert!(queue.contains_nonce(Nonce::new(3)));
+    }
+
+    #[test]
+    fn dequeue_rejects_wrong_validator() {
+        let keypair = Keypair::generate();
+        let mut queue = LocalBlock::new(2);
+        let mut block = Block::default();
+        block.body.last_epoch = HashType([1; 32]);
+        block.body.nonce = Nonce::new(1);
+        block.sign(&keypair.secret);
+        queue.enqueue_block(block).unwrap();
+
+        assert!(matches!(
+            queue.dequeue_block(Some(PubKey([99; 32])), HashType([1; 32]), Nonce::new(1), 0),
+            Err(BlossomError::UnknownSender)
+        ));
+        assert!(queue.is_empty());
+    }
 }

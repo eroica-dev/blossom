@@ -121,7 +121,7 @@ where
 
 #[cfg(test)]
 mod tests {
-    use tokio::io::duplex;
+    use tokio::io::{AsyncWriteExt, duplex};
 
     use super::*;
 
@@ -135,5 +135,43 @@ mod tests {
         writer.await.unwrap().unwrap();
 
         assert!(matches!(read, WireRequest::NextNonce));
+    }
+
+    #[tokio::test]
+    async fn zero_and_oversized_frames_are_rejected() {
+        let (mut client, mut server) = duplex(16);
+        let writer = tokio::spawn(async move {
+            client.write_u32(0).await.unwrap();
+        });
+
+        assert!(matches!(
+            read_frame::<WireRequest, _>(&mut server).await,
+            Err(BlossomError::InvalidFrameSize(0))
+        ));
+        writer.await.unwrap();
+
+        let (mut client, mut server) = duplex(16);
+        let writer = tokio::spawn(async move {
+            client.write_u32((MAX_FRAME_SIZE + 1) as u32).await.unwrap();
+        });
+        assert!(matches!(
+            read_frame::<WireRequest, _>(&mut server).await,
+            Err(BlossomError::InvalidFrameSize(size)) if size == MAX_FRAME_SIZE + 1
+        ));
+        writer.await.unwrap();
+    }
+
+    #[test]
+    fn response_kind_covers_all_variants() {
+        assert_eq!(WireResponse::Ok.kind(), "ok");
+        assert_eq!(WireResponse::Error("nope".to_string()).kind(), "error");
+        assert_eq!(
+            WireResponse::Health(NodeHealth {
+                status: "ok".to_string(),
+                public_key: crate::PubKey::default()
+            })
+            .kind(),
+            "health"
+        );
     }
 }

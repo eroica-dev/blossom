@@ -107,3 +107,46 @@ pub async fn send_wire_request(
     write_frame(&mut stream, &request).await?;
     read_frame(&mut stream).await
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::crypto::Keypair;
+    use crate::node::NodeIdentity;
+    use crate::runtime::RuntimeConfig;
+
+    fn tcp_node() -> (TcpNode, Keypair) {
+        let keypair = Keypair::generate();
+        let identity = NodeIdentity::new(
+            keypair.public,
+            Some(keypair.secret),
+            "tcp",
+            "127.0.0.1",
+            8080,
+            false,
+        );
+        (
+            TcpNode::new(crate::NodeRuntime::new(RuntimeConfig::new(identity))),
+            keypair,
+        )
+    }
+
+    #[tokio::test]
+    async fn handle_request_returns_health_and_errors() {
+        let (node, keypair) = tcp_node();
+
+        match node.handle_request(WireRequest::Health).await.unwrap() {
+            WireResponse::Health(health) => assert_eq!(health.public_key, keypair.public),
+            response => panic!("expected health, got {}", response.kind()),
+        }
+
+        match node
+            .handle_request(WireRequest::GetBlock(crate::Nonce::new(1)))
+            .await
+            .unwrap_err()
+        {
+            BlossomError::WireProtocol(message) => assert!(message.contains("does not serve")),
+            error => panic!("unexpected error: {error}"),
+        }
+    }
+}

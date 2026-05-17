@@ -407,6 +407,7 @@ pub fn genesis_epoch(nodes: impl IntoIterator<Item = NodeIdentity>) -> Epoch {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::blossom::{BlossomBody, DispatchBody};
     use crate::crypto::Keypair;
 
     fn runtime() -> (NodeRuntime, Keypair) {
@@ -420,6 +421,33 @@ mod tests {
             false,
         );
         (NodeRuntime::new(RuntimeConfig::new(node)), keypair)
+    }
+
+    fn runtime_with_peers() -> (NodeRuntime, Vec<Keypair>, EpochTarget) {
+        let keypairs = (0..6).map(|_| Keypair::generate()).collect::<Vec<_>>();
+        let nodes = keypairs
+            .iter()
+            .enumerate()
+            .map(|(index, keypair)| {
+                NodeIdentity::new(
+                    keypair.public,
+                    (index == 0).then_some(keypair.secret),
+                    "tcp",
+                    "127.0.0.1",
+                    8000 + index as u16,
+                    false,
+                )
+            })
+            .collect::<Vec<_>>();
+        let genesis = genesis_epoch(nodes.clone());
+        let mut config = RuntimeConfig::new(nodes[0].clone());
+        config.genesis = Some(genesis.clone());
+        let runtime = NodeRuntime::new(config);
+        let target = EpochTarget {
+            last_epoch: genesis.hash,
+            nonce: genesis.body.nonce.new_next(),
+        };
+        (runtime, keypairs, target)
     }
 
     #[test]
@@ -468,5 +496,103 @@ mod tests {
         assert_eq!(dispatch.header.nonce, target.nonce);
         assert_eq!(dispatch.body.blocks.len(), 1);
         assert_eq!(runtime.status().unwrap().pending_blocks, 0);
+    }
+
+    #[test]
+    fn status_omits_secret_key_and_registers_consensus_service() {
+        let (runtime, keypair) = runtime();
+        let status = runtime.status().unwrap();
+
+        assert_eq!(status.node.public_key(), keypair.public);
+        assert_eq!(status.node.secret_key, None);
+        assert!(
+            status
+                .services
+                .iter()
+                .any(|service| service.kind == ServiceKind::Consensus
+                    && service.public_key == keypair.public)
+        );
+    }
+
+    #[test]
+    fn submit_block_enforces_registered_block_service_key() {
+        let (runtime, keypair) = runtime();
+        let block_keypair = Keypair::generate();
+        runtime.register_service(Service::new(
+            ServiceKind::Block,
+            block_keypair.public,
+            "tcp",
+            "127.0.0.1",
+            9000,
+        ));
+        let target = runtime.next_epoch_target().unwrap();
+        let mut block = Block::default();
+        block.body.last_epoch = target.last_epoch;
+        block.body.nonce = target.nonce;
+        block.sign(&keypair.secret);
+
+        assert_eq!(
+            runtime.submit_block(block),
+            Err(BlossomError::UnknownSender)
+        );
+    }
+
+    #[test]
+    fn dispatch_without_queued_block_sends_signed_empty_block() {
+        let (runtime, _) = runtime();
+        let target = runtime.next_epoch_target().unwrap();
+
+        let dispatch = runtime.dispatch_local_block(0).unwrap();
+
+        assert_eq!(dispatch.header.nonce, target.nonce);
+        assert_eq!(dispatch.body.blocks.len(), 1);
+        let block = dispatch.body.blocks.values().next().unwrap();
+        assert!(block.is_empty());
+        assert!(block.verify_integrity().is_ok());
+    }
+
+    #[test]
+    fn receive_message_rejects_unknown_sender_and_bad_signature() {
+        let (runtime, keypairs, target) = runtime_with_peers();
+        let unknown = Keypair::generate();
+        let body = DispatchBody::default();
+        let unknown_dispatch = Dispatch {
+            header: Header {
+                sender: unknown.public,
+                last_epoch: target.last_epoch,
+                nonce: target.nonce,
+                round: 0,
+                signature: body
+                    .signature(&NodeIdentity::new(
+                        unknown.public,
+                        Some(unknown.secret),
+                        "tcp",
+                        "127.0.0.1",
+                        9999,
+                        false,
+                    ))
+                    .unwrap(),
+            },
+            body: body.clone(),
+        };
+        assert_eq!(
+            runtime.receive_message(Msg::Dispatch(unknown_dispatch)),
+            Err(BlossomError::UnknownSender)
+        );
+
+        let bad_signature_dispatch = Dispatch {
+            header: Header {
+                sender: keypairs[1].public,
+                last_epoch: target.last_epoch,
+                nonce: target.nonce,
+                round: 0,
+                signature: crate::Signature([1; 64]),
+            },
+            body,
+        };
+        assert_eq!(
+            runtime.receive_message(Msg::Dispatch(bad_signature_dispatch)),
+            Err(BlossomError::SignatureError)
+        );
     }
 }

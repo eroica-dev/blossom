@@ -39,6 +39,31 @@ cargo run --bin blossom-harness -- --nodes 6 --transactions 3
   `Verification`, `Proposal`, `Commit`, `EpochStarted`, `Ok`, and
   `Fail`.
 
+## Unit Coverage
+
+The library unit tests cover expected behavior and failure behavior for:
+
+- hashing, hex/JSON conversion, nonce arithmetic, and ordered map
+  hashing
+- Ed25519 key/signature parsing, serialization, signing, and rejection
+  paths
+- node identity signing and secret-key serialization hygiene
+- service-kind parsing, address-book replacement/removal, and endpoint
+  formatting
+- transaction hashing, block signing, block integrity, and tamper
+  detection
+- deterministic quorum selection, shuffling, supermajority thresholds,
+  message matrices, and quorum queues
+- signature trees, dispatch body verification, message enum conversion,
+  and Blossom body signatures
+- local block queue capacity, duplicate nonce rejection, stale/future
+  nonce behavior, and validator checks
+- epoch advancement, verification/proposal counting, epoch approval, and
+  Merkle-rooted block sets
+- runtime status, block-service key enforcement, empty dispatches, and
+  message rejection paths
+- frame-size rejection, TCP request dispatch, and harness helper behavior
+
 ## Harness
 
 `src/harness.rs` provides:

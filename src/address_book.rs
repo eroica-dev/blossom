@@ -168,4 +168,60 @@ mod tests {
         assert_eq!(book.add(second.clone()), Some(first));
         assert_eq!(book.service(ServiceKind::Block), Some(&second));
     }
+
+    #[test]
+    fn parses_service_kinds_and_rejects_unknown_values() {
+        assert_eq!("block".parse::<ServiceKind>(), Ok(ServiceKind::Block));
+        assert_eq!(
+            "address-book".parse::<ServiceKind>(),
+            Ok(ServiceKind::AddressBook)
+        );
+        assert_eq!(
+            "mystery".parse::<ServiceKind>(),
+            Err(BlossomError::UnknownService("mystery".to_string()))
+        );
+    }
+
+    #[test]
+    fn service_formats_base_url_and_socket_addr() {
+        let service = Service::new(
+            ServiceKind::Engine,
+            PubKey([3; 32]),
+            "tcp",
+            "127.0.0.1",
+            7000,
+        );
+
+        assert_eq!(service.base_url(), "tcp://127.0.0.1:7000");
+        assert_eq!(service.socket_addr(), "127.0.0.1:7000");
+    }
+
+    #[test]
+    fn removes_services_and_returns_sorted_services() {
+        let mut book = AddressBook::new();
+        let consensus = Service::new(
+            ServiceKind::Consensus,
+            PubKey([1; 32]),
+            "tcp",
+            "127.0.0.1",
+            8000,
+        );
+        let block = Service::new(
+            ServiceKind::Block,
+            PubKey([2; 32]),
+            "tcp",
+            "127.0.0.1",
+            9000,
+        );
+        book.add(consensus.clone());
+        book.add(block.clone());
+
+        assert!(book.contains(ServiceKind::Block));
+        assert_eq!(book.len(), 2);
+        assert_eq!(book.remove(ServiceKind::Block), Some(block));
+        assert!(!book.contains(ServiceKind::Block));
+
+        let services = book.into_services();
+        assert_eq!(services, vec![consensus]);
+    }
 }

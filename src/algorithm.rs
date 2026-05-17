@@ -220,4 +220,35 @@ mod tests {
         assert_eq!(quorums.len(), 2);
         assert!(quorums.iter().all(|quorum| quorum.contains(&key(7))));
     }
+
+    #[test]
+    fn empty_or_missing_self_produces_no_quorums() {
+        assert!(
+            select_quorums(Vec::<PubKey>::new(), &key(0), HashType::default(), false).is_empty()
+        );
+        assert!(select_quorums([key(1), key(2)], &key(0), HashType::default(), false).is_empty());
+    }
+
+    #[test]
+    fn deterministic_shuffle_is_reproducible_and_seed_sensitive() {
+        let seed = HashType::hash(b"seed");
+        let mut first = (0..12).collect::<Vec<_>>();
+        let mut second = (0..12).collect::<Vec<_>>();
+        let mut different = (0..12).collect::<Vec<_>>();
+
+        deterministic_shuffle(&mut first, seed);
+        deterministic_shuffle(&mut second, seed);
+        deterministic_shuffle(&mut different, HashType::hash(b"different"));
+
+        assert_eq!(first, second);
+        assert_ne!(first, different);
+    }
+
+    #[test]
+    fn supermajority_matches_two_thirds_plus_one_boundary() {
+        assert_eq!(supermajority_count(1), 1);
+        assert_eq!(supermajority_count(3), 2);
+        assert_eq!(supermajority_count(6), 4);
+        assert_eq!(supermajority_count(7), 5);
+    }
 }

@@ -82,3 +82,38 @@ pub enum NodeType {
     Observer,
     Consort,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn generated_node_can_sign_and_verify() {
+        let node = NodeIdentity::generate("tcp", "127.0.0.1", 8080);
+        let message = b"node-message";
+        let signature = node.sign(message).unwrap();
+
+        assert_eq!(node.protocol, "tcp");
+        assert_eq!(node.host, "127.0.0.1");
+        assert_eq!(node.port, 8080);
+        assert!(NodeIdentity::verify(&signature, message, &node.public_key()).is_ok());
+    }
+
+    #[test]
+    fn missing_secret_key_cannot_sign() {
+        let node = NodeIdentity::new(PubKey([9; 32]), None, "tcp", "localhost", 1, false);
+
+        assert_eq!(node.sign(b"message"), Err(BlossomError::MissingSecretKey));
+    }
+
+    #[test]
+    fn serialization_omits_secret_key() {
+        let node = NodeIdentity::generate("tcp", "localhost", 9000);
+        let json = serde_json::to_string(&node).unwrap();
+        let decoded = serde_json::from_str::<NodeIdentity>(&json).unwrap();
+
+        assert!(!json.contains("secret_key"));
+        assert_eq!(decoded.secret_key, None);
+        assert_eq!(decoded.public_key, node.public_key);
+    }
+}

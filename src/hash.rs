@@ -127,3 +127,66 @@ where
         HashType::hash(&bytes)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::crypto::PubKey;
+
+    #[test]
+    fn hex_display_parse_and_json_round_trip() {
+        let hash = HashType([7; 32]);
+        let encoded = hash.to_string();
+
+        assert_eq!(HashType::try_from_hex(&encoded), Ok(hash));
+        assert_eq!(
+            serde_json::to_string(&hash).unwrap(),
+            format!("\"{encoded}\"")
+        );
+        assert_eq!(
+            serde_json::from_str::<HashType>(&format!("\"{encoded}\"")).unwrap(),
+            hash
+        );
+    }
+
+    #[test]
+    fn invalid_hex_and_length_are_rejected() {
+        assert_eq!(
+            HashType::try_from_hex("not-hex"),
+            Err(BlossomError::InvalidHex)
+        );
+        assert_eq!(
+            HashType::try_from(&[1, 2, 3][..]),
+            Err(BlossomError::InvalidLength {
+                expected: 32,
+                actual: 3
+            })
+        );
+    }
+
+    #[test]
+    fn map_hashes_are_key_ordered_and_value_independent() {
+        let mut first = BTreeMap::new();
+        first.insert(PubKey([2; 32]), "two");
+        first.insert(PubKey([1; 32]), "one");
+
+        let mut second = BTreeMap::new();
+        second.insert(PubKey([1; 32]), "different");
+        second.insert(PubKey([2; 32]), "values");
+
+        assert_eq!(DoHash::hash(&first), DoHash::hash(&second));
+    }
+
+    #[test]
+    fn index_tree_hash_uses_indexed_keys() {
+        let mut tree = IndexTreeMap::new();
+        tree.insert(PubKey([1; 32]), ());
+        tree.insert(PubKey([2; 32]), ());
+
+        let mut map = BTreeMap::new();
+        map.insert(PubKey([1; 32]), ());
+        map.insert(PubKey([2; 32]), ());
+
+        assert_eq!(DoHash::hash(&tree), DoHash::hash(&map));
+    }
+}

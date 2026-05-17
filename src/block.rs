@@ -162,4 +162,53 @@ mod tests {
         assert_eq!(block.body.validator, keypair.public);
         assert!(block.verify_signature().is_ok());
     }
+
+    #[test]
+    fn transaction_hash_and_bytes_are_stable() {
+        let tx = Transaction::new("tx-1");
+
+        assert_eq!(tx.hash, HashType::hash(b"tx-1"));
+        assert_eq!(tx.to_bytes(), [tx.hash.as_ref(), b"tx-1"].concat());
+    }
+
+    #[test]
+    fn signed_block_integrity_rejects_hash_merkle_and_signature_tampering() {
+        let keypair = Keypair::generate();
+        let mut block = Block::default();
+        block.body.txs.push(Transaction::new("tx-1"));
+        block.sign(&keypair.secret);
+        assert!(block.verify_integrity().is_ok());
+
+        let mut tampered_hash = block.clone();
+        tampered_hash.hash = HashType([9; 32]);
+        assert_eq!(
+            tampered_hash.verify_integrity(),
+            Err(crate::error::BlossomError::InvalidBlockHash)
+        );
+
+        let mut tampered_merkle = block.clone();
+        tampered_merkle.body.merkle_root = HashType([8; 32]);
+        tampered_merkle.set_hash();
+        assert_eq!(
+            tampered_merkle.verify_integrity(),
+            Err(crate::error::BlossomError::InvalidBlockHash)
+        );
+
+        let mut tampered_signature = block;
+        tampered_signature.signature = Signature([7; 64]);
+        assert_eq!(
+            tampered_signature.verify_integrity(),
+            Err(crate::error::BlossomError::SignatureError)
+        );
+    }
+
+    #[test]
+    fn empty_with_nonce_sets_nonce_and_hash() {
+        let block = Block::empty_with_nonce(Nonce::new(9));
+
+        assert_eq!(block.body.nonce, Nonce::new(9));
+        assert_eq!(block.hash, block.hash());
+        assert!(block.is_empty());
+        assert_eq!(block.len(), 0);
+    }
 }

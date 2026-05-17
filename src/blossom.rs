@@ -508,3 +508,122 @@ impl BlossomMessage for EchoReDispatch {
 pub struct Ballot {
     pub ballot: (String, Vec<Verification>),
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::block::{Block, Transaction};
+    use crate::crypto::Keypair;
+    use crate::node::NodeIdentity;
+    use crate::nonce::Nonce;
+
+    fn node(keypair: &Keypair) -> NodeIdentity {
+        NodeIdentity::new(
+            keypair.public,
+            Some(keypair.secret),
+            "tcp",
+            "127.0.0.1",
+            8080,
+            false,
+        )
+    }
+
+    fn signed_block(keypair: &Keypair) -> Block {
+        let mut block = Block::default();
+        block.body.nonce = Nonce::new(1);
+        block.body.txs.push(Transaction::new("tx"));
+        block.sign(&keypair.secret);
+        block
+    }
+
+    #[test]
+    fn signature_tree_insert_verify_get_and_remove() {
+        let keypair = Keypair::generate();
+        let mut blocks = BTreeMap::new();
+        blocks.insert(HashType([1; 32]), ());
+        let blocks_hash = blocks.hash();
+        let signature = Signature::sign(blocks_hash.as_ref(), &keypair.secret);
+        let mut tree = SignatureTree::default();
+
+        tree.insert(&keypair.public, &signature, &blocks);
+
+        assert_eq!(tree.len(), 1);
+        assert!(!tree.is_empty());
+        assert!(tree.verify());
+        assert!(tree.get(&blocks_hash).is_some());
+        assert!(tree.remove(&blocks_hash).is_some());
+        assert!(tree.is_empty());
+    }
+
+    #[test]
+    fn signature_tree_rejects_bad_hashes_and_signatures() {
+        let keypair = Keypair::generate();
+        let mut blocks = BTreeMap::new();
+        blocks.insert(HashType([1; 32]), ());
+        let signature = Signature::sign(HashType([9; 32]).as_ref(), &keypair.secret);
+        let mut tree = SignatureTree::default();
+        tree.0
+            .insert(blocks.hash(), (vec![(keypair.public, signature)], blocks));
+
+        assert!(!tree.verify());
+    }
+
+    #[test]
+    fn dispatch_body_accepts_valid_blocks_and_rejects_bad_body_hash() {
+        let keypair = Keypair::generate();
+        let block = signed_block(&keypair);
+        let mut blocks = BTreeMap::new();
+        blocks.insert(block.hash, block.clone());
+        let body = DispatchBody {
+            blocks_hash: blocks.hash(),
+            blocks: blocks.clone(),
+            signature_tree: SignatureTree::default(),
+            signature_tree_hash: SignatureTree::default().hash(),
+        };
+
+        let (accepted, accepted_hash, tree, tree_hash) = body.verify_body(&BTreeMap::new());
+        assert_eq!(accepted.len(), 1);
+        assert_eq!(accepted.get(&block.hash).unwrap().hash, block.hash);
+        assert_eq!(accepted_hash, accepted.hash());
+        assert_eq!(tree_hash, tree.hash());
+
+        let mut bad_body = body;
+        bad_body.blocks_hash = HashType([9; 32]);
+        let (accepted, accepted_hash, _, tree_hash) = bad_body.verify_body(&BTreeMap::new());
+        assert!(accepted.is_empty());
+        assert_eq!(accepted_hash, HashType::default());
+        assert_eq!(tree_hash, HashType::default());
+    }
+
+    #[test]
+    fn dispatch_add_blocks_skips_empty_blocks() {
+        let keypair = Keypair::generate();
+        let full = signed_block(&keypair);
+        let mut empty = Block::default();
+        empty.body.nonce = Nonce::new(1);
+        empty.sign(&keypair.secret);
+        let mut incoming = BTreeMap::new();
+        incoming.insert(full.hash, full.clone());
+        incoming.insert(empty.hash, empty);
+        let mut pending = BTreeMap::new();
+
+        Dispatch::add_blocks(&mut pending, &incoming);
+
+        assert_eq!(pending.len(), 1);
+        assert!(pending.contains_key(&full.hash));
+    }
+
+    #[test]
+    fn body_signatures_verify_against_sender_identity() {
+        let keypair = Keypair::generate();
+        let node = node(&keypair);
+        let body = VerificationBody {
+            blocks_hash: HashType([3; 32]),
+            blocks: BTreeMap::new(),
+        };
+        let signature = body.signature(&node).unwrap();
+
+        assert!(body.verify(&signature, &keypair.public).is_ok());
+        assert!(body.verify(&signature, &PubKey([9; 32])).is_err());
+    }
+}

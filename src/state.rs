@@ -592,6 +592,7 @@ fn block_merkle_root(blocks: &BTreeMap<HashType, Block>) -> HashType {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::blossom::{Header, Proposal, ProposalBody, Verification, VerificationBody};
     use crate::crypto::{Keypair, Signature};
 
     fn node(index: u8) -> NodeIdentity {
@@ -698,5 +699,112 @@ mod tests {
         blocks.insert(hash, block);
 
         assert_eq!(block_merkle_root(&blocks), hash);
+    }
+
+    #[test]
+    fn advance_epoch_with_consensus_commits_verified_blocks() {
+        let (self_node, genesis) = genesis(0);
+        let mut state = LocalState::new(self_node, genesis.clone());
+        let next_nonce = genesis.body.nonce.new_next();
+        let mut block = Block::empty_with_nonce(next_nonce);
+        block.body.last_epoch = genesis.hash;
+        block.set_hash();
+        let block_hash = block.hash;
+        state
+            .get_mut_quorum(&genesis.hash, next_nonce, 0)
+            .verified_blocks
+            .insert(block_hash, block);
+
+        assert!(state.advance_epoch(&genesis.hash, next_nonce, 0, true));
+        let latest = state.epochchain.epochchain.last().unwrap();
+        assert_eq!(latest.body.last_epoch, genesis.hash);
+        assert_eq!(latest.body.nonce, next_nonce);
+        assert!(latest.body.blocks.contains_key(&block_hash));
+    }
+
+    #[test]
+    fn advance_epoch_without_consensus_creates_empty_epoch() {
+        let (self_node, genesis) = genesis(0);
+        let mut state = LocalState::new(self_node, genesis.clone());
+        let next_nonce = genesis.body.nonce.new_next();
+        state.get_mut_quorum(&genesis.hash, next_nonce, 0);
+
+        assert!(state.advance_epoch(&genesis.hash, next_nonce, 0, false));
+        let latest = state.epochchain.epochchain.last().unwrap();
+        assert_eq!(latest.body.last_epoch, genesis.hash);
+        assert!(latest.body.blocks.is_empty());
+        assert_eq!(latest.body.merkle_root, HashType::default());
+    }
+
+    #[test]
+    fn advance_epoch_rejects_mismatched_epoch_or_nonce() {
+        let (self_node, genesis) = genesis(0);
+        let mut state = LocalState::new(self_node, genesis.clone());
+
+        assert!(!state.advance_epoch(&HashType([9; 32]), genesis.body.nonce.new_next(), 0, true));
+        assert!(!state.advance_epoch(&genesis.hash, Nonce::new(99), 0, true));
+        assert_eq!(state.epochchain.epochchain.len(), 1);
+    }
+
+    #[test]
+    fn verification_count_tracks_consensus_hash() {
+        let mut count = init_verifications(6);
+        let blocks_hash = HashType([3; 32]);
+
+        for index in 0..4 {
+            count.record(Verification {
+                header: Header {
+                    sender: PubKey([index; 32]),
+                    ..Default::default()
+                },
+                body: VerificationBody {
+                    blocks_hash,
+                    blocks: BTreeMap::new(),
+                },
+            });
+        }
+
+        assert_eq!(count.consensus_hash(), Some(blocks_hash));
+    }
+
+    #[test]
+    fn proposal_count_reports_true_false_or_pending() {
+        let mut count = init_proposals(6);
+        let approved = HashType([4; 32]);
+        assert_eq!(count.consensus(), None);
+
+        for index in 0..4 {
+            count.proposals.insert(
+                PubKey([index; 32]),
+                Proposal {
+                    header: Header {
+                        sender: PubKey([index; 32]),
+                        ..Default::default()
+                    },
+                    body: ProposalBody {
+                        consensus: true,
+                        approved_hash: Some(approved),
+                        ..Default::default()
+                    },
+                },
+            );
+            *count.count.entry(approved).or_default() += 1;
+        }
+        assert_eq!(count.consensus(), Some(true));
+
+        let mut failed = init_proposals(6);
+        for index in 0..4 {
+            failed.proposals.insert(
+                PubKey([index; 32]),
+                Proposal {
+                    header: Header {
+                        sender: PubKey([index; 32]),
+                        ..Default::default()
+                    },
+                    body: ProposalBody::default(),
+                },
+            );
+        }
+        assert_eq!(failed.consensus(), Some(false));
     }
 }

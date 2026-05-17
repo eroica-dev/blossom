@@ -298,4 +298,48 @@ mod tests {
 
         assert!(matrix.status());
     }
+
+    #[test]
+    fn invalid_or_unknown_messages_do_not_pass_matrix() {
+        let quorum = key_vec();
+        let mut matrix = MessageMatrix::new(&quorum, &quorum[0]);
+
+        assert!(!matrix.update(
+            false,
+            Msg::Dispatch(Dispatch {
+                header: Header {
+                    sender: quorum[1],
+                    ..Default::default()
+                },
+                body: DispatchBody::default(),
+            })
+        ));
+        assert_eq!(matrix.matrix[matrix.self_index][1], Status::Void);
+
+        assert!(!matrix.update(
+            true,
+            Msg::Dispatch(Dispatch {
+                header: Header {
+                    sender: PubKey([99; 32]),
+                    ..Default::default()
+                },
+                body: DispatchBody::default(),
+            })
+        ));
+        assert!(!matrix.update(true, Msg::Ok));
+    }
+
+    #[test]
+    fn quorum_queue_advances_but_stays_at_last_matrix() {
+        let quorum = key_vec();
+        let mut queue = QuorumQueue::new(vec![quorum.clone(), quorum], &key_vec()[0]);
+
+        assert_eq!(queue.position, 0);
+        assert!(queue.get_current_matrix().is_some());
+        queue.next_matrix();
+        assert_eq!(queue.position, 1);
+        queue.next_matrix();
+        assert_eq!(queue.position, 1);
+        assert!(!queue.get_status(99));
+    }
 }

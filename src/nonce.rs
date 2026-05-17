@@ -55,3 +55,28 @@ impl fmt::Display for Nonce {
         write!(f, "{}", self.0)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn increments_without_mutating_original_next_value() {
+        let mut nonce = Nonce::new(41);
+
+        assert_eq!(nonce.new_next(), Nonce::new(42));
+        assert_eq!(nonce, Nonce::new(41));
+
+        nonce.mut_next();
+        assert_eq!(nonce, Nonce::new(42));
+    }
+
+    #[test]
+    fn bytes_and_display_are_little_endian_decimal() {
+        let nonce = Nonce::new(258);
+
+        assert_eq!(nonce.to_string(), "258");
+        assert_eq!(nonce.to_bytes(), 258u64.to_le_bytes().to_vec());
+        assert_eq!(nonce.value(), 258);
+    }
+}

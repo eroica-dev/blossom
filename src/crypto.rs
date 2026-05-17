@@ -300,4 +300,73 @@ mod tests {
         assert!(signature.verify(message, &keypair.public).is_ok());
         assert!(signature.verify(b"not blossom", &keypair.public).is_err());
     }
+
+    #[test]
+    fn public_secret_and_signature_hex_round_trip() {
+        let keypair = Keypair::generate();
+        let signature = Signature::sign(b"message", &keypair.secret);
+
+        assert_eq!(
+            PubKey::try_from_hex(&keypair.public.to_string()),
+            Ok(keypair.public)
+        );
+        assert_eq!(
+            SecKey::try_from_hex(&keypair.secret.to_string()),
+            Ok(keypair.secret)
+        );
+        assert_eq!(
+            Signature::try_from_hex(&signature.to_string()),
+            Ok(signature)
+        );
+    }
+
+    #[test]
+    fn malformed_key_material_is_rejected() {
+        assert_eq!(PubKey::try_from_hex("xx"), Err(BlossomError::InvalidHex));
+        assert_eq!(
+            PubKey::try_from(&[1, 2][..]),
+            Err(BlossomError::InvalidLength {
+                expected: 32,
+                actual: 2
+            })
+        );
+        assert_eq!(
+            SecKey::try_from(&[1, 2, 3][..]),
+            Err(BlossomError::InvalidLength {
+                expected: 32,
+                actual: 3
+            })
+        );
+        assert_eq!(
+            Signature::try_from(&[1; 8][..]),
+            Err(BlossomError::InvalidLength {
+                expected: 64,
+                actual: 8
+            })
+        );
+    }
+
+    #[test]
+    fn serde_round_trip_uses_hex_strings() {
+        let keypair = Keypair::generate();
+        let signature = Signature::sign(b"message", &keypair.secret);
+
+        let public_json = serde_json::to_string(&keypair.public).unwrap();
+        let secret_json = serde_json::to_string(&keypair.secret).unwrap();
+        let signature_json = serde_json::to_string(&signature).unwrap();
+
+        assert!(public_json.contains(&keypair.public.to_string()));
+        assert_eq!(
+            serde_json::from_str::<PubKey>(&public_json).unwrap(),
+            keypair.public
+        );
+        assert_eq!(
+            serde_json::from_str::<SecKey>(&secret_json).unwrap(),
+            keypair.secret
+        );
+        assert_eq!(
+            serde_json::from_str::<Signature>(&signature_json).unwrap(),
+            signature
+        );
+    }
 }

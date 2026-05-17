@@ -340,3 +340,45 @@ fn request_kind(request: &WireRequest) -> &'static str {
         WireRequest::SendBlock(_) => "send_block",
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn signed_block_sets_target_and_verifies() {
+        let keypair = Keypair::generate();
+        let target = EpochTarget {
+            last_epoch: crate::HashType([5; 32]),
+            nonce: Nonce::new(3),
+        };
+
+        let block = signed_block(target.clone(), keypair.secret, [Transaction::new("tx")]);
+
+        assert_eq!(block.body.validator, keypair.public);
+        assert_eq!(block.body.last_epoch, target.last_epoch);
+        assert_eq!(block.body.nonce, target.nonce);
+        assert_eq!(block.len(), 1);
+        assert!(block.verify_integrity().is_ok());
+    }
+
+    #[tokio::test]
+    async fn simulated_cluster_spawns_requested_number_of_nodes() {
+        let cluster = SimulatedCluster::spawn(2).await.unwrap();
+
+        assert_eq!(cluster.len(), 2);
+        assert!(!cluster.is_empty());
+        assert_ne!(
+            cluster.node(0).identity.public_key(),
+            cluster.node(1).identity.public_key()
+        );
+    }
+
+    #[tokio::test]
+    async fn zero_node_cluster_is_rejected() {
+        assert!(matches!(
+            SimulatedCluster::spawn(0).await,
+            Err(BlossomError::WireProtocol(_))
+        ));
+    }
+}
