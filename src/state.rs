@@ -598,7 +598,7 @@ mod tests {
         NodeIdentity::new(
             PubKey([index; 32]),
             None,
-            "http",
+            "tcp",
             format!("node-{index}"),
             8000 + index as u16,
             false,
@@ -633,7 +633,7 @@ mod tests {
                 NodeIdentity::new(
                     keypair.public,
                     None,
-                    "http",
+                    "tcp",
                     format!("node-{index}"),
                     9000 + index as u16,
                     false,

@@ -1,0 +1,139 @@
+use borsh::{BorshDeserialize, BorshSerialize};
+use serde::{Deserialize, Serialize};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+
+use crate::address_book::Service;
+use crate::block::Block;
+use crate::blossom::Dispatch;
+use crate::error::{BlossomError, Result};
+use crate::messages::Msg;
+use crate::nonce::Nonce;
+use crate::runtime::{AcceptedBlock, EpochTarget, MessageReceipt, NodeStatus};
+
+pub const MAX_FRAME_SIZE: usize = 32 * 1024 * 1024;
+
+#[derive(Serialize, Deserialize, BorshSerialize, BorshDeserialize, Debug, Clone)]
+pub enum WireRequest {
+    Health,
+    State,
+    AddressBook,
+    RegisterService(Service),
+    NextNonce,
+    SubmitBlock(Block),
+    Dispatch { round: u8 },
+    Message(Msg),
+    SendNonce(Nonce),
+    BlockNonce(Nonce),
+    GetBlock(Nonce),
+    SendBlock(Block),
+}
+
+#[derive(Serialize, Deserialize, BorshSerialize, BorshDeserialize, Debug, Clone)]
+pub enum WireResponse {
+    Health(NodeHealth),
+    State(NodeStatus),
+    AddressBook(Vec<Service>),
+    AddressBookUpdated(AddressBookUpdate),
+    NextNonce(EpochTarget),
+    BlockAccepted(AcceptedBlock),
+    Dispatch(Dispatch),
+    MessageReceipt(MessageReceipt),
+    Block(Block),
+    Ok,
+    Error(String),
+}
+
+impl WireResponse {
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::Health(_) => "health",
+            Self::State(_) => "state",
+            Self::AddressBook(_) => "address_book",
+            Self::AddressBookUpdated(_) => "address_book_updated",
+            Self::NextNonce(_) => "next_nonce",
+            Self::BlockAccepted(_) => "block_accepted",
+            Self::Dispatch(_) => "dispatch",
+            Self::MessageReceipt(_) => "message_receipt",
+            Self::Block(_) => "block",
+            Self::Ok => "ok",
+            Self::Error(_) => "error",
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize, BorshSerialize, BorshDeserialize, Debug, Clone, PartialEq, Eq)]
+pub struct NodeHealth {
+    pub status: String,
+    pub public_key: crate::crypto::PubKey,
+}
+
+#[derive(Serialize, Deserialize, BorshSerialize, BorshDeserialize, Debug, Clone)]
+pub struct AddressBookUpdate {
+    pub service: Service,
+    pub previous: Option<Service>,
+    pub nonce_announced: Option<Nonce>,
+}
+
+pub async fn read_frame<T, R>(reader: &mut R) -> Result<T>
+where
+    T: BorshDeserialize,
+    R: AsyncRead + Unpin,
+{
+    let len = reader
+        .read_u32()
+        .await
+        .map_err(|err| BlossomError::Io(err.to_string()))? as usize;
+    if len == 0 || len > MAX_FRAME_SIZE {
+        return Err(BlossomError::InvalidFrameSize(len));
+    }
+
+    let mut bytes = vec![0; len];
+    reader
+        .read_exact(&mut bytes)
+        .await
+        .map_err(|err| BlossomError::Io(err.to_string()))?;
+    borsh::from_slice(&bytes).map_err(|err| BlossomError::WireProtocol(err.to_string()))
+}
+
+pub async fn write_frame<T, W>(writer: &mut W, value: &T) -> Result<()>
+where
+    T: BorshSerialize,
+    W: AsyncWrite + Unpin,
+{
+    let bytes = borsh::to_vec(value).map_err(|err| BlossomError::WireProtocol(err.to_string()))?;
+    if bytes.is_empty() || bytes.len() > MAX_FRAME_SIZE {
+        return Err(BlossomError::InvalidFrameSize(bytes.len()));
+    }
+
+    writer
+        .write_u32(bytes.len() as u32)
+        .await
+        .map_err(|err| BlossomError::Io(err.to_string()))?;
+    writer
+        .write_all(&bytes)
+        .await
+        .map_err(|err| BlossomError::Io(err.to_string()))?;
+    writer
+        .flush()
+        .await
+        .map_err(|err| BlossomError::Io(err.to_string()))
+}
+
+#[cfg(test)]
+mod tests {
+    use tokio::io::duplex;
+
+    use super::*;
+
+    #[tokio::test]
+    async fn frame_round_trip() {
+        let (mut client, mut server) = duplex(1024);
+        let request = WireRequest::NextNonce;
+
+        let writer = tokio::spawn(async move { write_frame(&mut client, &request).await });
+        let read: WireRequest = read_frame(&mut server).await.unwrap();
+        writer.await.unwrap().unwrap();
+
+        assert!(matches!(read, WireRequest::NextNonce));
+    }
+}

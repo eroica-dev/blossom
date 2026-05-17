@@ -9,10 +9,11 @@ three stages:
 2. Block propagation
 3. Transaction validation
 
-The current Rust extraction focuses on reusable protocol logic rather
-than service orchestration. It keeps message types, deterministic
-quorum selection, local consensus state, block verification primitives,
-and the message matrix used during propagation.
+The current Rust extraction keeps reusable protocol logic and a compact
+deployable node surface. It includes message types, deterministic quorum
+selection, local consensus state, block verification primitives, the
+message matrix used during propagation, address-book registration, local
+block intake, and a raw TCP node process.
 
 ## Stage Map
 
@@ -23,13 +24,18 @@ them against local state, and close a local block. In this crate, that
 surface is represented by:
 
 - `src/block.rs`: signed block and transaction envelope primitives.
+- `src/local_block.rs`: queued block intake from the block service and
+  locally closed blocks.
+- `src/address_book.rs`: service registry for block, engine, relay,
+  consensus, and address-book services.
+- `src/runtime.rs`: next-nonce checks and signed block acceptance.
 - `src/crypto.rs`: Ed25519 signing and verification.
 - `src/hash.rs` and `src/nonce.rs`: deterministic identifiers used by
   blocks, epochs, and messages.
 
-The extraction intentionally keeps this layer minimal. Application
-transaction schemas, ledger adapters, block size policy, and mempool
-behavior belong above this crate.
+The extraction intentionally keeps transaction semantics minimal.
+Application transaction schemas, ledger adapters, block size policy, and
+mempool behavior belong above this crate or in a follow-up ledger layer.
 
 ### Block Propagation
 
@@ -49,6 +55,12 @@ The current implementation maps that layer to:
 - `src/state.rs`: local state, temporary consensus state, temporary
   quorum state, proposal counts, verification counts, and epoch
   advancement.
+- `src/wire.rs`: length-prefixed Borsh wire protocol for node and
+  service requests.
+- `src/bin/blossom-node.rs`: TCP listener for block intake, message
+  intake, dispatch generation, address-book updates, and state.
+- `src/service_client.rs`: TCP helpers for block-service nonce updates
+  and block/engine service calls.
 
 The implemented primary propagation lifecycle is:
 
@@ -111,6 +123,10 @@ validator.
 - Dispatch body verification against block hashes, block signatures,
   and signature-tree hashes.
 - Message matrix behavior for expected quorum messages.
+- Address book, local block queue, node status, block intake, dispatch
+  generation, and protocol message intake.
+- A raw TCP `blossom-node` binary with the initial deployable node
+  API.
 
 ## Paper-Defined Extensions
 
@@ -128,7 +144,8 @@ architecture, but is not part of this extraction yet:
 - Byzantine pruning policy.
 - Full transaction tagging, derivative epoch hashing, and append-only
   ledger application.
-- Runtime transport, node discovery, storage, metrics, and deployment.
+- Durable node discovery, storage, metrics, and production deployment
+  manifests.
 
 Those pieces should be added as separate layers or follow-up crates so
 the core protocol library remains portable.

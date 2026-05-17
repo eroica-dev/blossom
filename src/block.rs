@@ -60,6 +60,16 @@ impl Block {
             .verify(&self.body.to_bytes(), &self.body.validator)
     }
 
+    pub fn verify_integrity(&self) -> Result<()> {
+        if self.hash != self.hash() {
+            return Err(crate::error::BlossomError::InvalidBlockHash);
+        }
+        if self.body.merkle_root != self.body.compute_merkle_root() {
+            return Err(crate::error::BlossomError::InvalidBlockHash);
+        }
+        self.verify_signature()
+    }
+
     pub fn len(&self) -> usize {
         self.body.txs.len()
     }
