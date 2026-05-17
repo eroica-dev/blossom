@@ -12,6 +12,7 @@ test suite.
 | `harness` | Local TCP simulation | How expensive is a full node scenario: spawn cluster, register block service, submit block, dispatch, deliver? |
 | `harness-matrix` | Shell matrix over harness parameters | How does the full scenario change with node count and transaction count? |
 | `load` | Large local TCP simulation | What happens when a block carries hundreds of thousands or millions of transactions, and how many framed bytes move? |
+| `epoch-depth` | In-memory protocol simulation | How do paper-aligned quorum rounds behave across consecutive epochs? |
 
 ## Commands
 
@@ -39,6 +40,20 @@ Run a million-transaction load benchmark:
 ```bash
 TRANSACTIONS=1000000 TX_BYTES=32 NODES=6 ITERATIONS=1 \
   ./benchmarks/scripts/run-load.sh
+```
+
+Run a paper-aligned epoch-depth benchmark:
+
+```bash
+EPOCH_DEPTH=3 NODES=36 TXS_PER_NODE=1000 TX_BYTES=32 \
+  ./benchmarks/scripts/run-epoch-depth.sh
+```
+
+Derive epoch depth from a target input volume:
+
+```bash
+TARGET_TRANSACTIONS=1000000 NODES=36 TXS_PER_NODE=1000 \
+  ./benchmarks/scripts/run-epoch-depth.sh
 ```
 
 Results are written to `benchmarks/results/`, which is intentionally ignored
@@ -75,3 +90,10 @@ test a lower or higher ceiling.
 cluster. `DELIVERY_MODE=first-accepted` stops after the first accepting peer,
 which is the default for `run-load.sh` so million-transaction runs profile one
 successful peer hop without multiplying loopback traffic across the quorum.
+
+`run-epoch-depth.sh` is intentionally in-memory. It models the paper's epoch
+shape before transport costs are introduced: every node creates one capped
+block, every quorum round performs a union of peer block sets, and convergence
+means all nodes finish the epoch with the same ordered block set. `EPOCH_DEPTH`
+measures consecutive epochs; `TARGET_TRANSACTIONS` derives the required depth
+from `NODES * TXS_PER_NODE`.

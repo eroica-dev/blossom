@@ -148,10 +148,18 @@ Before cutting into hot code paths, add a whitepaper-aligned epoch harness. The
 current hotspots are real for the current transport stress test, but optimizing
 them first risks improving a workload that the protocol is not supposed to run.
 
+The first version of that gate is `src/bin/blossom-epoch-bench.rs`. It adds
+`--epoch-depth` and `--target-transactions` so we can measure consecutive
+paper-shaped epochs instead of one oversized single-node dispatch. It is
+in-memory by design: the benchmark isolates the quorum topology, block-set
+union, message shape, and serialized byte estimates before TCP transport is
+added back in.
+
 Suggested next implementation order:
 
 1. Add a protocol-level simulation harness that can execute full quorum rounds
-   in memory first, without TCP.
+   in memory first, without TCP. Initial implementation:
+   `src/bin/blossom-epoch-bench.rs`.
 2. Add a TCP version of the same harness so transport cost is separable from
    protocol cost.
 3. Add a 36-node deterministic convergence test: every node starts with one
