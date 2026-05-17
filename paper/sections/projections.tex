@@ -1,0 +1,156 @@
+\section{Projections}\label{proj}
+With the core functionality of \texttt{Blossom} described in the previous section, \textit{\nameref{proto}} [\S\ref{proto}], we may move on to the theoretical analysis of the protocol. In this section, we will describe models related to different performance characteristics of \texttt{Blossom}, as to project their theoretical performance before real-world testing. It is important that prior to the protocol passing any real-world examination, there are no fundamental issues we discover during our theoretical examination.
+
+The performance categories we will be modeling in this section, include the \textit{\nameref{proj:tps}} [\S\ref{proj:tps}], \textit{\nameref{proj:ft}} [\S\ref{proj:ft}], \textit{\nameref{proj:fb}} [\S\ref{proj:fb}], and \textit{\nameref{proj:dyn_ut}} [\S\ref{proj:dyn_ut}]. These metrics represent the fundamental features of a successful blockchain protocol, with the ideal outcome displaying the protocol's ability to provide consistently high performance while maintaining a strong tolerance to byzantine behavior. While there do not exist clear standards to classify the success or failure of the protocol relative to any of these single metrics, we can estimate the performance of our system against precedent networks.
+
+\subsection{Protocol Throughput and Finality}\label{proj:tps}
+As a uniquely scalable consensus protocol, we expect the performance of \texttt{Blossom} will be limited by infrastructure conditions rather than a fundamental behavior within the protocol. This results in a theoretical maximum network throughput which is determined by non-protocol features, such as IT infrastructure and node hardware. When developing a model to estimate the performance of our protocol we implemented the following variables: compute threads (\textit{t}), bandwidth [MB/s] (\textit{b}), the latency per round in an open channel [ms] (\textit{l}), transactions per block (\(\beta\)), transaction size [bytes] (\(\tau\)), signature verifications per second per thread (\(\nu\)) and average block efficiency (\textit{E}). We recognize there exist possible variances between these variables and their real-world outcome; however, the purpose of this model is to approximate general performance outcomes over scales, rather than predict exact performance. With the above variables block time (\(B_t\)) and throughput (\textit{T}) are as follows, given nodes (\textit{n}):
+\[
+B_t =
+(5.5n \times 10^{-7})
++
+\frac{\beta n E \tau}{b}
++
+\tfrac{\beta n E+n+\big(n\log_q(n) \big)}{\nu t}
++
+\big (l \times \lceil \log_q(\tfrac{n}{2}) \rceil \big)
+\]
+\[
+T = \frac{\beta n E}{B_t}
+\]
+
+Due to the protocol's cooperative nature, the values inserted for each variable are expected to represent the characteristics of the bottom 33\% of nodes (i.e. least performant…) members of the network, as it is these members who bottleneck the throughput of the entire platform. This mitigates any performance overestimation returned by the model associated with the selection of median or average performance. A reasonable expectation of the least viable system would be a node with the hardware and infrastructure attributes equivalent to an Intel Core i5-10400 CPU and an internet bandwidth (upload \& download) of 10 MB/s.
+
+When accounting for the above processor and bandwidth characteristics, with the additional expected base values for the remaining variables, we are provided the following inputs for our model \(
+\{
+t = 8, \
+b = 10, \ 
+l = 200, \
+\beta = 1000, \
+\tau = 200, \
+\nu = 20000 \
+E = 1.00
+\}
+\).
+
+\input{figures/proj_small}
+
+In analyzing \textit{Figure} \ref{fig:proj_small} it becomes clear that as the number of nodes increases, which occurs exponentially at intervals of \(q^x\), the throughput of the network reaches a maximum limit \([\approx 50,000]\), while the finality for all applicable transactions increases at a rate highly correlated to a linear coefficient \([R^2 = 0.9782]\).
+
+We believe these results to be accurate due to the known bottlenecks of the protocol, with those bottlenecks being network bandwidth and compute potential. Bandwidth is considered a reasonable bottleneck as every transaction has a minimum viable size, and as the number of transactions increases, there is a linear increase in latency. Compute potential is another reasonable bottleneck as every transaction stores a cryptographic signature, with said signature having a high compute cost. When a transaction is added to the ledger the signature must first be validated, and as the number of signatures increases there is a linear increase in latency. Beyond bandwidth and compute potential other minor bottlenecks exist; however, these two factors account for a majority (\(>99\% \)) of all protocol latency. While protocol-specific improvements will be discussed in later sections [see \S\ref{conclusion}], IT improvements provide the greatest potential performance increases. Accounting for the previous model variables, if the  estimated network bandwidth was improved by a factor of two (2) to support \(\{ b = 20\}\), we would see a throughput improvement of \([\approx100\%]\) while time to finality would be reduced by \([\approx50\%]\) when compared to the values used in \textit{Figure} \ref{fig:proj_small}. When accounting for an average system with the variables of \(\{
+t = 16, \
+b = 100 
+\}\)  we would see a throughput improvement of \([\approx550\%]\) while time to finality would be reduced by \([\approx85\%]\) when compared to the values used in \textit{Figure} \ref{fig:proj_small}.
+
+When placing our protocol in the context of the decentralized ecosystem, we can observe the characteristics of precedent networks, as to reference the distribution of node hardware represented in active systems. When observing the Ethereum network, there are 4797 active nodes, with an estimated \(63.8\%\) of said nodes hosted in the cloud — a majority of which are hosted on AWS \cite{ether-nodes-hz}. Ignoring the negative consequences of this decentralization, if \texttt{Blossom} nodes were hosted in the cloud to an equivalent degree as on Ethereum, we would be able to drastically increase projected performance, due to the high bandwidth of cloud infrastructure and rapid scalability of cloud compute. Referencing the metrics for standard cloud services, we see \(
+\{
+t \ge 32, \
+b \ge 10000 
+\}
+\). If we were to re-compute our model with the new metrics \(
+\{
+t = 32, \
+b = 10000 
+\}\) we would observe a new distribution, as seen in \textit{Figure} \ref{fig:proj_large}. 
+
+\input{figures/proj_large}
+
+The new projection displayed in Figure 2 is much more impressive than that displayed in Figure 1, as the bandwidth allowance was increased by 100x. As a consequence, when compared to Figure 1 we have seen a throughput improvement of \([\approx1340\%]\) while time to finality is reduced by \([\approx93\%]\). When isolating this performance increase to the equivalent network values displayed by Ethereum, of 4797 active nodes, the model projects a throughput performance of 462,743 TPS at a finality time of 16.8 seconds.
+From the observation of the necessary performance required of functioning platforms, the performance displayed in both \textit{Figure} \ref{fig:proj_small} and \textit{Figure} \ref{fig:proj_large} are comparable to sustainable and efficient infrastructure, especially given \texttt{Blossom} is able to achieve this performance with non-specialized hardware.
+
+\subsection{Fault Tolerance}\label{proj:ft}
+It is important we clarify that the fault tolerance noted for each quorum and the fault tolerance of each epoch (e.g. each state) are not required to be equivalent, and whether the two thresholds are represented by a similar fault ratio or not, there is no programmatic need for parity. That being said, as to avoid confusion we will refer to the fault tolerance of each quorum as the ‘quorum fault tolerance,’ and the fault tolerance of each epoch as the ‘epoch fault tolerance.’ Previous BFT-based protocols have laid the groundwork in designed a protocol that is capable of reaching consensus amongst a distributed network using P2P network dynamics; however, as each quorum is but a partition of the greater network, to guarantee a global consensus we must undergo more rigorous proofs. In this section, we will be focusing on the methodology for achieving said proofs, as well as quantifying the methods for maintaining a consensus.
+
+The \textit{epoch fault tolerance} we have chosen to implement for our protocol requires a supermajority consensus of greater than \(\frac{2n}{3}\) nodes. Our reason for selecting this value is due to its leniency, allowing for the presence of a reasonable number of byzantine nodes before consensus no longer occurs (\(\frac{n}{3}\)), and that this fraction has the smallest integer numerator and denominator while greater than a \(50\%\) equality. We have chosen to avoid a regular majority consensus (\(> 50\%\)), as the threshold may be too exact for our style of distributed protocol. If a more cautious approach were taken, we would recommend increasing the \textit{epoch fault tolerance} to require a supermajority consensus of greater than \(\frac{3n}{4}\) or  nodes. Once a limit has been selected we can verify if a given state has been reached rather easily, by querying the historic epoch hash of every node at a specified epoch nonce. We used the term ‘historic’ when describing this querying method, as this approach would be highly inefficient if implemented for nodes participating in consensus. This inefficiency would decrease our actual finality time, thus negatively affecting our TPS measurement. Following the completion of a given Epoch, we verify if a supermajority consensus did or did not occur by surveying the purported ‘last epoch’  stored within every novel block, checking if the total number of blocks with a shared epoch is greater or less than the \textit{epoch fault tolerance} required by the network. The procedure of verifying the ‘last epoch’ stored within each block header is already completed during both the \textit{block propagation} and transaction validation phase of \texttt{Blossom}; however, to verify fault tolerance we added the additional behavior of logging the number of blocks with an identical epoch hash. If a node determines that a consensus has not been reached, then it is their prerogative to ignore the outcome of their present epoch, and gossip across the network that they believe consensus has stalled. If this failure to convene is false, and the greater network did achieve consensus then the node will be seen as faulty by their peers; however, in the case, it is true that consensus failed to occur, nodes will begin attempting to \textit{restate} the network.
+
+The \textit{restate} protocol has nodes randomly subsample the entire network, creating novel quorums of size \textit{q}. The goal of each quorum is to quickly determine the most recent epoch nonce where a supermajority of nodes has an identical state. The quorum members will then adopt that epoch as their new ‘most recent’ epoch. As we cannot remove epochs that have already been verified with a supermajority consensus, it is expected that nodes will only be required to move back one (1) nonce from their present position; however, given nodes may have incorrectly formed several epochs we provide nodes the ability to move back further than one (1) epoch. The specifics of the \textit{restate} protocol deserve their own paper; however, we expect enough to be gleaned from this short summary to recognize the role and significance of the procedure.
+
+For a \textit{restate} to occur there must be some number of byzantine nodes present in the network. Due to factors we have discussed previously, and will discuss in a coming section (see \textit{\nameref{proj:fb}} [\S\ref{proj:fb}]), it is necessary that byzantine nodes are pruned from the greater network in a means which is both uncontroversial and able to occur concurrently across a supermajority of distributed nodes. It is important that the implementation mitigates Type I errors, and the dismissal of non-byzantine nodes, and as such it is important nodes are acted upon in a verifiable fashion. The three variant solutions we propose are each reasonable approaches to resolve this issue; however, each maintains a unique distribution of tradeoffs that may or may not dissuade said solutions' implementation. The three solutions we propose are: 
+
+\begin{description}
+\item[Pruning by an arbiter,] refers to the use of a specialized node that observes network behavior and develops proof against observed byzantine nodes. This proof should be easily verified by all parties, with the arbiter themselves held in high regard. This system is similar to the use of a fisherman, described in the Polkadot whitepaper \cite{polkadot-pl}. However, to elaborate on the specific behaviors of an arbiter within \texttt{Blossom}, their behavior would be the following. Similar to light nodes or replica nodes, each arbiter would maintain a local replica of the network state which would be updated each epoch. This state is expected to be valid, with the appropriate amount of signatures maintained with the associated epoch. To develop a proof against an operating node, an arbiter would be tasked with auditing the historical record of every blockchain node, as to check for faults against their local record. The methods by which an arbiter checks the record are up to their digression; however, it is the arbiter’s responsibility to return verifiable proof quantifying a pattern of byzantine behavior. As all nodes are required to present cryptographic signatures with the presentation of any novel data (e.g. blocks and epochs), if a node did operate in a provably byzantine manner, the record should maintain proof of the node ratifying the faulty state with their signature.
+\item[Pruning by incorrect consensus,] refers to the concurrent decision by nodes to remove their peers who did not reach an identical supermajority consensus as the greater network. This is expected to occur immediately following the discovery of such a lapse (i.e. the epoch following the fault’s occurrence), with no tolerance for accidental deviations from the greater network. This approach is highly punitive to nodes who presented Byzantine behavior for non-malicious reasons and offers no opportunity for Byzantine nodes to independently correct their state. This lack of tolerance is especially important given the presence of finical or social disincentives which are adopted following a node's removal. We would only recommend this procedure's inclusion in the pruning process if it is discovered that the risk of allowing byzantine nodes to linger on the network is immense.
+\item[Pruning by observed byzantine behavior,] is similar to the previous solution (pruning by incorrect consensus); however, rather than immediately removing nodes found to be purporting an incorrect state, some pattern is required to be observed over a series of sequential epoch’s for a node to be pruned. This approach would allow non-byzantine nodes the opportunity to independently correct their state without punishment, while byzantine nodes are removed due to their observed faulty behavior. The barriers to adopting this approach are due to the computation required to develop a ‘proof of fault’ in the required manner. It may be unfeasible for nodes to observe and log their peer's behavior concurrent with participating in consensus. If the threshold of proof would require a supermajority of nodes to personally participate in a quorum with some byzantine node, said byzantine node would remain an active member of the network for \(\frac{n}{(q-1) \times \log_q(n)}\) epochs in the best case scenario. There exists little value in the firsthand account of byzantine behavior due to the use of cryptographic signatures; however, the question then arises: ‘If byzantine nodes are not removed immediately, what threshold merits their expulsion?’
+\end{description}
+
+When looking to adopt these three approaches we recognize it will be important to test the viability of each method in a reasonable manner; however, given the issues which may arise as a result of strategic byzantine nodes (malicious nodes) as well as regular byzantine nodes, we expect our solution will require both the use of an arbiter and distributed pruning process. We may also discover additional methods for resolving the pruning of byzantine nodes, and we intend on disclosing such novel methods in future documentation given the need may arise.
+
+\subsection{Failure Bleed}\label{proj:fb}
+Earlier in this paper we introduced the concept of a \textit{failure bleed}, the ability for byzantine nodes to induce faulty behavior in non-byzantine nodes by blocking consensus, or not sharing correct information. To reduce the occurrence of \textit{failure bleed}, we introduced a second recursion of the consensus tree, allowing nodes to reconvene with their past quorums to verify data concurrency before finalizing the epoch state. At the cost of additional latency during consensus, this solution drastically reduces the likelihood of a \textit{failure bleed} to occur. To quantify this difference before and after the introduction of this solution, we must acknowledge the reasons a \textit{failure bleed} may occur, so as to guarantee its mitigation.
+
+In the original approach, with a single recursion of the consensus tree, it is required that every quorum a node participates in reaches consensus. If a consensus is not reached, each non-byzantine quorum member will experience some data loss. This means that given the number of faulty nodes in a quorum is greater than the fault tolerance of each quorum \((f > \frac{1}{3})\), then all remaining nodes in that quorum will become faulty as well. With the more tolerant approach, due to the additional recursion of the consensus tree, as long as a node participated in at least one (1) quorum which successfully reached consensus, they will most likely be able to resolve any data loss they maintain. To measure the probability that a \textit{failure bleed} (\textit{F}) were to occur in this scenario, we will be testing for the maximum number of non-byzantine nodes who become byzantine, assuming \textit{n} represents all nodes on the network, \textit{f} represents the total number of byzantine nodes on the network, and \textit{a} represents the minimum number of faults required for all quorums to be considered faulty. The formula for determining the likelihood that {\(\frac{f}{a}\) \textit{failure bleed’s} occur is as follows:
+\[
+a = \big (
+\lfloor
+\frac{q}{3}
+\rfloor +1 \big )
+\times
+\big ( \log_q(n)-1 \big)
+\]
+\[
+F =\prod ^{
+\lfloor
+\frac{f}{a}\rfloor
+}
+_{i=0} \bigg(
+\prod _{j=0}^{a} \tfrac{(f-ai)-j}{(n-ai)-j} 
+\bigg)
+\]
+
+Implementing these functions over the network of sizes \(n=6^{[2:6]}\), we can observe the maximum likelihood that non-byzantine nodes become byzantine as a consequence of \textit{failure bleed}. We then plotted these results in \textit{Figure} \ref{fig:failure_f3} and \textit{Figure} \ref{fig:failure_f6} with each graph representing the probability that one (1) through five (5) new faults occur due to \textit{failure bleed}. Our reason for distributing these measurements was to quantity the probabilistic effect of a network with more or less byzantine nodes present. To quantify this variance \textit{Figure} \ref{fig:failure_f3} expects the network to maintain \(f=\frac{n}{3}\) byzantine nodes, while \textit{Figure} \ref{fig:failure_f6} has the network maintain \(f=\frac{n}{6}\) byzantine nodes. In reducing the number of byzantine number of nodes across the network we expect the likelihood of \textit{failure bleed} to reduce, at a non-linear rate.
+\input{figures/failure_f3}
+\input{figures/failure_f6}
+
+\subsection{Dynamic Utilization}\label{proj:dyn_ut}
+The performance measurements we reference in \textit{\nameref{proj:tps}} [\S\ref{proj:tps}], as well as other moments later in this document, were projected or collected when the network was operating within the range of ‘maximum utilization.’ \textit{Maximum utilization} refers to the characteristic of a given epoch where at least \(90\%\) of possible transactions which may be distributed are distributed (\(\ge 90\%\)). This classification is important due to our use of a block cap, limiting the total number of transactions each node may distribute in a given epoch. For sake of example, given a network of 1,000 nodes (\(n=1000\)) with a block limit equivalent to 1,000 transactions (\(\equiv 1000\)), then the \textit{maximum utilization} range for each epoch would be 900,000 to 1,000,000 transactions.
+
+Due to the scalability of \texttt{Blossom}, and previously discussed dynamics of the block limit, we expect the real-world utilization of \texttt{Blossom} to run well below \textit{maximum utilization}. In the realistic scenario where network utilization is dynamic, we are interested in understanding the effect such fluctuations may have on overall network performance if any effect is had at all.
+
+For this analysis, we will make use of the model we developed in the section \textit{\nameref{proj:tps}} [\S\ref{proj:tps}], as to represent the effect on performance from variations in network utilization. To display changes over scale, we will measure network utilization ($U$), which is equivalent to \textit{average block efficiency} (\(U \equiv E\)), and the size of the network (\textit{n}). Network utilization will be measured in intervals of \(10\%\), while changes to the number of network members will be tested with 100, 1,000, and 10,000 nodes.
+
+\input{figures/fin_change}
+\input{figures/tps_change}
+
+The outcome of this experiment presents that the rate of change for finality is linearly correlated with the rate of change in network utilization, as seen in \textit{Figure} \ref{fig:fin_change}, while the rate of change of throughput (TPS) is non-linearly correlated with the rate of change in network utilization, as seen in \textit{Figure} \ref{fig:tps_change}. In part due to the inverse relationship of throughput and finality, as well as other factors consequence of \texttt{Blossom} design, changes in network utilization have a relatively positive benefit for finality, as overall finality time is reduced, while the cost to throughput is diminished as the size of the network increases. This observation further supports the scalability claims of \texttt{Blossom}, as the network’s instability (i.e. the deviation of network throughput) is shown to decrease with the network’s size.
+
+In cases where a network’s utilization is operating less than the protocol's maximum utilization threshold (\(< 90 \%\)), due to \texttt{Blossom} scalability efficiency decreases with network utilization, as seen in \textit{Figure} \ref{fig:tps_change} given TPS is directly correlated with per capital efficiency. With this being said, in circumstances where the \textit{network utilizing} \texttt{Blossom} is more averse to increases in finality than decreases in efficiency, there exists a moment of ‘ideal utilization.’ Implementing the formulas \(f(E)\) and \(g(E)\), where \(f(E)\) returns the finality of the network at given variables and \(g(E)\) returns the throughput of the network at given variables, we may find the ideal utilization of the network. When solving for network utilization, the formulas for \(f(E)\) and \(g(E)\) are as follows.
+
+\[
+f(E) = 
+(5.5 \times 10^{-7})
++
+\frac{\beta n E \tau}{b}
++
+\frac{\beta E+n+(n\log_qn)}{\nu tn}
++
+\frac{l \times \lceil \log_q\frac{n}{2} \rceil}{n}
+\]
+\[
+g(E) = 
+\frac{\beta n E}{f(E)}
+\]
+
+We may then use the above formulas to find the percentage difference in performance from maximum utilization (where \(E \equiv 1\)) and network utilization at a given value between zero (0) and one (1) (\(0 \leq E \leq 1\)). The specific function to calculate the \textit{moment of utilization} (\(h(E)\)) is as follows.
+
+\[
+h(E) = \frac{g(E)}{g(1)}-\frac{f(E)}{f(1)}
+\]
+
+Implementing function \(h(E)\) for all values of \textit{E} in the range of [0,1] we may then observe the rate of change between finality and throughput, as displayed in \textit{Figure} \ref{fig:comp_change}.
+
+\input{figures/comp_change}
+Observing the graphs for network sizes of 100, 1,000, and 10,000 nodes over variable utilization rates (see \textit{Figure} \ref{fig:comp_change}), it is clear that as the network size increases the moment of ideal utilization, represented by the maximum value of each distribution, moves to lower rates of utilization. This can be further proven when calculating the exact moment of \textit{ideal utilization} using the differential equation, the results of which are displayed in \textit{Table} \ref{tab:tab1}.
+\begin{table}[!h]
+\centering
+    \begin{tabular}{cccc}
+     \hline
+     \textbf{$n$}& Ideal $U$ $\%$ & Fin $\%$ Reduc.&TPS $\%$ Reduc.\\
+     \hline
+     100   & 100 $\%$   &0.0 $\%$&   0.0 $\%$\\
+     1000&   32.55 $\%$ & 56.82 $\%$  &24.61 $\%$\\
+     10000& 14.58 $\%$ & 95.02 $\%$&  34.65 $\%$\\
+     \hline
+    \end{tabular}
+    \caption{The \textit{ideal utilization} of the distributions graphed in \textit{Figure} \ref{fig:comp_change} with the relative reductions in finality and throughput.}
+    \label{tab:tab1}
+\end{table}

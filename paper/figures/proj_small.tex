@@ -1,0 +1,57 @@
+\begin{figure}[h!]
+    \centering
+    \begin{tikzpicture}
+      \pgfplotsset{
+          scale only axis,
+      }
+    
+      \begin{axis}[
+        xmode=log,
+        axis y line*=left,
+        axis x line*=bottom,
+        xlabel = Total Network Size (\textit{n}),
+        ylabel= Transaction per Second (TPS),   
+        scaled y ticks=true
+      ]
+        \addplot[mark=*]
+          coordinates{
+            (6,4225.35)	
+            (36,11920.49)	
+            (216,28346.26)	
+            (1296, 42885.46)	
+            (7776,48351.61)	
+            (46656,49664.07)	
+            (279936,49934.27)
+            % more points
+          }; \label{plot_1}
+    
+        \end{axis}
+    
+        \begin{axis}[
+          xmode=log,
+          ymode=log,
+          axis y line*=right,
+          axis x line*=bottom,
+          axis x line=none,
+          ylabel=Finality in Seconds (Fin),
+          legend style={at={(0.05,0.95)}, anchor=north west, legend cell align=left},
+        ]
+    
+        \addplot[mark=x]
+          coordinates{
+            (6,1.42)	
+            (36,3.02)	
+            (216,7.62)	
+            (1296, 30.22)	
+            (7776,160.82)	
+            (46656,939.43)	
+            (279936,5606.09)			
+            % more points
+          }; \label{plot_2}
+        \addlegendimage{/pgfplots/refstyle=plot_1}\addlegendentry{Fin}
+        \addlegendimage{/pgfplots/refstyle=plot_2}\addlegendentry{TPS}
+        \end{axis}
+    \end{tikzpicture}
+    \caption{The network throughput and finality as the number of network members increases, assuming the network is under maximum possible load.}
+    \label{fig:proj_small}
+\end{figure}

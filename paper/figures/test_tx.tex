@@ -1,0 +1,69 @@
+
+
+\begin{figure}[h!]
+    \centering
+    \begin{tikzpicture}
+      \pgfplotsset{
+          scale only axis,
+          every axis legend/.append style={ at={(1.25,1.25)}, 
+          legend columns = 0}
+          % legend style={at={(0.5,0.5)},
+      }
+    
+      \begin{axis}[
+        xmode=log,
+        ymode=log,
+        axis y line*=left,
+        axis x line*=bottom,
+        xlabel = Network Size ($n$),
+        ylabel= Transactions (Tx) per Epoch,   
+        scaled y ticks=true
+      ]
+
+        \addplot[mark=x,color=black] coordinates{
+            (6,5919)
+            (36,32531)
+            (216,199719)
+            (1296,1155692)
+            % more points
+          }; \label{plot_1_y1}
+          
+        \addplot[mark=o,color=black] coordinates{
+            (6,5736)
+            (36,33493)
+            (216,177556)
+            (1296,1015081)
+            % more points
+          }; \label{plot_1_y2}
+    
+        \addplot[mark=square,color=black] coordinates{
+            (6,5830)
+            (36,33133)
+            (216,134270)
+            (1296,741752)	
+            % more points
+          }; \label{plot_1_y3}
+          
+        \addplot[mark=triangle,color=black] coordinates{
+            (6,5809)
+            (36,34574)
+            (216,126303)
+            (1296,767379)	
+            % more points
+          }; \label{plot_1_y4}
+        
+        \addlegendimage{/pgfplots/refstyle=plot_1_y1}\addlegendentry{\texttt{1vCPU}}
+        \addlegendimage{/pgfplots/refstyle=plot_1_y2}\addlegendentry{\texttt{2vCPU}}
+        \addlegendimage{/pgfplots/refstyle=plot_1_y3}\addlegendentry{\texttt{4vCPU}}
+        \addlegendimage{/pgfplots/refstyle=plot_1_y4}\addlegendentry{\texttt{8vCPU}}
+        \end{axis}
+    \end{tikzpicture}
+    \caption{The average number of transactions in each epoch at a given configuration (indicated above), where each transaction is equivalent to 400 \texttt{bytes} of data (0.4\texttt{kB}).}
+    \label{fig:test_tx}
+\end{figure}
+
+% 	6	36	216	1296
+% Tx per Epoch [1.vCPU]	5919	32531	199719	1155692
+% Tx per Epoch [2.vCPU]	5736	33493	177556	1015081
+% Tx per Epoch [4.vCPU]	5830	33133	134270	741752
+% Tx per Epoch [8.vCPU] 	5809	34574	126303	767379

@@ -1,0 +1,69 @@
+
+
+\begin{figure}[h!]
+    \centering
+    \begin{tikzpicture}
+      \pgfplotsset{
+          scale only axis,
+          every axis legend/.append style={ at={(1.25,1.25)}, 
+          legend columns = 0}
+          % legend style={at={(0.5,0.5)},
+      }
+    
+      \begin{axis}[
+        xmode=log,
+        %ymode=log,
+        axis y line*=left,
+        axis x line*=bottom,
+        xlabel = Network Size ($n$),
+        ylabel= Throughput (TPS),   
+        scaled y ticks=true
+      ]
+
+        \addplot[mark=x,color=black] coordinates{
+            (6,12757.6483092012)
+            (36,28617)
+            (216,18145.04)
+            (1296,19524.42)
+            % more points
+          }; \label{plot_1_y1}
+          
+        \addplot[mark=o,color=black] coordinates{
+            (6,19867.2694674749)
+            (36,42655.0136745384)
+            (216,32568.52)
+            (1296,37939.67)
+            % more points
+          }; \label{plot_1_y2}
+    
+        \addplot[mark=square,color=black] coordinates{
+            (6,19958.2378084842)
+            (36,61495.6571839636)
+            (216,49938.6)
+            (1296,69754.93)	
+            % more points
+          }; \label{plot_1_y3}
+          
+        \addplot[mark=triangle,color=black] coordinates{
+            (6,21786.3152948651)
+            (36,71270.533771156)
+            (216,70014.28)
+            (1296,124795.86)	
+            % more points
+          }; \label{plot_1_y4}
+        
+        \addlegendimage{/pgfplots/refstyle=plot_1_y1}\addlegendentry{\texttt{1vCPU}}
+        \addlegendimage{/pgfplots/refstyle=plot_1_y2}\addlegendentry{\texttt{2vCPU}}
+        \addlegendimage{/pgfplots/refstyle=plot_1_y3}\addlegendentry{\texttt{4vCPU}}
+        \addlegendimage{/pgfplots/refstyle=plot_1_y4}\addlegendentry{\texttt{8vCPU}}
+        \end{axis}
+    \end{tikzpicture}
+    \caption{Average network throughput (TPS) at a given configuration (indicated above).}
+    \label{fig:test_tps}
+\end{figure}
+
+% 	6	36	216	1296
+% Throughput [1.vCPU] (TPS)	12757.6483092012	28617	18145.04	19524.42
+% Throughput [2.vCPU] (TPS)	19867.2694674749	42655.0136745384	32568.52	37939.67
+% Throughput [4.vCPU] (TPS)	19958.2378084842	61495.6571839636	49938.6	69754.93
+% Throughput [8.vCPU] (TPS)	21786.3152948651	71270.533771156	70014.28	124795.86

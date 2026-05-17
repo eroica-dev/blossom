@@ -1,0 +1,251 @@
+@ARTICLE{Nakamoto2008,
+  title   = "Bitcoin: A peer-to-peer electronic cash system",
+  author  = "Nakamoto, S",
+  journal = "Decentralized Business Review",
+  year    =  2008
+}
+
+@ARTICLE{Castro2002,
+  title     = "Practical byzantine fault tolerance and proactive recovery",
+  author    = "Castro, Miguel and Liskov, Barbara",
+  abstract  = "Our growing reliance on online services accessible on the
+               Internet demands highly available systems that provide correct
+               service without interruptions. Software bugs, operator mistakes,
+               and malicious attacks are a major cause of service interruptions
+               and they can cause arbitrary behavior, that is, Byzantine
+               faults. This article describes a new replication algorithm, BFT,
+               that can be used to build highly available systems that tolerate
+               Byzantine faults. BFT can be used in practice to implement real
+               services: it performs well, it is safe in asynchronous
+               environments such as the Internet, it incorporates mechanisms to
+               defend against Byzantine-faulty clients, and it recovers
+               replicas proactively. The recovery mechanism allows the
+               algorithm to tolerate any number of faults over the lifetime of
+               the system provided fewer than 1/3 of the replicas become faulty
+               within a small window of vulnerability. BFT has been implemented
+               as a generic program library with a simple interface. We used
+               the library to implement the first Byzantine-fault-tolerant NFS
+               file system, BFS. The BFT library and BFS perform well because
+               the library incorporates several important optimizations, the
+               most important of which is the use of symmetric cryptography to
+               authenticate messages. The performance results show that BFS
+               performs 2\% faster to 24\% slower than production
+               implementations of the NFS protocol that are not replicated.
+               This supports our claim that the BFT library can be used to
+               build practical systems that tolerate Byzantine faults.",
+  journal   = "ACM Trans. Comput. Syst.",
+  publisher = "Association for Computing Machinery (ACM)",
+  volume    =  20,
+  number    =  4,
+  pages     = "398--461",
+  month     =  nov,
+  year      =  2002,
+  language  = "en"
+}
+
+@INPROCEEDINGS{Miller2016,
+  title           = "The honey badger of {BFT} protocols",
+  booktitle       = "Proceedings of the 2016 {ACM} {SIGSAC} Conference on
+                     Computer and Communications Security",
+  author          = "Miller, Andrew and Xia, Yu and Croman, Kyle and Shi,
+                     Elaine and Song, Dawn",
+  abstract        = "The surprising success of cryptocurrencies has led to a
+                     surge of interest in deploying large scale, highly robust,
+                     Byzantine fault tolerant (BFT) protocols for
+                     mission-critical applications, such as financial
+                     transactions. Although the conventional wisdom is to build
+                     atop a (weakly) synchronous protocol such as PBFT (or a
+                     variation thereof), such protocols rely critically on
+                     network timing assumptions, and only guarantee liveness
+                     when the network behaves as expected. We argue these
+                     protocols are ill-suited for this deployment scenario. We
+                     present an alternative, HoneyBadgerBFT, the first
+                     practical asynchronous BFT protocol, which guarantees
+                     liveness without making any timing assumptions. We base
+                     our solution on a novel atomic broadcast protocol that
+                     achieves optimal asymptotic efficiency. We present an
+                     implementation and experimental results to show our system
+                     can achieve throughput of tens of thousands of
+                     transactions per second, and scales to over a hundred
+                     nodes on a wide area network. We even conduct BFT
+                     experiments over Tor, without needing to tune any
+                     parameters. Unlike the alternatives, HoneyBadgerBFT simply
+                     does not care about the underlying network.",
+  publisher       = "ACM",
+  month           =  oct,
+  year            =  2016,
+  address         = "New York, NY, USA",
+  copyright       = "http://www.acm.org/publications/policies/copyright\_policy\#Background",
+  conference      = "CCS'16: 2016 ACM SIGSAC Conference on Computer and
+                     Communications Security",
+  location        = "Vienna Austria"
+}
+
+@BOOK{Buchman2016,
+  title  = "Tendermint: Byzantine fault tolerance in the age of blockchains
+            (Doctoral dissertation)",
+  author = "Buchman, E",
+  year   =  2016
+}
+
+@ARTICLE{Durstenfeld1964,
+  title     = "Algorithm 235: Random permutation",
+  author    = "Durstenfeld, Richard",
+  journal   = "Commun. ACM",
+  publisher = "Association for Computing Machinery (ACM)",
+  volume    =  7,
+  number    =  7,
+  pages     = "420",
+  month     =  jul,
+  year      =  1964,
+  language  = "en"
+}
+
+@book{burns2022kubernetes,
+  title={Kubernetes: up and running},
+  author={Burns, Brendan and Beda, Joe and Hightower, Kelsey and Evenson, Lachlan},
+  year={2022},
+  publisher={" O'Reilly Media, Inc."}
+}
+
+@MISC{Prometheus_undated-lh,
+  title        = "Prometheus - Monitoring system \& time series database",
+  author       = "{Prometheus}",
+  abstract     = "An open-source monitoring system with a dimensional data
+                  model, flexible query language, efficient time series
+                  database and modern alerting approach.",
+  howpublished = "\url{https://prometheus.io/}",
+  note         = "Accessed: 2023-4-18",
+  language     = "en"
+}
+
+@article{kwon2019cosmos,
+  title ={Cosmos whitepaper},
+  author={Kwon, Jae and Buchman, Ethan},
+  journal={A Netw. Distrib. Ledgers},
+  pages={27},
+  year={2019}
+}
+
+@BOOK{Rocket2018,
+  title    = "Snowflake to avalanche: A novel metastable consensus protocol
+              family for cryptocurrencies",
+  author   = "Rocket, T",
+  year     =  2018
+}
+
+@inproceedings{allavena2005correctness,
+  title={Correctness of a gossip based membership protocol},
+  author={Allavena, Andr{\'e} and Demers, Alan and Hopcroft, John E},
+  booktitle={Proceedings of the twenty-fourth annual ACM symposium on Principles of distributed computing},
+  pages={292--301},
+  year={2005}
+}
+
+@article{yakovenko2018solana,
+  title={Solana: A new architecture for a high performance blockchain v0. 8.13},
+  author={Yakovenko, Anatoly},
+  journal={Whitepaper},
+  year={2018}
+}
+
+@article{sekniqi2020avalanche,
+  title={Avalanche platform},
+  author={Sekniqi, Kevin and Laine, Daniel and Buttolph, Stephen and Sirer, E G{\"u}n},
+  journal={Netw. Distrib. Ledgers},
+  year={2020}
+}
+
+@ARTICLE{Strauch2011-hy,
+  title   = "{NoSQL} databases",
+  author  = "Strauch, C and Sites, U L S and Kriha, W",
+  journal = "Lecture Notes, Stuttgart Media University",
+  volume  =  20,
+  number  =  24,
+  year    =  2011
+}
+
+@ARTICLE{Oneil1996-kb,
+  title   = "The log-structured merge-tree ({LSM-tree})",
+  author  = "Oneil, P and Cheng, E and Gawlick, D and Neil, E",
+  journal = "Acta Informatica",
+  volume  =  33,
+  number  =  4,
+  pages   = "351--385",
+  year    =  1996
+}
+
+@MISC{POS,
+  title        = "Proof of stake instead of proof of work",
+  howpublished = "\url{https://bitcointalk.org/index.php?topic=27787.0}",
+  note         = "Accessed: 2023-4-18"
+}
+
+@ARTICLE{Boutin2022-jl,
+  title    = "{NIST} announces first four quantum-resistant cryptographic
+              algorithms | {NIST}",
+  author   = "Boutin, Chad",
+  abstract = "Federal agency reveals the first group of winners from its
+              six-year competition.",
+  month    =  jul,
+  year     =  2022
+}
+
+@MISC{ether-nodes-hz,
+  title        = "Network types - ethernodes.Org - the ethereum network \& node
+                  explorer",
+  howpublished = "\url{https://ethernodes.org/network-types}",
+  note         = "Accessed: 2023-4-18",
+  language     = "en"
+}
+
+@MISC{polkadot-pl,
+  howpublished = "\url{https://assets.polkadot.network/Polkadot-whitepaper.pdf.}",
+  note         = "Accessed: 2023-4-18"
+}
+
+@INCOLLECTION{Maymounkov2002-in,
+  title     = "Kademlia: A peer-to-peer information system based on the {XOR}
+               metric",
+  booktitle = "{Peer-to-Peer} Systems",
+  author    = "Maymounkov, Petar and Mazi{\`e}res, David",
+  publisher = "Springer Berlin Heidelberg",
+  pages     = "53--65",
+  series    = "Lecture notes in computer science",
+  year      =  2002,
+  address   = "Berlin, Heidelberg"
+}
+
+@ARTICLE{Pugh1990-yz,
+  title     = "Skip lists: a probabilistic alternative to balanced trees",
+  author    = "Pugh, William",
+  abstract  = "Skip lists are data structures that use probabilistic balancing
+               rather than strictly enforced balancing. As a result, the
+               algorithms for insertion and deletion in skip lists are much
+               simpler and significantly faster than equivalent algorithms for
+               balanced trees.",
+  journal   = "Commun. ACM",
+  publisher = "Association for Computing Machinery (ACM)",
+  volume    =  33,
+  number    =  6,
+  pages     = "668--676",
+  month     =  jun,
+  year      =  1990,
+  language  = "en"
+}
+
+@book{carlson2013redis,
+  title={Redis in action},
+  author={Carlson, Josiah},
+  year={2013},
+  publisher={Simon and Schuster}
+}
+
+@MISC{oracle-si,
+  title        = "{LinkedHashMap} (java platform {SE} 8 )",
+  month        =  apr,
+  year         =  2023,
+  howpublished = "\url{https://docs.oracle.com/javase/8/docs/api/java/util/LinkedHashMap.html}",
+  note         = "Accessed: 2023-4-18",
+  language     = "en"
+}

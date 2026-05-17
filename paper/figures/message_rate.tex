@@ -1,0 +1,41 @@
+\begin{figure}[h!]
+    \centering
+    \begin{tikzpicture}
+        \begin{axis}[
+            scale only axis,
+            axis lines = left,
+            % ymode=log,
+            xlabel = $n$,
+            ylabel = {$\Sigma m$},
+        ]
+            % %Below the red plot is defined
+            \addplot [
+                domain=0:100, 
+                samples=100, 
+                color=red,
+            ]
+            {exp(x)-x};
+            \addlegendentry{\(\mathcal{O}(n^2)\)}
+
+            %Below the blue plot is defined
+            \addplot [
+                domain=0:100, 
+                samples=100, 
+                color=blue,
+            ]
+            {x};
+            \addlegendentry{\(\mathcal{O}(n)\)}
+
+            %Below the blue plot is defined
+            \addplot [
+                domain=0:100, 
+                samples=100, 
+                color=black,
+            ]
+            {log2(x)};
+            \addlegendentry{\(\mathcal{O}(\log n)\)}
+        \end{axis}
+    \end{tikzpicture}
+    % \caption{The rate of change in message complexity between \texttt{P2P} (\(\mathcal{O}(n^2))\), improved \texttt{P2P} (\mathcal{O}(n)), and \texttt{Blossom} \mathcal{O}(\log n)}
+    \label{fig:message_rate}
+\end{figure}

@@ -1,3 +1,17 @@
 /target
 Cargo.lock
 .DS_Store
+
+# LaTeX build outputs
+*.aux
+*.bbl
+*.bcf
+*.blg
+*.fdb_latexmk
+*.fls
+*.log
+*.out
+*.pdf
+*.run.xml
+*.synctex*
+*.toc

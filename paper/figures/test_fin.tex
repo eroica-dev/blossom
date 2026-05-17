@@ -1,0 +1,67 @@
+\begin{figure}[h!]
+    \centering
+    \begin{tikzpicture}
+      \pgfplotsset{
+          scale only axis,
+          every axis legend/.append style={ at={(1.25,1.25)}, 
+          legend columns = 0}
+          % legend style={at={(0.5,0.5)},
+      }
+    
+      \begin{axis}[
+        xmode=log,
+        ymode=log,
+        axis y line*=left,
+        axis x line*=bottom,
+        xlabel = Network Size ($n$),
+        ylabel= Finality (Fin),   
+        scaled y ticks=true
+      ]
+
+        \addplot[mark=x,color=black] coordinates{
+            (6,0.455107294288512)
+            (36,1.29)
+            (216,10.95)
+            (1296,59.08)
+            % more points
+          }; \label{plot_1_y1}
+          
+        \addplot[mark=o,color=black] coordinates{
+            (6,0.27530306109322)
+            (36,0.849044639878005)
+            (216,5.44)
+            (1296,26.64)
+            % more points
+          }; \label{plot_1_y2}
+    
+        \addplot[mark=square,color=black] coordinates{
+            (6,0.274978588764595)
+            (36,0.569285265953815)
+            (216,2.68)
+            (1296,10.59)	
+            % more points
+          }; \label{plot_1_y3}
+          
+        \addplot[mark=triangle,color=black] coordinates{
+            (6,0.260436966149718)
+            (36,0.489546359299769)
+            (216,1.79)
+            (1296,6.13)	
+            % more points
+          }; \label{plot_1_y4}
+        
+        \addlegendimage{/pgfplots/refstyle=plot_1_y1}\addlegendentry{\texttt{1vCPU}}
+        \addlegendimage{/pgfplots/refstyle=plot_1_y2}\addlegendentry{\texttt{2vCPU}}
+        \addlegendimage{/pgfplots/refstyle=plot_1_y3}\addlegendentry{\texttt{4vCPU}}
+        \addlegendimage{/pgfplots/refstyle=plot_1_y4}\addlegendentry{\texttt{8vCPU}}
+        \end{axis}
+    \end{tikzpicture}
+    \caption{Average network finality at a given configuration (indicated above).}
+    \label{fig:test_fin}
+\end{figure}
+
+% 	6	36	216	1296
+% Finality [1.vCPU]	0.455107294288512	1.29	10.95	59.08
+% Finality [2.vCPU] 	0.27530306109322	0.849044639878005	5.44	26.64
+% Finality [4.vCPU]	0.274978588764595	0.569285265953815	2.68	10.59
+% Finality [8.vCPU]	0.260436966149718	0.489546359299769	1.79	6.13

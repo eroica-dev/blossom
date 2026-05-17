@@ -1,0 +1,86 @@
+
+
+\begin{figure}[h!]
+    \centering
+    \begin{tikzpicture}
+      \pgfplotsset{
+          scale only axis,
+          xticklabel={\pgfmathparse{\tick*100}\pgfmathprintnumber{\pgfmathresult}\%},
+          yticklabel={\pgfmathparse{\tick*100}\pgfmathprintnumber{\pgfmathresult}\%},
+          every axis legend/.append style={ at={(1.15,1.15)}, 
+          legend columns = 0}
+          % legend style={at={(0.5,0.5)},
+      }
+    
+      \begin{axis}[
+        % xmode=log,
+        % ymode=log,
+        axis y line*=left,
+        axis x line*=bottom,
+        xlabel = Network Utilization (\textit{U}),
+        ylabel= Throughput \(\%\) \(\Delta\),   
+        scaled y ticks=true
+      ]
+
+        \addplot[mark=x,color=black] coordinates{
+            (1, 1)
+            (.9,.9426)
+            (.8,.8838)
+            (.7,.8181)
+            (.6,.7444)
+            (.5,.6609)
+            (.4,.5658)
+            (.3,.4564)
+            (.2,.3291)
+            (.1,.1792)
+            % more points
+          }; \label{plot_1_y1}
+    
+        \addplot[mark=o,color=black] coordinates{
+            (1, 1)
+            (.9,.9727)
+            (.8,.9487)
+            (.7,.9195)
+            (.6,.8832)
+            (.5,.837)
+            (.4,.7761)
+            (.3,.6922)
+            (.2,.5691)
+            (.1,.3711)
+            % more points
+          }; \label{plot_1_y2}
+          
+        \addplot[mark=square,color=black] coordinates{
+            (1, 1)
+            (.9,.9902)
+            (.8,.9889)
+            (.7,.9872)
+            (.6,.9849)
+            (.5,.9818)
+            (.4,.9771)
+            (.3,.9695)
+            (.2,.9545)
+            (.1,.9122)
+            % more points
+          }; \label{plot_1_y3}
+
+% 100 %	1	1	1
+% 90 %	0.9426	0.9727	0.9902
+% 80 %	0.8838	0.9487	0.9889
+% 70 %	0.8181	0.9195	0.9872
+% 60 %	0.7444	0.8832	0.9849
+% 50%	0.6609	0.837	0.9818
+% 40 %	0.5658	0.7761	0.9771
+% 30 %	0.4564	0.6922	0.9695
+% 20 %	0.3291	0.5691	0.9545
+% 10 %	0.1792	0.3711	0.9122
+        
+        \addlegendimage{/pgfplots/refstyle=plot_1_y1}\addlegendentry{100 Nodes}
+        \addlegendimage{/pgfplots/refstyle=plot_1_y2}\addlegendentry{1,000 Nodes}
+        \addlegendimage{/pgfplots/refstyle=plot_1_y3}\addlegendentry{10,000 Nodes}
+
+        \end{axis}
+    \end{tikzpicture}
+    \caption{The percentage decrease in finality time as \textit{network utilization} decreases.}
+    \label{fig:tps_change}
+\end{figure}

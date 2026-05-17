@@ -22,6 +22,8 @@ It does not include the old Actix actors, HTTP APIs, database adapters, metrics 
 - `src/algorithm.rs`: deterministic quorum/round selection.
 - `src/crypto.rs`: Ed25519 public keys, secret keys, signatures, and key generation.
 - `src/block.rs`: minimal signed block and transaction envelope used by dispatch verification.
+- `paper/`: LaTeX protocol paper source and figure assets used as the architecture reference.
+- `docs/architecture.md`: paper-informed architecture map for the extracted crate.
 - `docs/source-map.md`: source files used for the extraction.
 
 ## Verify

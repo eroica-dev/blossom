@@ -1,0 +1,63 @@
+\documentclass{apa7}
+\usepackage{graphicx,appendix,amsmath,amsfonts,pagenote,hyperref,tabularx,changepage}
+\usepackage[symbol]{footmisc}
+\usepackage{anyfontsize}
+\usepackage{draftwatermark}
+\SetWatermarkLightness{ 0.9 }
+\SetWatermarkText{DO NOT COPY}
+\SetWatermarkScale{0.75}
+% \usepackage[style=numeric]{biblatex}
+\graphicspath{{images}}
+
+% hyperref styles
+\hypersetup{
+    colorlinks=true,
+    linkcolor = blue,
+    filecolor=magenta,      
+    urlcolor=cyan,
+    pdfpagemode=FullScreen,
+    citecolor=purple,
+    }
+% graphing styles
+\usepackage{tikz}
+\usepackage{pgfplots}
+\pgfplotsset{width=5.5cm,compat=1.12}
+\usepgfplotslibrary{fillbetween}
+
+\setcounter{secnumdepth}{3}
+
+\chead{\fontsize{10}{12} \selectfont \textit{Blossom Consensus Protocol}}
+
+\cfoot{\fontsize{8}{10} \selectfont \textcolor{gray}{\textit{Eden Labs ©2023 Proprietary and Confidential. All Rights Reserved.}}}
+
+\title{Blossom Consensus Protocol
+
+\small\textit{v}0.6.7}
+\shorttitle{Blossom}
+
+\authorsnames{Devon Tietjen}
+\authorsaffiliations{\textit{{Co-Founder, Eden Labs}}}
+\abstract{\input{sections/disclaimer.tex}}
+
+\begin{document}
+
+\maketitle
+% \input{sections/disclaimer}
+
+\twocolumn
+\tableofcontents
+\input{sections/abstract}
+\input{sections/introduction}
+\input{sections/terminology}
+\input{sections/related}
+\input{sections/assumptions}
+\input{sections/protocol}
+\input{sections/projections}
+\input{sections/benchmarks}
+\input{sections/additions}
+\input{sections/conclusion}
+
+\onecolumn
+\bibliographystyle{acm}
+\bibliography{ref}
+\end{document}

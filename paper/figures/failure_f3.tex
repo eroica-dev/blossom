@@ -1,0 +1,72 @@
+
+
+\begin{figure}[h!]
+    \centering
+    \begin{tikzpicture}
+      \pgfplotsset{
+          scale only axis,
+          every axis legend/.append style={ at={(1.25,1.25)}, 
+          legend columns = 3}
+      }
+    
+      \begin{axis}[
+        xmode=log,
+        ymode=log,
+        axis y line*=left,
+        axis x line*=bottom,
+        xlabel = Total Network Size (\textit{n}),
+        ylabel= Fault Tolerance,   
+        scaled y ticks=true
+      ]
+        \addplot[mark=x,color=black] coordinates{
+            (36,0.000474)	
+            (216,0.0000357)	
+            (1296, 0.0000017)	
+            (7776,0.0000000678)	
+            (46656,0.00000000259)	
+            % more points
+          }; \label{plot_1_y1}
+    
+        \addplot[mark=o,color=black] coordinates{
+            (36,0.00000000451)	
+            (216,0.000000000584)	
+            (1296,0.00000000000233)	
+            (7776,0.00000000000000436)	
+            (46656,0.00000000000000000649)	
+            % more points
+          }; \label{plot_1_y2}
+          
+        \addplot[mark=square,color=black] coordinates{
+            (216,0.00000000000000376)	
+            (1296,0.00000000000000000258)	
+            (7776,0.000000000000000000000265)	
+            (46656,0.0000000000000000000000000162)	
+            % more points
+          }; \label{plot_1_y3}
+        
+        \addplot[mark=triangle,color=black] coordinates{
+            (216,0.00000000000000000000781)	
+            (1296,0.00000000000000000000000227)	
+            (7776,0.000000000000000000000000000015)	
+            (46656,0.00000000000000000000000000000000004)	
+            % more points
+          }; \label{plot_1_y4}
+        
+        \addplot[mark=diamond,color=black] coordinates{
+            (216,0.00000000000000000000000000391)	
+            (1296,0.000000000000000000000000000002)	
+            (7776,0.00000000000000000000000000000000000083)	
+            (46656,0.0000000000000000000000000000000000000000000972)	
+            % more points
+          }; \label{plot_1_y5}
+          \addlegendimage{/pgfplots/refstyle=plot_1_y1}\addlegendentry{1 New Fault}
+        \addlegendimage{/pgfplots/refstyle=plot_1_y2}\addlegendentry{2 New Fault}
+        \addlegendimage{/pgfplots/refstyle=plot_1_y3}\addlegendentry{3 New Fault}
+        \addlegendimage{/pgfplots/refstyle=plot_1_y4}\addlegendentry{4 New Fault}
+
+        \addlegendimage{/pgfplots/refstyle=plot_1_y4}\addlegendentry{5 New Fault}
+        \end{axis}
+    \end{tikzpicture}
+    \caption{The likelihood that a new node would become faulty due to \textit{failure bleed} given \(f = \frac{n}{3}\) faulty nodes.}
+    \label{fig:failure_f3}
+\end{figure}
