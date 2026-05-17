@@ -55,6 +55,7 @@ cargo run --release --bin blossom-harness-bench -- \
   `Dispatch`, `EchoResponse`, `EchoRequest`, `EchoReDispatch`,
   `Verification`, `Proposal`, `Commit`, `EpochStarted`, `Ok`, and
   `Fail`.
+- Overlay broadcast over the topology fan-out API using local TCP nodes.
 - Trusted-cluster intake where unsigned blocks and default-signature
   dispatches are accepted from known members and still rejected from
   unknown senders.
@@ -68,7 +69,7 @@ The library unit tests cover expected behavior and failure behavior for:
 - Ed25519 key/signature parsing, serialization, signing, and rejection
   paths
 - node identity signing and secret-key serialization hygiene
-- service-kind parsing, address-book replacement/removal, and endpoint
+- service-kind parsing, multi-peer address-book registration/removal, and endpoint
   formatting
 - transaction hashing, block signing, block integrity, and tamper
   detection
@@ -82,6 +83,7 @@ The library unit tests cover expected behavior and failure behavior for:
   Merkle-rooted block sets
 - runtime status, block-service key enforcement, empty dispatches, and
   message rejection paths
+- overlay fan-out target selection and direct/topology target filtering
 - trusted runtime behavior for unsigned block submission, unsigned
   dispatch intake, known-member enforcement, trusted dispatch-body
   verification, and trusted quorum verification

@@ -13,6 +13,8 @@ node surface:
 - Consensus state, temporary quorum state, proposal/verification counting, and epoch advancement.
 - Indexed verifier membership, epoch approval checks, and Merkle-rooted epoch block sets.
 - Address book and service registration for block, engine, consensus, relay, and address-book services.
+- Overlay runtime APIs for address-book-backed fan-out without starting
+  the epoch state machine.
 - Local block intake/queueing for signed block-service output.
 - Optional trusted-cluster mode for private known-member deployments that
   skip block/message signatures while retaining membership and hash/merkle
@@ -20,6 +22,7 @@ node surface:
 - Optional `insecure-fast-hash` build feature for trusted/performance
   experiments that swaps protocol SHA-256 commitments for XXH3.
 - A raw TCP `blossom-node` binary with a length-prefixed Borsh wire protocol for health, state, address book, block intake, dispatch, and message handling.
+- Reusable encoded wire frames for cached broadcast/fan-out sends.
 - Minimal cryptographic and block primitives needed for the protocol to compile independently.
 - Unit tests for signing, block verification, quorum selection, address-book behavior, block queueing, message matrix behavior, and runtime block dispatch.
 
@@ -39,6 +42,7 @@ block/engine services together.
 - `src/block.rs`: minimal signed block and transaction envelope used by dispatch verification.
 - `src/address_book.rs`: service registry copied from the Eden runtime shape.
 - `src/local_block.rs`: local signed block queue and build-block helper.
+- `src/overlay.rs`: overlay runtime, fan-out strategies, and broadcast reports.
 - `src/runtime.rs`: deployable node runtime over local state, address book, and block intake.
 - `src/wire.rs`: length-prefixed Borsh request/response protocol.
 - `src/tcp.rs`: reusable TCP node server and request client.
@@ -108,6 +112,30 @@ Borsh-encoded WireRequest
 ```
 
 The response uses the same framing with `WireResponse`.
+
+## Use As An Overlay
+
+`OverlayRuntime` exposes the address book and topology-aware messaging
+without instantiating consensus or epoch state. This is useful for DHT,
+gossip, and application-level overlay traffic that wants Blossom's
+structured fan-out but not block commitment.
+
+```rust
+use blossom::{FanOutStrategy, HashType, Msg, OverlayRuntime};
+
+let overlay = OverlayRuntime::new(self_node);
+overlay.register_service(peer_consensus_service);
+
+let report = overlay
+    .broadcast(Msg::Ok, FanOutStrategy::topology(HashType::hash(b"round")))
+    .await?;
+```
+
+`NodeRuntime` exposes the same `broadcast` and `broadcast_request` APIs
+for deployers that want consensus nodes to send application-level
+messages through the selected topology. The address book supports
+multiple services per kind, so each consensus peer can be registered
+independently.
 
 ## Run The Harness
 

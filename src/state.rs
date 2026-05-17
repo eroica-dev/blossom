@@ -115,10 +115,8 @@ impl LocalState {
             return false;
         };
 
-        if !consensus {
-            if let Some(quorum) = current_consensus.quorum.get_mut(&current_round) {
-                quorum.verified_blocks.clear();
-            }
+        if !consensus && let Some(quorum) = current_consensus.quorum.get_mut(&current_round) {
+            quorum.verified_blocks.clear();
         }
 
         if current_consensus.peers.len() > current_round as usize + 1 {
@@ -608,7 +606,7 @@ fn block_merkle_root(blocks: &BTreeMap<HashType, Block>) -> HashType {
         if let Some(hash) = blocks.keys().next().copied().filter(|_| blocks.len() == 1) {
             return hash;
         }
-        return blocks.hash();
+        blocks.hash()
     }
 
     #[cfg(not(feature = "insecure-fast-hash"))]

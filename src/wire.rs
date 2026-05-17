@@ -1,4 +1,5 @@
 use borsh::{BorshDeserialize, BorshSerialize};
+use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use std::env;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -78,6 +79,48 @@ pub struct AddressBookUpdate {
     pub nonce_announced: Option<Nonce>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EncodedFrame {
+    bytes: Bytes,
+    payload_len: usize,
+}
+
+impl EncodedFrame {
+    pub fn encode<T>(value: &T) -> Result<Self>
+    where
+        T: BorshSerialize + ?Sized,
+    {
+        let payload =
+            borsh::to_vec(value).map_err(|err| BlossomError::WireProtocol(err.to_string()))?;
+        validate_payload_len(payload.len())?;
+
+        let mut bytes = Vec::with_capacity(FRAME_PREFIX_BYTES + payload.len());
+        bytes.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+        bytes.extend_from_slice(&payload);
+
+        Ok(Self {
+            bytes: Bytes::from(bytes),
+            payload_len: payload.len(),
+        })
+    }
+
+    pub fn as_bytes(&self) -> &[u8] {
+        self.bytes.as_ref()
+    }
+
+    pub fn payload_len(&self) -> usize {
+        self.payload_len
+    }
+
+    pub fn framed_len(&self) -> usize {
+        self.bytes.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.bytes.is_empty()
+    }
+}
+
 pub async fn read_frame<T, R>(reader: &mut R) -> Result<T>
 where
     T: BorshDeserialize,
@@ -105,9 +148,7 @@ where
     W: AsyncWrite + Unpin,
 {
     let bytes = borsh::to_vec(value).map_err(|err| BlossomError::WireProtocol(err.to_string()))?;
-    if bytes.is_empty() || bytes.len() > configured_max_frame_size() {
-        return Err(BlossomError::InvalidFrameSize(bytes.len()));
-    }
+    validate_payload_len(bytes.len())?;
 
     writer
         .write_u32(bytes.len() as u32)
@@ -115,6 +156,21 @@ where
         .map_err(|err| BlossomError::Io(err.to_string()))?;
     writer
         .write_all(&bytes)
+        .await
+        .map_err(|err| BlossomError::Io(err.to_string()))?;
+    writer
+        .flush()
+        .await
+        .map_err(|err| BlossomError::Io(err.to_string()))
+}
+
+pub async fn write_encoded_frame<W>(writer: &mut W, frame: &EncodedFrame) -> Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    validate_payload_len(frame.payload_len)?;
+    writer
+        .write_all(frame.as_bytes())
         .await
         .map_err(|err| BlossomError::Io(err.to_string()))?;
     writer
@@ -147,6 +203,13 @@ where
         .ok_or_else(|| BlossomError::WireProtocol("frame length overflow".to_string()))
 }
 
+fn validate_payload_len(len: usize) -> Result<()> {
+    if len == 0 || len > configured_max_frame_size() {
+        return Err(BlossomError::InvalidFrameSize(len));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use tokio::io::{AsyncWriteExt, duplex};
@@ -159,6 +222,23 @@ mod tests {
         let request = WireRequest::NextNonce;
 
         let writer = tokio::spawn(async move { write_frame(&mut client, &request).await });
+        let read: WireRequest = read_frame(&mut server).await.unwrap();
+        writer.await.unwrap().unwrap();
+
+        assert!(matches!(read, WireRequest::NextNonce));
+    }
+
+    #[tokio::test]
+    async fn encoded_frame_round_trip() {
+        let (mut client, mut server) = duplex(1024);
+        let request = WireRequest::NextNonce;
+        let frame = EncodedFrame::encode(&request).unwrap();
+
+        assert_eq!(frame.payload_len(), encoded_len(&request).unwrap());
+        assert_eq!(frame.framed_len(), framed_len(&request).unwrap());
+        assert!(!frame.is_empty());
+
+        let writer = tokio::spawn(async move { write_encoded_frame(&mut client, &frame).await });
         let read: WireRequest = read_frame(&mut server).await.unwrap();
         writer.await.unwrap().unwrap();
 

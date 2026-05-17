@@ -18,6 +18,7 @@ pub mod local_block;
 pub mod messages;
 pub mod node;
 pub mod nonce;
+pub mod overlay;
 pub mod register;
 pub mod runtime;
 pub mod service_client;
@@ -39,15 +40,17 @@ pub use local_block::LocalBlock;
 pub use messages::{MSGKey, Msg};
 pub use node::{NodeIdentity, NodeType};
 pub use nonce::Nonce;
+pub use overlay::{BroadcastReceipt, BroadcastReport, FanOutStrategy, OverlayRuntime};
 pub use register::{MessageMatrix, QuorumQueue, Status};
 pub use runtime::{
-    AcceptedBlock, EpochTarget, MessageReceipt, NodeRuntime, NodeStatus, RuntimeConfig, TrustMode,
-    genesis_epoch,
+    AcceptedBlock, EpochTarget, MessageReceipt, NodeRuntime, NodeStatus, RuntimeConfig,
+    RuntimeMode, TrustMode, genesis_epoch,
 };
 pub use service_client::TcpServiceClient;
 pub use state::{Epoch, EpochBody, EpochChain, EpochNonce, LocalState, TempConsensus, TempQuorum};
-pub use tcp::{TcpNode, send_wire_request};
+pub use tcp::{TcpNode, send_wire_frame, send_wire_request};
 pub use wire::{
-    AddressBookUpdate, NodeHealth, WireRequest, WireResponse, configured_max_frame_size,
-    encoded_len, framed_len, read_frame, write_frame,
+    AddressBookUpdate, EncodedFrame, NodeHealth, WireRequest, WireResponse,
+    configured_max_frame_size, encoded_len, framed_len, read_frame, write_encoded_frame,
+    write_frame,
 };

@@ -185,6 +185,7 @@ fn build_nodes(count: usize) -> Vec<BenchNode> {
         .collect()
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_epoch(
     epoch: usize,
     epoch_depth: usize,
@@ -420,6 +421,7 @@ fn round_quorums(keys: &[PubKey], seed: HashType, shuffle: bool) -> Vec<Vec<Vec<
         .collect()
 }
 
+#[allow(clippy::too_many_arguments)]
 fn count_quorum_messages(
     round: u8,
     quorum: &[usize],

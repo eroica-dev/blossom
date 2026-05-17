@@ -59,6 +59,8 @@ The current implementation maps that layer to:
   service requests.
 - `src/tcp.rs`: reusable server/client path used by the node binary,
   harness, and end-to-end tests.
+- `src/overlay.rs`: address-book-backed fan-out and broadcast APIs for
+  using Blossom's topology without running epoch consensus.
 - `src/bin/blossom-node.rs`: TCP listener for block intake, message
   intake, dispatch generation, address-book updates, and state.
 - `src/service_client.rs`: TCP helpers for block-service nonce updates
@@ -133,10 +135,24 @@ The shuffle is deterministic and seed-driven so the topology can change
 between epochs while remaining independently reproducible by every
 validator.
 
+## Overlay Mode
+
+`OverlayRuntime` exposes the transport-facing pieces of Blossom without
+creating local epoch state. It owns a node identity plus an address book,
+registers multiple consensus services, selects fan-out targets with the
+same topology algorithm, and broadcasts `WireRequest` or `Msg` values over
+the TCP wire path.
+
+`NodeRuntime` exposes the same broadcast surface for full consensus nodes.
+This lets applications reuse Blossom's structured fan-out for overlay
+messages, gossip, DHT routing, or private-agent coordination without
+committing a block or advancing an epoch.
+
 ## Implemented Now
 
 - Primary Blossom message structures.
 - Deterministic quorum and round selection.
+- Overlay runtime and runtime broadcast APIs using the quorum topology.
 - Primary dispatch, echo, verification, proposal, and commit message
   flow.
 - Local consensus, temporary quorum state, and epoch chain structures.

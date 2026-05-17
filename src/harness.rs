@@ -11,8 +11,8 @@ use crate::error::{BlossomError, Result};
 use crate::node::NodeIdentity;
 use crate::nonce::Nonce;
 use crate::runtime::{EpochTarget, RuntimeConfig, TrustMode, genesis_epoch};
-use crate::tcp::{TcpNode, send_wire_request};
-use crate::wire::{WireRequest, WireResponse, read_frame, write_frame};
+use crate::tcp::{TcpNode, send_wire_frame, send_wire_request};
+use crate::wire::{EncodedFrame, WireRequest, WireResponse, read_frame, write_frame};
 
 pub struct SimulatedCluster {
     nodes: Vec<SimulatedNode>,
@@ -138,6 +138,10 @@ impl SimulatedCluster {
         self.nodes[index].request(request).await
     }
 
+    pub async fn request_frame(&self, index: usize, frame: &EncodedFrame) -> Result<WireResponse> {
+        self.nodes[index].request_frame(frame).await
+    }
+
     pub async fn next_target(&self, index: usize) -> Result<EpochTarget> {
         match self.request(index, WireRequest::NextNonce).await? {
             WireResponse::NextNonce(target) => Ok(target),
@@ -174,6 +178,10 @@ impl SimulatedNode {
 
     pub async fn request(&self, request: WireRequest) -> Result<WireResponse> {
         send_wire_request(self.addr(), request).await
+    }
+
+    pub async fn request_frame(&self, frame: &EncodedFrame) -> Result<WireResponse> {
+        send_wire_frame(self.addr(), frame).await
     }
 }
 

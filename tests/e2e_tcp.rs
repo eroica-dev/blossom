@@ -2,10 +2,10 @@ use std::collections::BTreeMap;
 
 use blossom::{
     Block, BlossomBody, Commit, CommitBody, Dispatch, EchoReDispatch, EchoRequest, EchoResponse,
-    EchoResponseBody, EpochStarted, EpochStartedBody, EpochTarget, HashType, Header, MSGKey,
-    MockBlockService, Msg, Nonce, Proposal, ProposalBody, ServiceKind, Signature, SimulatedCluster,
-    TcpServiceClient, Transaction, TrustMode, Verification, VerificationBody, WireRequest,
-    WireResponse,
+    EchoResponseBody, EpochStarted, EpochStartedBody, EpochTarget, FanOutStrategy, HashType,
+    Header, MSGKey, MockBlockService, Msg, Nonce, OverlayRuntime, Proposal, ProposalBody,
+    ServiceKind, Signature, SimulatedCluster, TcpServiceClient, Transaction, TrustMode,
+    Verification, VerificationBody, WireRequest, WireResponse,
 };
 use blossom::{DoHash, NodeIdentity};
 
@@ -48,6 +48,27 @@ async fn cluster_exposes_health_state_address_book_and_nonce() {
             Nonce::new(1)
         );
     }
+}
+
+#[tokio::test]
+async fn overlay_runtime_broadcasts_over_topology() {
+    let cluster = SimulatedCluster::spawn(6).await.unwrap();
+    let overlay = OverlayRuntime::new(cluster.node(0).identity.clone());
+    for node in cluster.nodes() {
+        overlay.register_service(node.service.clone());
+    }
+
+    let report = overlay
+        .broadcast(
+            Msg::Ok,
+            FanOutStrategy::unshuffled_topology(HashType::default()),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(report.attempted(), 5);
+    assert_eq!(report.accepted(), 5);
+    assert_eq!(report.failed(), 0);
 }
 
 #[tokio::test]

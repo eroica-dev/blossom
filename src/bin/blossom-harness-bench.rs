@@ -6,8 +6,8 @@ use std::time::Instant;
 use clap::{Parser, ValueEnum};
 
 use blossom::{
-    BlossomError, MockBlockService, Msg, SimulatedCluster, Transaction, WireRequest, WireResponse,
-    encoded_len, framed_len, signed_block,
+    BlossomError, EncodedFrame, MockBlockService, Msg, SimulatedCluster, Transaction, WireRequest,
+    WireResponse, encoded_len, framed_len, signed_block,
 };
 
 type MainResult<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
@@ -206,10 +206,11 @@ async fn run_iteration(
     let mut deliveries_attempted = 0usize;
     let mut deliveries_accepted = 0usize;
     let delivered = if nodes > 1 {
+        let deliver_request = WireRequest::Message(Msg::Dispatch(dispatch));
+        let deliver_frame = EncodedFrame::encode(&deliver_request)?;
+        let deliver_request_bytes = deliver_frame.framed_len();
         for recipient in 1..nodes {
-            let deliver_request = WireRequest::Message(Msg::Dispatch(dispatch.clone()));
-            let deliver_request_bytes = framed_len(&deliver_request)?;
-            let deliver_response = cluster.request(recipient, deliver_request).await?;
+            let deliver_response = cluster.request_frame(recipient, &deliver_frame).await?;
             let deliver_response_bytes = framed_len(&deliver_response)?;
             deliver_wire_bytes += deliver_request_bytes + deliver_response_bytes;
             deliveries_attempted += 1;

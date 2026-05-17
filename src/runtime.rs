@@ -18,7 +18,12 @@ use crate::local_block::LocalBlock;
 use crate::messages::{MSGKey, Msg};
 use crate::node::NodeIdentity;
 use crate::nonce::Nonce;
+use crate::overlay::{
+    BroadcastReport, FanOutStrategy, add_self_consensus_service, broadcast_wire_request,
+    select_fanout_targets,
+};
 use crate::state::{Epoch, EpochBody, LocalState};
+use crate::wire::WireRequest;
 
 #[derive(Debug, Clone)]
 pub struct RuntimeConfig {
@@ -27,6 +32,7 @@ pub struct RuntimeConfig {
     pub address_book: AddressBook,
     pub block_cap: usize,
     pub trust_mode: TrustMode,
+    pub mode: RuntimeMode,
 }
 
 impl RuntimeConfig {
@@ -37,8 +43,21 @@ impl RuntimeConfig {
             address_book: AddressBook::new(),
             block_cap: 100,
             trust_mode: TrustMode::Verified,
+            mode: RuntimeMode::Consensus,
         }
     }
+
+    pub fn overlay(self_node: NodeIdentity) -> Self {
+        let mut config = Self::new(self_node);
+        config.mode = RuntimeMode::Overlay;
+        config
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RuntimeMode {
+    Consensus,
+    Overlay,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -101,13 +120,7 @@ impl NodeRuntime {
             .genesis
             .take()
             .unwrap_or_else(|| genesis_epoch([config.self_node.clone()]));
-        config.address_book.add(Service::new(
-            ServiceKind::Consensus,
-            config.self_node.public_key(),
-            config.self_node.protocol.clone(),
-            config.self_node.host.clone(),
-            config.self_node.port,
-        ));
+        add_self_consensus_service(&mut config.address_book, &config.self_node);
 
         Self {
             inner: Arc::new(RuntimeInner {
@@ -172,6 +185,30 @@ impl NodeRuntime {
             .write()
             .expect("address book lock poisoned")
             .add(service)
+    }
+
+    pub fn fanout_targets(&self, strategy: &FanOutStrategy) -> Vec<Service> {
+        let self_node = self.self_node();
+        let address_book = self
+            .inner
+            .address_book
+            .read()
+            .expect("address book lock poisoned");
+        select_fanout_targets(&self_node, &address_book, strategy)
+    }
+
+    pub async fn broadcast(&self, msg: Msg, strategy: FanOutStrategy) -> Result<BroadcastReport> {
+        self.broadcast_request(WireRequest::Message(msg), strategy)
+            .await
+    }
+
+    pub async fn broadcast_request(
+        &self,
+        request: WireRequest,
+        strategy: FanOutStrategy,
+    ) -> Result<BroadcastReport> {
+        let targets = self.fanout_targets(&strategy);
+        broadcast_wire_request(request, targets).await
     }
 
     pub fn next_epoch_target(&self) -> Result<EpochTarget> {
@@ -589,6 +626,30 @@ mod tests {
         assert_eq!(dispatch.header.nonce, target.nonce);
         assert_eq!(dispatch.body.blocks.len(), 1);
         assert_eq!(runtime.status().unwrap().pending_blocks, 0);
+    }
+
+    #[test]
+    fn fanout_targets_use_registered_consensus_services() {
+        let (runtime, keypairs, _) = runtime_with_peers();
+        for (index, keypair) in keypairs.iter().enumerate().skip(1) {
+            runtime.register_service(Service::new(
+                ServiceKind::Consensus,
+                keypair.public,
+                "tcp",
+                "127.0.0.1",
+                8000 + index as u16,
+            ));
+        }
+
+        let targets =
+            runtime.fanout_targets(&FanOutStrategy::unshuffled_topology(HashType::default()));
+
+        assert_eq!(targets.len(), 5);
+        assert!(
+            targets
+                .iter()
+                .all(|service| service.public_key != keypairs[0].public)
+        );
     }
 
     #[test]

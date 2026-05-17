@@ -6,7 +6,7 @@ use blossom::{
     MessageMatrix, NodeIdentity, Nonce, PubKey, RuntimeConfig, SignatureTree, Transaction,
     TrustMode, genesis_epoch,
 };
-use blossom::{DoHash, NodeRuntime, WireRequest, framed_len};
+use blossom::{DoHash, EncodedFrame, NodeRuntime, WireRequest, framed_len};
 use criterion::{BatchSize, BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use std::hint::black_box;
 
@@ -276,6 +276,25 @@ fn bench_block_scaling(c: &mut Criterion) {
                     )
                 });
             },
+        );
+
+        group.bench_with_input(
+            BenchmarkId::new("submit_frame_encode_32b_txs", count),
+            &count,
+            |b, _| {
+                b.iter(|| {
+                    black_box(
+                        EncodedFrame::encode(black_box(&submit)).expect("wire frame should encode"),
+                    )
+                });
+            },
+        );
+
+        let encoded = EncodedFrame::encode(&submit).expect("wire frame should encode");
+        group.bench_with_input(
+            BenchmarkId::new("submit_frame_clone_32b_txs", count),
+            &count,
+            |b, _| b.iter(|| black_box(black_box(&encoded).clone())),
         );
     }
 

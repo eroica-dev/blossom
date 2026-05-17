@@ -5,7 +5,8 @@ use crate::error::{BlossomError, Result};
 use crate::runtime::NodeRuntime;
 use crate::service_client::TcpServiceClient;
 use crate::wire::{
-    AddressBookUpdate, NodeHealth, WireRequest, WireResponse, read_frame, write_frame,
+    AddressBookUpdate, EncodedFrame, NodeHealth, WireRequest, WireResponse, read_frame,
+    write_encoded_frame, write_frame,
 };
 
 #[derive(Clone)]
@@ -105,6 +106,14 @@ pub async fn send_wire_request(
         .await
         .map_err(|err| BlossomError::Io(err.to_string()))?;
     write_frame(&mut stream, &request).await?;
+    read_frame(&mut stream).await
+}
+
+pub async fn send_wire_frame(addr: impl AsRef<str>, frame: &EncodedFrame) -> Result<WireResponse> {
+    let mut stream = TcpStream::connect(addr.as_ref())
+        .await
+        .map_err(|err| BlossomError::Io(err.to_string()))?;
+    write_encoded_frame(&mut stream, frame).await?;
     read_frame(&mut stream).await
 }
 

@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::fmt;
 use std::str::FromStr;
 
@@ -99,7 +99,7 @@ impl Service {
     Serialize, Deserialize, BorshSerialize, BorshDeserialize, Debug, Clone, Default, PartialEq, Eq,
 )]
 pub struct AddressBook {
-    services: HashMap<ServiceKind, Service>,
+    services: BTreeMap<(ServiceKind, PubKey), Service>,
 }
 
 impl AddressBook {
@@ -108,19 +108,45 @@ impl AddressBook {
     }
 
     pub fn add(&mut self, service: Service) -> Option<Service> {
-        self.services.insert(service.kind, service)
+        self.services
+            .insert((service.kind, service.public_key), service)
     }
 
     pub fn service(&self, kind: ServiceKind) -> Option<&Service> {
-        self.services.get(&kind)
+        self.services
+            .iter()
+            .find_map(|((service_kind, _), service)| (*service_kind == kind).then_some(service))
+    }
+
+    pub fn service_for(&self, kind: ServiceKind, public_key: &PubKey) -> Option<&Service> {
+        self.services.get(&(kind, *public_key))
+    }
+
+    pub fn services_for_kind(&self, kind: ServiceKind) -> impl Iterator<Item = &Service> {
+        self.services
+            .iter()
+            .filter_map(move |((service_kind, _), service)| {
+                (*service_kind == kind).then_some(service)
+            })
     }
 
     pub fn remove(&mut self, kind: ServiceKind) -> Option<Service> {
-        self.services.remove(&kind)
+        let key = self
+            .services
+            .keys()
+            .find(|(service_kind, _)| *service_kind == kind)
+            .copied()?;
+        self.services.remove(&key)
+    }
+
+    pub fn remove_service(&mut self, kind: ServiceKind, public_key: &PubKey) -> Option<Service> {
+        self.services.remove(&(kind, *public_key))
     }
 
     pub fn contains(&self, kind: ServiceKind) -> bool {
-        self.services.contains_key(&kind)
+        self.services
+            .keys()
+            .any(|(service_kind, _)| *service_kind == kind)
     }
 
     pub fn len(&self) -> usize {
@@ -136,9 +162,7 @@ impl AddressBook {
     }
 
     pub fn into_services(self) -> Vec<Service> {
-        let mut services = self.services.into_values().collect::<Vec<_>>();
-        services.sort_by_key(|service| service.kind);
-        services
+        self.services.into_values().collect()
     }
 }
 
@@ -147,7 +171,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn stores_one_service_per_kind() {
+    fn stores_multiple_services_per_kind() {
         let mut book = AddressBook::new();
         let first = Service::new(
             ServiceKind::Block,
@@ -165,8 +189,19 @@ mod tests {
         );
 
         assert!(book.add(first.clone()).is_none());
-        assert_eq!(book.add(second.clone()), Some(first));
-        assert_eq!(book.service(ServiceKind::Block), Some(&second));
+        assert!(book.add(second.clone()).is_none());
+        assert_eq!(book.add(second.clone()), Some(second.clone()));
+        assert_eq!(
+            book.service_for(ServiceKind::Block, &first.public_key),
+            Some(&first)
+        );
+        assert_eq!(
+            book.services_for_kind(ServiceKind::Block)
+                .cloned()
+                .collect::<Vec<_>>(),
+            vec![first.clone(), second.clone()]
+        );
+        assert_eq!(book.service(ServiceKind::Block), Some(&first));
     }
 
     #[test]
