@@ -277,6 +277,7 @@ impl DispatchBody {
             accepted_blocks.insert(*sent_hash, block.clone());
         }
 
+        let accepted_blocks_hash = accepted_blocks.hash();
         let signature_tree = if verify_signatures {
             if self.signature_tree.verify() {
                 self.signature_tree.clone()
@@ -291,8 +292,8 @@ impl DispatchBody {
         let signature_tree_hash = signature_tree.hash();
 
         (
-            accepted_blocks.clone(),
-            accepted_blocks.hash(),
+            accepted_blocks,
+            accepted_blocks_hash,
             signature_tree,
             signature_tree_hash,
         )
