@@ -10,8 +10,8 @@ use blossom::algorithm::select_quorums;
 use blossom::wire::FRAME_PREFIX_BYTES;
 use blossom::{
     Block, BlockHandle, BlockIndex, BlossomBody, Commit, CommitBody, DoHash, EchoResponse,
-    EchoResponseBody, HashType, Header, Keypair, Msg, Nonce, Proposal, ProposalBody, PubKey,
-    SecretSigner, SignatureTree, Transaction, Verification, VerificationBody, WireRequest,
+    EchoResponseBody, HashType, Header, Keypair, MSGKey, Msg, Nonce, Proposal, ProposalBody,
+    PubKey, SecretSigner, SignatureTree, Transaction, Verification, VerificationBody, WireRequest,
     encoded_len, framed_len,
 };
 
@@ -488,6 +488,7 @@ fn dispatch_profile_for(
     let blocks_hash = blocks.hash();
     let header = signed_header_bytes(
         node,
+        MSGKey::Dispatch,
         last_epoch,
         nonce,
         round,
@@ -520,7 +521,7 @@ fn dispatch_for(
         signature_tree_hash,
     };
     Ok(blossom::Dispatch {
-        header: signed_header(node, last_epoch, nonce, round, &body)?,
+        header: signed_header(node, MSGKey::Dispatch, last_epoch, nonce, round, &body)?,
         body,
     })
 }
@@ -538,7 +539,7 @@ fn echo_for(
         signature_tree_hash: dispatch.signature_tree_hash,
     };
     Ok(EchoResponse {
-        header: signed_header(node, last_epoch, nonce, round, &body)?,
+        header: signed_header(node, MSGKey::EchoResponse, last_epoch, nonce, round, &body)?,
         body,
     })
 }
@@ -556,7 +557,7 @@ fn verification_for(
         blocks: blocks.clone(),
     };
     Ok(Verification {
-        header: signed_header(node, last_epoch, nonce, round, &body)?,
+        header: signed_header(node, MSGKey::Verification, last_epoch, nonce, round, &body)?,
         body,
     })
 }
@@ -578,7 +579,7 @@ fn proposal_for(
         signature_tree_hash: Some(blocks.hash()),
     };
     Ok(Proposal {
-        header: signed_header(node, last_epoch, nonce, round, &body)?,
+        header: signed_header(node, MSGKey::Proposal, last_epoch, nonce, round, &body)?,
         body,
     })
 }
@@ -594,40 +595,58 @@ fn commit_for(
         signature_tree_insert: None,
     };
     Ok(Commit {
-        header: signed_header(node, last_epoch, nonce, round, &body)?,
+        header: signed_header(node, MSGKey::Commit, last_epoch, nonce, round, &body)?,
         body,
     })
 }
 
 fn signed_header<T: BlossomBody>(
     node: &BenchNode,
+    kind: MSGKey,
     last_epoch: HashType,
     nonce: Nonce,
     round: u8,
     body: &T,
 ) -> MainResult<Header> {
+    let message_hash = Header::signature_hash_for_body(
+        &node.keypair.public,
+        &last_epoch,
+        nonce,
+        round,
+        kind,
+        body,
+    );
     Ok(Header {
         sender: node.keypair.public,
         last_epoch,
         nonce,
         round,
-        signature: node.signer.sign(&body.to_bytes()),
+        signature: node.signer.sign(message_hash.as_ref()),
     })
 }
 
 fn signed_header_bytes(
     node: &BenchNode,
+    kind: MSGKey,
     last_epoch: HashType,
     nonce: Nonce,
     round: u8,
     body_bytes: &[u8],
 ) -> MainResult<Header> {
+    let message_hash = Header::signature_hash_for_bytes(
+        &node.keypair.public,
+        &last_epoch,
+        nonce,
+        round,
+        kind,
+        body_bytes,
+    );
     Ok(Header {
         sender: node.keypair.public,
         last_epoch,
         nonce,
         round,
-        signature: node.signer.sign(body_bytes),
+        signature: node.signer.sign(message_hash.as_ref()),
     })
 }
 

@@ -3,6 +3,7 @@ use std::collections::BTreeMap;
 
 use borsh::{BorshDeserialize, BorshSerialize};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use crate::block::Block;
 use crate::crypto::{PubKey, Signature};
@@ -12,6 +13,8 @@ use crate::messages::{MSGKey, Msg};
 use crate::node::NodeIdentity;
 use crate::nonce::Nonce;
 use crate::state::LocalState;
+
+const MESSAGE_SIGNATURE_DOMAIN: &[u8] = b"blossom.message-signature.v1";
 
 #[derive(Serialize, Deserialize, BorshSerialize, BorshDeserialize, Debug, Clone, Default)]
 pub struct Header {
@@ -23,6 +26,66 @@ pub struct Header {
 }
 
 impl Header {
+    pub fn signature_hash<B: BlossomBody>(&self, kind: MSGKey, body: &B) -> HashType {
+        Self::signature_hash_for_body(
+            &self.sender,
+            &self.last_epoch,
+            self.nonce,
+            self.round,
+            kind,
+            body,
+        )
+    }
+
+    pub fn signature_hash_for_body<B: BlossomBody>(
+        sender: &PubKey,
+        last_epoch: &HashType,
+        nonce: Nonce,
+        round: u8,
+        kind: MSGKey,
+        body: &B,
+    ) -> HashType {
+        let mut sha256 = Sha256::new();
+        Self::update_signature_context(&mut sha256, sender, last_epoch, nonce, round, kind);
+        body.update_signing_hash(&mut sha256);
+        HashType::from_byte_hash(sha256.finalize().into())
+    }
+
+    pub fn signature_hash_for_bytes(
+        sender: &PubKey,
+        last_epoch: &HashType,
+        nonce: Nonce,
+        round: u8,
+        kind: MSGKey,
+        body_bytes: &[u8],
+    ) -> HashType {
+        let mut sha256 = Sha256::new();
+        Self::update_signature_context(&mut sha256, sender, last_epoch, nonce, round, kind);
+        sha256.update(body_bytes);
+        HashType::from_byte_hash(sha256.finalize().into())
+    }
+
+    fn update_signature_context(
+        sha256: &mut Sha256,
+        sender: &PubKey,
+        last_epoch: &HashType,
+        nonce: Nonce,
+        round: u8,
+        kind: MSGKey,
+    ) {
+        sha256.update(MESSAGE_SIGNATURE_DOMAIN);
+        sha256.update([kind.signature_tag()]);
+        sha256.update(sender.as_ref());
+        sha256.update(last_epoch.as_ref());
+        sha256.update(nonce.to_le_bytes());
+        sha256.update([round]);
+    }
+
+    pub fn verify_signature<B: BlossomBody>(&self, kind: MSGKey, body: &B) -> Result<()> {
+        self.signature
+            .verify(self.signature_hash(kind, body).as_ref(), &self.sender)
+    }
+
     pub fn verify_header(&self, state: &mut LocalState) -> Option<bool> {
         let consensus = state.get_mut_consensus(&self.last_epoch, self.nonce);
         if !consensus.is_peer_member_of_round(&self.sender, self.round) {
@@ -68,11 +131,21 @@ pub trait BlossomMessage: std::fmt::Debug + Sized {
 
 pub trait BlossomBody {
     fn signature(&self, node: &NodeIdentity) -> Result<Signature> {
-        node.sign(&self.to_bytes())
+        node.sign(self.signing_hash().as_ref())
     }
 
     fn verify(&self, signature: &Signature, pub_key: &PubKey) -> Result<()> {
-        signature.verify(&self.to_bytes(), pub_key)
+        signature.verify(self.signing_hash().as_ref(), pub_key)
+    }
+
+    fn signing_hash(&self) -> HashType {
+        let mut sha256 = Sha256::new();
+        self.update_signing_hash(&mut sha256);
+        HashType::from_byte_hash(sha256.finalize().into())
+    }
+
+    fn update_signing_hash(&self, sha256: &mut Sha256) {
+        sha256.update(self.to_bytes());
     }
 
     fn to_bytes(&self) -> Vec<u8>;
@@ -201,6 +274,11 @@ impl DispatchBody {
 }
 
 impl BlossomBody for DispatchBody {
+    fn update_signing_hash(&self, sha256: &mut Sha256) {
+        sha256.update(self.blocks_hash.as_ref());
+        sha256.update(self.signature_tree_hash.as_ref());
+    }
+
     fn to_bytes(&self) -> Vec<u8> {
         [self.blocks_hash.as_ref(), self.signature_tree_hash.as_ref()].concat()
     }
@@ -262,6 +340,12 @@ pub struct EchoResponseBody {
 }
 
 impl BlossomBody for EchoResponseBody {
+    fn update_signing_hash(&self, sha256: &mut Sha256) {
+        sha256.update(self.sender.as_ref());
+        sha256.update(self.blocks_hash.as_ref());
+        sha256.update(self.signature_tree_hash.as_ref());
+    }
+
     fn to_bytes(&self) -> Vec<u8> {
         [
             self.sender.as_ref(),
@@ -315,6 +399,10 @@ pub struct VerificationBody {
 }
 
 impl BlossomBody for VerificationBody {
+    fn update_signing_hash(&self, sha256: &mut Sha256) {
+        sha256.update(self.blocks_hash.as_ref());
+    }
+
     fn to_bytes(&self) -> Vec<u8> {
         self.blocks_hash.as_ref().to_vec()
     }
@@ -355,6 +443,16 @@ pub struct ProposalBody {
 }
 
 impl BlossomBody for ProposalBody {
+    fn update_signing_hash(&self, sha256: &mut Sha256) {
+        if !self.consensus {
+            sha256.update([0]);
+            return;
+        }
+
+        sha256.update(self.approved_hash.unwrap_or_default().as_ref());
+        sha256.update(self.signature_tree_hash.unwrap_or_default().as_ref());
+    }
+
     fn to_bytes(&self) -> Vec<u8> {
         if !self.consensus {
             return vec![0];
@@ -399,6 +497,17 @@ pub struct CommitBody {
 }
 
 impl BlossomBody for CommitBody {
+    fn update_signing_hash(&self, sha256: &mut Sha256) {
+        match &self.signature_tree_insert {
+            Some(tree) => {
+                for key in tree.keys() {
+                    sha256.update(key.as_ref());
+                }
+            }
+            None => sha256.update([0]),
+        }
+    }
+
     fn to_bytes(&self) -> Vec<u8> {
         match &self.signature_tree_insert {
             Some(tree) => {
@@ -445,6 +554,10 @@ pub struct EpochStarted {
 pub struct EpochStartedBody {}
 
 impl BlossomBody for EpochStartedBody {
+    fn update_signing_hash(&self, sha256: &mut Sha256) {
+        sha256.update([0]);
+    }
+
     fn to_bytes(&self) -> Vec<u8> {
         vec![0]
     }
@@ -625,5 +738,42 @@ mod tests {
 
         assert!(body.verify(&signature, &keypair.public).is_ok());
         assert!(body.verify(&signature, &PubKey([9; 32])).is_err());
+    }
+
+    #[test]
+    fn header_signature_binds_message_context() {
+        let keypair = Keypair::generate();
+        let body = VerificationBody {
+            blocks_hash: HashType([3; 32]),
+            blocks: BTreeMap::new(),
+        };
+        let last_epoch = HashType([2; 32]);
+        let nonce = Nonce::new(7);
+        let round = 1;
+        let signature_hash = Header::signature_hash_for_body(
+            &keypair.public,
+            &last_epoch,
+            nonce,
+            round,
+            MSGKey::Verification,
+            &body,
+        );
+        let header = Header {
+            sender: keypair.public,
+            last_epoch,
+            nonce,
+            round,
+            signature: keypair.signer().sign(signature_hash.as_ref()),
+        };
+
+        assert!(header.verify_signature(MSGKey::Verification, &body).is_ok());
+
+        let mut replayed = header;
+        replayed.round = 2;
+        assert!(
+            replayed
+                .verify_signature(MSGKey::Verification, &body)
+                .is_err()
+        );
     }
 }

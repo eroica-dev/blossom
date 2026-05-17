@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 
 use blossom::{
     BlossomBody, Commit, CommitBody, Dispatch, EchoReDispatch, EchoRequest, EchoResponse,
-    EchoResponseBody, EpochStarted, EpochStartedBody, EpochTarget, HashType, Header,
+    EchoResponseBody, EpochStarted, EpochStartedBody, EpochTarget, HashType, Header, MSGKey,
     MockBlockService, Msg, Nonce, Proposal, ProposalBody, ServiceKind, Signature, SimulatedCluster,
     TcpServiceClient, Transaction, Verification, VerificationBody, WireRequest, WireResponse,
 };
@@ -223,7 +223,7 @@ async fn protocol_message_variants_are_accepted_over_tcp() {
         signature_tree_hash: dispatch.body.signature_tree_hash,
     };
     let echo = EchoResponse {
-        header: signed_header(sender, &dispatch, &echo_body),
+        header: signed_header(sender, &dispatch, MSGKey::EchoResponse, &echo_body),
         body: echo_body,
     };
     expect_receipt(
@@ -238,7 +238,7 @@ async fn protocol_message_variants_are_accepted_over_tcp() {
         blocks: blocks.clone(),
     };
     let verification = Verification {
-        header: signed_header(sender, &dispatch, &verification_body),
+        header: signed_header(sender, &dispatch, MSGKey::Verification, &verification_body),
         body: verification_body.clone(),
     };
     expect_receipt(
@@ -260,7 +260,7 @@ async fn protocol_message_variants_are_accepted_over_tcp() {
         signature_tree_hash: Some(blocks.hash()),
     };
     let proposal = Proposal {
-        header: signed_header(sender, &dispatch, &proposal_body),
+        header: signed_header(sender, &dispatch, MSGKey::Proposal, &proposal_body),
         body: proposal_body,
     };
     expect_receipt(
@@ -275,7 +275,7 @@ async fn protocol_message_variants_are_accepted_over_tcp() {
         signature_tree_insert: None,
     };
     let commit = Commit {
-        header: signed_header(sender, &dispatch, &commit_body),
+        header: signed_header(sender, &dispatch, MSGKey::Commit, &commit_body),
         body: commit_body,
     };
     expect_receipt(
@@ -287,7 +287,7 @@ async fn protocol_message_variants_are_accepted_over_tcp() {
 
     let started_body = EpochStartedBody {};
     let started = EpochStarted {
-        header: signed_header(sender, &dispatch, &started_body),
+        header: signed_header(sender, &dispatch, MSGKey::EpochStarted, &started_body),
         body: started_body,
     };
     expect_receipt(
@@ -349,14 +349,27 @@ fn expect_receipt(response: blossom::Result<WireResponse>, kind: &str) {
     }
 }
 
-fn signed_header<T: BlossomBody>(sender: &NodeIdentity, dispatch: &Dispatch, body: &T) -> Header {
+fn signed_header<T: BlossomBody>(
+    sender: &NodeIdentity,
+    dispatch: &Dispatch,
+    kind: MSGKey,
+    body: &T,
+) -> Header {
+    let message_hash = Header::signature_hash_for_body(
+        &sender.public_key(),
+        &dispatch.header.last_epoch,
+        dispatch.header.nonce,
+        dispatch.header.round,
+        kind,
+        body,
+    );
     Header {
         sender: sender.public_key(),
         last_epoch: dispatch.header.last_epoch,
         nonce: dispatch.header.nonce,
         round: dispatch.header.round,
-        signature: body
-            .signature(sender)
+        signature: sender
+            .sign(message_hash.as_ref())
             .unwrap_or_else(|_| Signature::default()),
     }
 }

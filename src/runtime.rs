@@ -15,7 +15,7 @@ use crate::crypto::{SecretSigner, Signature};
 use crate::error::{BlossomError, Result};
 use crate::hash::{DoHash, HashType};
 use crate::local_block::LocalBlock;
-use crate::messages::Msg;
+use crate::messages::{MSGKey, Msg};
 use crate::node::NodeIdentity;
 use crate::nonce::Nonce;
 use crate::state::{Epoch, EpochBody, LocalState};
@@ -235,7 +235,14 @@ impl NodeRuntime {
             last_epoch: target.last_epoch,
             nonce: target.nonce,
             round,
-            signature: self.sign_body(&self_node, &body)?,
+            signature: self.sign_body(
+                &self_node,
+                MSGKey::Dispatch,
+                target.last_epoch,
+                target.nonce,
+                round,
+                &body,
+            )?,
         };
 
         let mut state = self.inner.state.write().expect("state lock poisoned");
@@ -248,8 +255,8 @@ impl NodeRuntime {
         match message {
             Msg::Dispatch(message) => {
                 message
-                    .body
-                    .verify(&message.header.signature, &message.header.sender)?;
+                    .header
+                    .verify_signature(MSGKey::Dispatch, &message.body)?;
                 let mut state = self.inner.state.write().expect("state lock poisoned");
                 if message.header.verify_header(&mut state) == Some(false) {
                     return Err(BlossomError::UnknownSender);
@@ -271,8 +278,8 @@ impl NodeRuntime {
 
     fn receive_echo_response(&self, message: EchoResponse) -> Result<MessageReceipt> {
         message
-            .body
-            .verify(&message.header.signature, &message.header.sender)?;
+            .header
+            .verify_signature(MSGKey::EchoResponse, &message.body)?;
         let mut state = self.inner.state.write().expect("state lock poisoned");
         if message.header.verify_header(&mut state) == Some(false) {
             return Err(BlossomError::UnknownSender);
@@ -282,8 +289,8 @@ impl NodeRuntime {
 
     fn receive_verification(&self, message: Verification) -> Result<MessageReceipt> {
         message
-            .body
-            .verify(&message.header.signature, &message.header.sender)?;
+            .header
+            .verify_signature(MSGKey::Verification, &message.body)?;
         let mut state = self.inner.state.write().expect("state lock poisoned");
         if message.header.verify_header(&mut state) == Some(false) {
             return Err(BlossomError::UnknownSender);
@@ -299,8 +306,8 @@ impl NodeRuntime {
 
     fn receive_proposal(&self, message: Proposal) -> Result<MessageReceipt> {
         message
-            .body
-            .verify(&message.header.signature, &message.header.sender)?;
+            .header
+            .verify_signature(MSGKey::Proposal, &message.body)?;
         let mut state = self.inner.state.write().expect("state lock poisoned");
         if message.header.verify_header(&mut state) == Some(false) {
             return Err(BlossomError::UnknownSender);
@@ -322,8 +329,8 @@ impl NodeRuntime {
 
     fn receive_commit(&self, message: Commit) -> Result<MessageReceipt> {
         message
-            .body
-            .verify(&message.header.signature, &message.header.sender)?;
+            .header
+            .verify_signature(MSGKey::Commit, &message.body)?;
         let mut state = self.inner.state.write().expect("state lock poisoned");
         if message.header.verify_header(&mut state) == Some(false) {
             return Err(BlossomError::UnknownSender);
@@ -339,8 +346,8 @@ impl NodeRuntime {
 
     fn receive_epoch_started(&self, message: EpochStarted) -> Result<MessageReceipt> {
         message
-            .body
-            .verify(&message.header.signature, &message.header.sender)?;
+            .header
+            .verify_signature(MSGKey::EpochStarted, &message.body)?;
         let mut state = self.inner.state.write().expect("state lock poisoned");
         if message.header.verify_header(&mut state) == Some(false) {
             return Err(BlossomError::UnknownSender);
@@ -385,11 +392,26 @@ impl NodeRuntime {
         Ok(block)
     }
 
-    fn sign_body<T: BlossomBody>(&self, self_node: &NodeIdentity, body: &T) -> Result<Signature> {
-        let body_bytes = body.to_bytes();
+    fn sign_body<T: BlossomBody>(
+        &self,
+        self_node: &NodeIdentity,
+        kind: MSGKey,
+        last_epoch: HashType,
+        nonce: Nonce,
+        round: u8,
+        body: &T,
+    ) -> Result<Signature> {
+        let message_hash = Header::signature_hash_for_body(
+            &self_node.public_key(),
+            &last_epoch,
+            nonce,
+            round,
+            kind,
+            body,
+        );
         match self.inner.signer.as_ref() {
-            Some(signer) => Ok(signer.sign(&body_bytes)),
-            None => self_node.sign(&body_bytes),
+            Some(signer) => Ok(signer.sign(message_hash.as_ref())),
+            None => self_node.sign(message_hash.as_ref()),
         }
     }
 }
@@ -424,7 +446,7 @@ pub fn genesis_epoch(nodes: impl IntoIterator<Item = NodeIdentity>) -> Epoch {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::blossom::{BlossomBody, DispatchBody};
+    use crate::blossom::DispatchBody;
     use crate::crypto::Keypair;
 
     fn runtime() -> (NodeRuntime, Keypair) {
@@ -573,22 +595,21 @@ mod tests {
         let (runtime, keypairs, target) = runtime_with_peers();
         let unknown = Keypair::generate();
         let body = DispatchBody::default();
+        let unknown_signature_hash = Header::signature_hash_for_body(
+            &unknown.public,
+            &target.last_epoch,
+            target.nonce,
+            0,
+            MSGKey::Dispatch,
+            &body,
+        );
         let unknown_dispatch = Dispatch {
             header: Header {
                 sender: unknown.public,
                 last_epoch: target.last_epoch,
                 nonce: target.nonce,
                 round: 0,
-                signature: body
-                    .signature(&NodeIdentity::new(
-                        unknown.public,
-                        Some(unknown.secret),
-                        "tcp",
-                        "127.0.0.1",
-                        9999,
-                        false,
-                    ))
-                    .unwrap(),
+                signature: unknown.signer().sign(unknown_signature_hash.as_ref()),
             },
             body: body.clone(),
         };

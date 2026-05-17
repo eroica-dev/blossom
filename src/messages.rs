@@ -95,6 +95,21 @@ impl fmt::Display for MSGKey {
     }
 }
 
+impl MSGKey {
+    pub fn signature_tag(self) -> u8 {
+        match self {
+            Self::Dispatch => 0,
+            Self::EchoResponse => 1,
+            Self::EchoRequest => 2,
+            Self::EchoReDispatch => 3,
+            Self::Verification => 4,
+            Self::Proposal => 5,
+            Self::Commit => 6,
+            Self::EpochStarted => 7,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
