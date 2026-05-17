@@ -20,4 +20,8 @@ if [[ -n "${CRITERION_ARGS:-}" ]]; then
   args=(${CRITERION_ARGS})
 fi
 
-pinned_exec cargo bench --bench protocol -- "${args[@]}"
+if [[ "${#args[@]}" -gt 0 ]]; then
+  pinned_exec cargo bench --bench protocol -- "${args[@]}"
+else
+  pinned_exec cargo bench --bench protocol
+fi
