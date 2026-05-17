@@ -45,4 +45,7 @@ pub use runtime::{
 pub use service_client::TcpServiceClient;
 pub use state::{Epoch, EpochBody, EpochChain, EpochNonce, LocalState, TempConsensus, TempQuorum};
 pub use tcp::{TcpNode, send_wire_request};
-pub use wire::{AddressBookUpdate, NodeHealth, WireRequest, WireResponse, read_frame, write_frame};
+pub use wire::{
+    AddressBookUpdate, NodeHealth, WireRequest, WireResponse, configured_max_frame_size,
+    encoded_len, framed_len, read_frame, write_frame,
+};

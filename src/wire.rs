@@ -1,5 +1,6 @@
 use borsh::{BorshDeserialize, BorshSerialize};
 use serde::{Deserialize, Serialize};
+use std::env;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use crate::address_book::Service;
@@ -10,7 +11,10 @@ use crate::messages::Msg;
 use crate::nonce::Nonce;
 use crate::runtime::{AcceptedBlock, EpochTarget, MessageReceipt, NodeStatus};
 
-pub const MAX_FRAME_SIZE: usize = 32 * 1024 * 1024;
+pub const DEFAULT_MAX_FRAME_SIZE: usize = 32 * 1024 * 1024;
+pub const MAX_FRAME_SIZE: usize = DEFAULT_MAX_FRAME_SIZE;
+pub const FRAME_PREFIX_BYTES: usize = 4;
+pub const MAX_FRAME_SIZE_ENV: &str = "BLOSSOM_MAX_FRAME_SIZE";
 
 #[derive(Serialize, Deserialize, BorshSerialize, BorshDeserialize, Debug, Clone)]
 pub enum WireRequest {
@@ -83,7 +87,7 @@ where
         .read_u32()
         .await
         .map_err(|err| BlossomError::Io(err.to_string()))? as usize;
-    if len == 0 || len > MAX_FRAME_SIZE {
+    if len == 0 || len > configured_max_frame_size() {
         return Err(BlossomError::InvalidFrameSize(len));
     }
 
@@ -101,7 +105,7 @@ where
     W: AsyncWrite + Unpin,
 {
     let bytes = borsh::to_vec(value).map_err(|err| BlossomError::WireProtocol(err.to_string()))?;
-    if bytes.is_empty() || bytes.len() > MAX_FRAME_SIZE {
+    if bytes.is_empty() || bytes.len() > configured_max_frame_size() {
         return Err(BlossomError::InvalidFrameSize(bytes.len()));
     }
 
@@ -117,6 +121,30 @@ where
         .flush()
         .await
         .map_err(|err| BlossomError::Io(err.to_string()))
+}
+
+pub fn configured_max_frame_size() -> usize {
+    env::var(MAX_FRAME_SIZE_ENV)
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_MAX_FRAME_SIZE)
+}
+
+pub fn encoded_len<T>(value: &T) -> Result<usize>
+where
+    T: BorshSerialize + ?Sized,
+{
+    borsh::object_length(value).map_err(|err| BlossomError::WireProtocol(err.to_string()))
+}
+
+pub fn framed_len<T>(value: &T) -> Result<usize>
+where
+    T: BorshSerialize + ?Sized,
+{
+    encoded_len(value)?
+        .checked_add(FRAME_PREFIX_BYTES)
+        .ok_or_else(|| BlossomError::WireProtocol("frame length overflow".to_string()))
 }
 
 #[cfg(test)]
@@ -173,5 +201,13 @@ mod tests {
             .kind(),
             "health"
         );
+    }
+
+    #[test]
+    fn frame_length_helpers_count_payload_and_prefix() {
+        let request = WireRequest::NextNonce;
+
+        assert_eq!(encoded_len(&request).unwrap(), 1);
+        assert_eq!(framed_len(&request).unwrap(), FRAME_PREFIX_BYTES + 1);
     }
 }

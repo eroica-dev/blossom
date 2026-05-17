@@ -5,8 +5,8 @@ use blossom::{
     Block, Dispatch, DispatchBody, HashType, Keypair, LocalBlock, MessageMatrix, NodeIdentity,
     Nonce, PubKey, RuntimeConfig, SignatureTree, Transaction, genesis_epoch,
 };
-use blossom::{DoHash, NodeRuntime};
-use criterion::{BatchSize, BenchmarkId, Criterion, criterion_group, criterion_main};
+use blossom::{DoHash, NodeRuntime, WireRequest, framed_len};
+use criterion::{BatchSize, BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use std::hint::black_box;
 
 fn bench_hash_and_block(c: &mut Criterion) {
@@ -144,6 +144,53 @@ fn bench_runtime(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_block_scaling(c: &mut Criterion) {
+    let mut group = c.benchmark_group("block_scaling");
+    group.sample_size(10);
+
+    let keypair = Keypair::generate();
+    for count in [1_000usize, 10_000] {
+        group.throughput(Throughput::Elements(count as u64));
+        group.bench_with_input(
+            BenchmarkId::new("sign_block_32b_txs", count),
+            &count,
+            |b, count| {
+                b.iter_batched(
+                    || block_with_payload_txs(*count, 32),
+                    |mut block| {
+                        block.sign(&keypair.secret);
+                        black_box(block)
+                    },
+                    BatchSize::LargeInput,
+                );
+            },
+        );
+
+        let mut signed = block_with_payload_txs(count, 32);
+        signed.sign(&keypair.secret);
+        group.bench_with_input(
+            BenchmarkId::new("verify_block_32b_txs", count),
+            &count,
+            |b, _| b.iter(|| black_box(&signed).verify_integrity().unwrap()),
+        );
+
+        let submit = WireRequest::SubmitBlock(signed.clone());
+        group.bench_with_input(
+            BenchmarkId::new("submit_frame_len_32b_txs", count),
+            &count,
+            |b, _| {
+                b.iter(|| {
+                    black_box(
+                        framed_len(black_box(&submit)).expect("wire length should be computable"),
+                    )
+                });
+            },
+        );
+    }
+
+    group.finish();
+}
+
 fn block_with_txs(count: usize) -> Block {
     let mut block = Block::default();
     block.body.last_epoch = HashType([1; 32]);
@@ -153,6 +200,20 @@ fn block_with_txs(count: usize) -> Block {
             .body
             .txs
             .push(Transaction::new(format!("bench-tx-{index}")));
+    }
+    block
+}
+
+fn block_with_payload_txs(count: usize, payload_len: usize) -> Block {
+    let mut block = Block::default();
+    block.body.last_epoch = HashType([1; 32]);
+    block.body.nonce = Nonce::new(1);
+    for index in 0..count {
+        let mut bytes = vec![0; payload_len];
+        let index_bytes = (index as u64).to_le_bytes();
+        let take = bytes.len().min(index_bytes.len());
+        bytes[..take].copy_from_slice(&index_bytes[..take]);
+        block.body.txs.push(Transaction::new(bytes));
     }
     block
 }
@@ -200,6 +261,7 @@ criterion_group!(
     bench_hash_and_block,
     bench_quorum_and_matrix,
     bench_protocol_messages,
-    bench_runtime
+    bench_runtime,
+    bench_block_scaling
 );
 criterion_main!(benches);

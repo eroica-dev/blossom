@@ -4,8 +4,10 @@
 # Environment:
 #   NODE_COUNTS="1 6 12"
 #   TRANSACTION_COUNTS="0 3 32"
+#   TX_BYTES=32
 #   ITERATIONS=5
 #   WARMUP=1
+#   DELIVERY_MODE=all-peers   all-peers or first-accepted
 #   SERVER_CPUSET=0-3      Linux only, optional taskset pinning.
 
 set -euo pipefail
@@ -38,8 +40,10 @@ for nodes in ${NODE_COUNTS:-1 6 12}; do
     pinned_exec "${cmd[@]}" \
       --nodes "$nodes" \
       --transactions "$txs" \
+      --transaction-bytes "${TX_BYTES:-32}" \
       --iterations "${ITERATIONS:-5}" \
       --warmup "${WARMUP:-1}" \
+      --delivery-mode "${DELIVERY_MODE:-all-peers}" \
       --csv "$tmp"
     if [[ "$first" == "1" ]]; then
       cat "$tmp" > "$out"

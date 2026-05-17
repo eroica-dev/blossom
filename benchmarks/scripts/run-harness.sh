@@ -4,8 +4,10 @@
 # Environment:
 #   NODES=6
 #   TRANSACTIONS=3
+#   TX_BYTES=32
 #   ITERATIONS=10
 #   WARMUP=1
+#   DELIVERY_MODE=all-peers   all-peers or first-accepted
 #   SERVER_CPUSET=0-3      Linux only, optional taskset pinning.
 
 set -euo pipefail
@@ -32,8 +34,10 @@ fi
 pinned_exec "${cmd[@]}" \
   --nodes "${NODES:-6}" \
   --transactions "${TRANSACTIONS:-3}" \
+  --transaction-bytes "${TX_BYTES:-32}" \
   --iterations "${ITERATIONS:-10}" \
   --warmup "${WARMUP:-1}" \
+  --delivery-mode "${DELIVERY_MODE:-all-peers}" \
   --csv "$out"
 
 echo "wrote $out"
