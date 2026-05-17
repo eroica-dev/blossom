@@ -227,7 +227,7 @@ pub(crate) async fn broadcast_wire_request(
     request: WireRequest,
     targets: Vec<Service>,
 ) -> Result<BroadcastReport> {
-    let frame = EncodedFrame::encode(&request)?;
+    let frame = EncodedFrame::encode_wire_request(&request)?;
     let mut handles = Vec::with_capacity(targets.len());
 
     for service in targets {

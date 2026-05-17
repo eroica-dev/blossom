@@ -5,15 +5,19 @@ use borsh::{BorshDeserialize, BorshSerialize};
 use serde::{Deserialize, Serialize};
 
 use crate::block::Block;
-use crate::crypto::{PubKey, Signature};
-use crate::error::Result;
+use crate::crypto::{PubKey, Signature, verify_batch};
+use crate::error::{BlossomError, Result};
 use crate::hash::{DoHash, HashType, ProtocolHasher};
 use crate::messages::{MSGKey, Msg};
 use crate::node::NodeIdentity;
 use crate::nonce::Nonce;
-use crate::state::LocalState;
+use crate::state::{
+    LocalState, PendingDispatch, configured_max_pending_raw_dispatch_bytes,
+    configured_max_pending_raw_dispatch_bytes_per_sender,
+};
 
 const MESSAGE_SIGNATURE_DOMAIN: &[u8] = b"blossom.message-signature.v1";
+const BATCH_SIGNATURE_VERIFY_THRESHOLD: usize = 4;
 
 #[derive(Serialize, Deserialize, BorshSerialize, BorshDeserialize, Debug, Clone, Default)]
 pub struct Header {
@@ -168,15 +172,12 @@ impl SignatureTree {
         blocks: &BTreeMap<HashType, ()>,
     ) {
         let key = blocks.hash();
-        match self.0.get(&key) {
-            Some((signers, value)) => {
-                let mut signature_list = signers.clone();
-                signature_list.push((*signed_by, *signature));
-                self.0.insert(key, (signature_list, value.clone()));
+        match self.0.entry(key) {
+            std::collections::btree_map::Entry::Occupied(mut entry) => {
+                entry.get_mut().0.push((*signed_by, *signature));
             }
-            None => {
-                self.0
-                    .insert(key, (vec![(*signed_by, *signature)], blocks.clone()));
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                entry.insert((vec![(*signed_by, *signature)], blocks.clone()));
             }
         }
     }
@@ -198,6 +199,15 @@ impl SignatureTree {
     }
 
     pub fn verify(&self) -> bool {
+        let signature_count = self
+            .0
+            .values()
+            .map(|(signatures, _)| signatures.len())
+            .sum::<usize>();
+        if signature_count >= BATCH_SIGNATURE_VERIFY_THRESHOLD {
+            return self.verify_batched();
+        }
+
         for (blocks_hash, (signatures, blocks)) in &self.0 {
             if blocks.hash() != *blocks_hash {
                 return false;
@@ -210,6 +220,26 @@ impl SignatureTree {
             }
         }
         true
+    }
+
+    fn verify_batched(&self) -> bool {
+        let mut messages = Vec::new();
+        let mut signatures_to_verify = Vec::new();
+        let mut public_keys = Vec::new();
+
+        for (blocks_hash, (signatures, blocks)) in &self.0 {
+            if blocks.hash() != *blocks_hash {
+                return false;
+            }
+
+            for (pub_key, signature) in signatures {
+                messages.push(blocks_hash.as_ref());
+                signatures_to_verify.push(*signature);
+                public_keys.push(*pub_key);
+            }
+        }
+
+        verify_batch(&messages, &signatures_to_verify, &public_keys).is_ok()
     }
 }
 
@@ -262,13 +292,12 @@ impl DispatchBody {
             if already_verified_blocks.contains_key(sent_hash) {
                 continue;
             }
-            if *sent_hash != block.hash() {
-                continue;
-            }
             let block_ok = if verify_signatures {
-                block.verify_integrity().is_ok()
+                block.verify_integrity_with_hash(*sent_hash).is_ok()
             } else {
-                block.verify_unsigned_integrity().is_ok()
+                block
+                    .verify_unsigned_integrity_with_hash(*sent_hash)
+                    .is_ok()
             };
             if !block_ok {
                 continue;
@@ -311,15 +340,33 @@ impl BlossomBody for DispatchBody {
 }
 
 impl Dispatch {
-    pub fn verify(&self, state: &mut LocalState) -> bool {
+    pub fn try_accept_into_state(self, state: &mut LocalState) -> Result<()> {
+        let sender = self.header.sender;
         let quorum = state.get_mut_quorum(
             &self.header.last_epoch,
             self.header.nonce,
             self.header.round,
         );
-        quorum.received_dispatches.push(self.header.sender);
-        quorum.pending_dispatches.push(self.clone());
-        true
+        if quorum.received_dispatches.contains(&sender) {
+            return Err(BlossomError::WireProtocol(format!(
+                "duplicate dispatch from {sender}"
+            )));
+        }
+        quorum.try_push_pending_dispatch(
+            PendingDispatch::Decoded(self),
+            configured_max_pending_raw_dispatch_bytes(),
+            configured_max_pending_raw_dispatch_bytes_per_sender(),
+        )?;
+        quorum.received_dispatches.push(sender);
+        Ok(())
+    }
+
+    pub fn accept_into_state(self, state: &mut LocalState) -> bool {
+        self.try_accept_into_state(state).is_ok()
+    }
+
+    pub fn verify(&self, state: &mut LocalState) -> bool {
+        self.clone().accept_into_state(state)
     }
 
     pub fn add_blocks(

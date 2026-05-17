@@ -7,6 +7,7 @@ use ed25519_dalek::{
     PUBLIC_KEY_LENGTH, SECRET_KEY_LENGTH, SIGNATURE_LENGTH, Signature as DalekSignature, Signer,
     SigningKey, Verifier, VerifyingKey,
     hazmat::{ExpandedSecretKey, raw_sign},
+    verify_batch as dalek_verify_batch,
 };
 use rand_core::OsRng;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -234,6 +235,37 @@ impl Signature {
     }
 }
 
+pub fn verify_batch(
+    messages: &[&[u8]],
+    signatures: &[Signature],
+    public_keys: &[PubKey],
+) -> Result<()> {
+    if messages.len() != signatures.len() || signatures.len() != public_keys.len() {
+        return Err(BlossomError::InvalidLength {
+            expected: messages.len(),
+            actual: signatures.len().max(public_keys.len()),
+        });
+    }
+
+    let verifying_keys = public_keys
+        .iter()
+        .map(|public_key| {
+            VerifyingKey::from_bytes(public_key.as_array())
+                .map_err(|_| BlossomError::InvalidPublicKey)
+        })
+        .collect::<Result<Vec<_>>>()?;
+    if verifying_keys.iter().any(VerifyingKey::is_weak) {
+        return Err(BlossomError::InvalidPublicKey);
+    }
+
+    let signatures = signatures
+        .iter()
+        .map(|signature| DalekSignature::from_bytes(&signature.0))
+        .collect::<Vec<_>>();
+    dalek_verify_batch(messages, &signatures, &verifying_keys)
+        .map_err(|_| BlossomError::SignatureError)
+}
+
 pub struct SecretSigner {
     public_key: PubKey,
     verifying_key: VerifyingKey,
@@ -371,6 +403,37 @@ mod tests {
         assert!(signer.matches_public_key(&keypair.public));
         assert_eq!(signature, expected);
         assert!(signature.verify(message, &keypair.public).is_ok());
+    }
+
+    #[test]
+    fn batch_verifies_multiple_signatures() {
+        let keypairs = [
+            Keypair::generate(),
+            Keypair::generate(),
+            Keypair::generate(),
+            Keypair::generate(),
+        ];
+        let messages = [
+            b"one".as_slice(),
+            b"two".as_slice(),
+            b"three".as_slice(),
+            b"four".as_slice(),
+        ];
+        let signatures = keypairs
+            .iter()
+            .zip(messages)
+            .map(|(keypair, message)| Signature::sign(message, &keypair.secret))
+            .collect::<Vec<_>>();
+        let public_keys = keypairs
+            .iter()
+            .map(|keypair| keypair.public)
+            .collect::<Vec<_>>();
+
+        assert!(verify_batch(&messages, &signatures, &public_keys).is_ok());
+
+        let mut bad = signatures.clone();
+        bad[0] = signatures[1];
+        assert!(verify_batch(&messages, &bad, &public_keys).is_err());
     }
 
     #[test]

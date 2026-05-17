@@ -11,7 +11,11 @@
 #   ITERATIONS=1
 #   WARMUP=0
 #   DELIVERY_MODE=first-accepted   all-peers or first-accepted
+#   TRUSTED=0
+#   EXTERNAL_TRANSACTION_HASHES=0
 #   BLOSSOM_MAX_FRAME_SIZE=1073741824
+#   BLOSSOM_MAX_PENDING_RAW_DISPATCH_BYTES=536870912
+#   BLOSSOM_MAX_PENDING_RAW_DISPATCH_BYTES_PER_SENDER=134217728
 #   SERVER_CPUSET=0-3         Linux only, optional taskset pinning.
 
 set -euo pipefail
@@ -37,6 +41,14 @@ if [[ "${DIRECT:-0}" == "1" ]]; then
 else
   cmd=(cargo run --release --bin blossom-harness-bench --)
 fi
+trusted_arg=()
+if [[ "${TRUSTED:-0}" == "1" || "${TRUSTED:-false}" == "true" ]]; then
+  trusted_arg=(--trusted)
+fi
+external_hash_arg=()
+if [[ "${EXTERNAL_TRANSACTION_HASHES:-0}" == "1" || "${EXTERNAL_TRANSACTION_HASHES:-false}" == "true" ]]; then
+  external_hash_arg=(--external-transaction-hashes)
+fi
 
 pinned_exec "${cmd[@]}" \
   --nodes "${NODES:-6}" \
@@ -46,6 +58,8 @@ pinned_exec "${cmd[@]}" \
   --iterations "${ITERATIONS:-1}" \
   --warmup "${WARMUP:-0}" \
   --delivery-mode "${DELIVERY_MODE:-first-accepted}" \
+  "${trusted_arg[@]}" \
+  "${external_hash_arg[@]}" \
   --csv "$out"
 
 echo "wrote $out"

@@ -9,6 +9,8 @@
 #   ITERATIONS=10
 #   WARMUP=1
 #   DELIVERY_MODE=all-peers   all-peers or first-accepted
+#   TRUSTED=0                 1 to run the known-member trusted path
+#   EXTERNAL_TRANSACTION_HASHES=0
 #   SERVER_CPUSET=0-3      Linux only, optional taskset pinning.
 
 set -euo pipefail
@@ -31,6 +33,14 @@ if [[ "${DIRECT:-0}" == "1" ]]; then
 else
   cmd=(cargo run --release --bin blossom-harness-bench --)
 fi
+trusted_arg=()
+if [[ "${TRUSTED:-0}" == "1" || "${TRUSTED:-false}" == "true" ]]; then
+  trusted_arg=(--trusted)
+fi
+external_hash_arg=()
+if [[ "${EXTERNAL_TRANSACTION_HASHES:-0}" == "1" || "${EXTERNAL_TRANSACTION_HASHES:-false}" == "true" ]]; then
+  external_hash_arg=(--external-transaction-hashes)
+fi
 
 pinned_exec "${cmd[@]}" \
   --nodes "${NODES:-6}" \
@@ -40,6 +50,8 @@ pinned_exec "${cmd[@]}" \
   --iterations "${ITERATIONS:-10}" \
   --warmup "${WARMUP:-1}" \
   --delivery-mode "${DELIVERY_MODE:-all-peers}" \
+  "${trusted_arg[@]}" \
+  "${external_hash_arg[@]}" \
   --csv "$out"
 
 echo "wrote $out"

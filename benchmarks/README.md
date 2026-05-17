@@ -42,6 +42,23 @@ TRANSACTIONS=1000000 TX_BYTES=32 NODES=6 ITERATIONS=1 \
   ./benchmarks/scripts/run-load.sh
 ```
 
+Run the same TCP harness in known-member trusted mode:
+
+```bash
+TRUSTED=1 BLOSSOM_HOT_WIRE_CODEC=1 TRANSACTIONS=1000000 TX_BYTES=32 \
+  NODES=6 ITERATIONS=1 ./benchmarks/scripts/run-load.sh
+```
+
+Run the trusted harness with application-supplied transaction identifiers:
+
+```bash
+BLOSSOM_HOT_WIRE_CODEC=1 BLOSSOM_MAX_FRAME_SIZE=1073741824 \
+  cargo run --release --features external-transaction-hashes,insecure-fast-hash \
+  --bin blossom-harness-bench -- --nodes 6 --transactions 1000000 \
+  --transaction-bytes 32 --iterations 1 --warmup 0 \
+  --delivery-mode first-accepted --trusted --external-transaction-hashes
+```
+
 Run a paper-aligned epoch-depth benchmark:
 
 ```bash
@@ -92,24 +109,52 @@ unsandboxed local runs where direct binary socket binding is allowed.
 The harness benchmarks bind local ephemeral TCP ports and use the same
 `WireRequest`/`WireResponse` framing as the deployable node. Each measured
 iteration creates a fresh simulated cluster so the scenario can submit nonce
-`1` without relying on hidden state reset.
+`1` without relying on hidden state reset. Within an iteration, the driver
+reuses one persistent TCP connection to node 0 for registration, nonce lookup,
+submission, and dispatch so the measured loop reflects the steady-state node
+protocol rather than repeated connection setup.
 
 Use at least six nodes when the benchmark needs accepted peer delivery; six is
 the current Blossom quorum size.
 
-Harness CSVs include the exact Borsh frame sizes counted for each phase:
+Harness CSVs include the exact frame sizes counted for each phase:
 `register_wire_bytes`, `next_nonce_wire_bytes`, `submit_wire_bytes`,
 `dispatch_wire_bytes`, `deliver_wire_bytes`, and `total_wire_bytes`. They also
 record `tx_payload_bytes`, `application_state_bytes`,
-`accepted_application_state_bytes`, and `block_bytes`, so a run can distinguish
-raw transaction payload and piggy-backed coordination state from protocol
-overhead.
+`accepted_application_state_bytes`, `block_bytes`, `trusted`, and
+`external_transaction_hashes`, so a run can distinguish raw transaction payload,
+piggy-backed coordination state, protocol overhead, trust-boundary mode, and
+whether per-transaction identifiers were computed by Blossom or supplied by the
+application.
 
 The runtime defaults to a 32 MiB maximum frame. Large load runs need a larger
 limit because one million 32-byte transactions produces a submit frame of
 roughly 68 MiB before dispatch and peer delivery. `run-load.sh` sets
 `BLOSSOM_MAX_FRAME_SIZE=1073741824` by default. Override it when you want to
-test a lower or higher ceiling.
+test a lower or higher ceiling. Frame and raw-dispatch limits are read once at
+process startup, so set these environment variables before launching the
+benchmark or node process.
+
+`BLOSSOM_HOT_WIRE_CODEC=1` opts outgoing TCP dispatch frames into the
+experimental BLSM v1 codec. Decoders accept both Borsh and BLSM frames so mixed
+read-side tests stay compatible, and explicit hot helpers still exist for
+block-frame microbenchmarks. Runtime writers keep submit/send-block on Borsh
+because those paths must materialize owned blocks today; BLSM is selected for
+dispatch where receivers can authenticate the header and keep the block payload
+raw until consensus verification actually needs it.
+
+The hot encoder preallocates exact frame sizes with checked length calculators
+before writing payload bytes. That avoids large buffer growth copies during
+million-transaction dispatches while preserving the same configured frame-size
+limit.
+
+Raw hot dispatches are still resource-bounded after authentication. The quorum
+state rejects duplicate pending dispatches from the same `(sender, signature)`
+and caps stored raw payload bytes with
+`BLOSSOM_MAX_PENDING_RAW_DISPATCH_BYTES` and
+`BLOSSOM_MAX_PENDING_RAW_DISPATCH_BYTES_PER_SENDER`. The defaults are 512 MiB
+per quorum and 128 MiB per sender; raise them only for intentionally larger
+trusted load tests.
 
 `DELIVERY_MODE=all-peers` measures dispatch delivery to every peer in the
 cluster. `DELIVERY_MODE=first-accepted` stops after the first accepting peer,
@@ -132,6 +177,19 @@ quorum unions, but it seals blocks without Ed25519 signatures and counts only
 dispatch fanout for each quorum. This models a private deployment where
 membership is known out of band and consensus can skip echo, verification,
 proposal, and commit traffic.
+
+With `--trusted`, `blossom-harness-bench` spawns trusted TCP nodes and seals the
+submitted benchmark block without Ed25519 work. It still uses the same address
+book, block-service registration, frame limits, dispatch delivery, duplicate
+dispatch checks, and raw hot-dispatch caps.
+
+The `external-transaction-hashes` feature enables
+`Transaction::from_external_hash` and `Transaction::from_external_hash_u64`.
+This is meant for systems such as fast-cache/FCNP, where every key already has
+a stable `u64` XXH3 `hash_key`. In that mode Blossom skips the per-transaction
+payload hash and commits to the supplied transaction id plus the ordered
+transaction bytes at the block level. The Merkle root is then over external
+application ids, not Blossom-computed payload hashes.
 
 The `insecure-fast-hash` feature is deliberately separate from `--trusted`.
 It swaps SHA-256 protocol commitments for XXH3 so benchmark runs can isolate

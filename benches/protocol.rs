@@ -6,7 +6,9 @@ use blossom::{
     MessageMatrix, NodeIdentity, Nonce, PubKey, RuntimeConfig, SignatureTree, Transaction,
     TrustMode, genesis_epoch,
 };
-use blossom::{DoHash, EncodedFrame, NodeRuntime, WireRequest, framed_len};
+use blossom::{
+    DoHash, EncodedFrame, NodeRuntime, WireRequest, framed_len, hot_wire_request_framed_len,
+};
 use criterion::{BatchSize, BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use std::hint::black_box;
 
@@ -19,6 +21,15 @@ fn bench_hash_and_block(c: &mut Criterion) {
             &size,
             |b, size| {
                 b.iter(|| Transaction::new(vec![7; *size]));
+            },
+        );
+
+        #[cfg(feature = "external-transaction-hashes")]
+        group.bench_with_input(
+            BenchmarkId::new("transaction_external_hash_u64", size),
+            &size,
+            |b, size| {
+                b.iter(|| Transaction::from_external_hash_u64(7, vec![7; *size]));
             },
         );
     }
@@ -290,7 +301,37 @@ fn bench_block_scaling(c: &mut Criterion) {
             },
         );
 
-        let encoded = EncodedFrame::encode(&submit).expect("wire frame should encode");
+        group.bench_with_input(
+            BenchmarkId::new("submit_hot_frame_len_32b_txs", count),
+            &count,
+            |b, _| {
+                b.iter(|| {
+                    black_box(
+                        hot_wire_request_framed_len(black_box(&submit))
+                            .expect("wire length should be computable")
+                            .expect("submit block should have hot wire encoding"),
+                    )
+                });
+            },
+        );
+
+        group.bench_with_input(
+            BenchmarkId::new("submit_hot_frame_encode_32b_txs", count),
+            &count,
+            |b, _| {
+                b.iter(|| {
+                    black_box(
+                        EncodedFrame::encode_hot_wire_request(black_box(&submit))
+                            .expect("wire frame should encode")
+                            .expect("submit block should have hot wire encoding"),
+                    )
+                });
+            },
+        );
+
+        let encoded = EncodedFrame::encode_hot_wire_request(&submit)
+            .expect("wire frame should encode")
+            .expect("submit block should have hot wire encoding");
         group.bench_with_input(
             BenchmarkId::new("submit_frame_clone_32b_txs", count),
             &count,

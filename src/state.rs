@@ -1,4 +1,6 @@
 use std::collections::{BTreeMap, HashMap};
+use std::env;
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use indextreemap::IndexTreeMap;
@@ -12,12 +14,21 @@ use crate::blossom::{
     Commit, Dispatch, EchoReDispatch, EchoRequest, EchoResponse, Proposal, SignatureTree,
     SignaturesForHash, Verification,
 };
-use crate::crypto::PubKey;
+use crate::crypto::{PubKey, Signature};
 use crate::error::{BlossomError, Result};
 use crate::hash::{DoHash, HashType};
 use crate::node::{NodeIdentity, NodeType};
 use crate::nonce::Nonce;
 use crate::register::MessageMatrix;
+use crate::wire::HotDispatch;
+
+pub const DEFAULT_MAX_PENDING_RAW_DISPATCH_BYTES: usize = 512 * 1024 * 1024;
+pub const DEFAULT_MAX_PENDING_RAW_DISPATCH_BYTES_PER_SENDER: usize = 128 * 1024 * 1024;
+pub const MAX_PENDING_RAW_DISPATCH_BYTES_ENV: &str = "BLOSSOM_MAX_PENDING_RAW_DISPATCH_BYTES";
+pub const MAX_PENDING_RAW_DISPATCH_BYTES_PER_SENDER_ENV: &str =
+    "BLOSSOM_MAX_PENDING_RAW_DISPATCH_BYTES_PER_SENDER";
+static CONFIGURED_MAX_PENDING_RAW_DISPATCH_BYTES: OnceLock<usize> = OnceLock::new();
+static CONFIGURED_MAX_PENDING_RAW_DISPATCH_BYTES_PER_SENDER: OnceLock<usize> = OnceLock::new();
 
 #[derive(Serialize, Debug, Clone, Default)]
 pub struct LocalState {
@@ -302,12 +313,45 @@ impl Serialize for EpochNonce {
     }
 }
 
+#[derive(Serialize, Debug, Clone)]
+pub enum PendingDispatch {
+    Decoded(Dispatch),
+    Hot(HotDispatch),
+}
+
+impl PendingDispatch {
+    fn sender_and_signature(&self) -> (PubKey, Signature) {
+        match self {
+            Self::Decoded(dispatch) => (dispatch.header.sender, dispatch.header.signature),
+            Self::Hot(dispatch) => (dispatch.header.sender, dispatch.header.signature),
+        }
+    }
+
+    fn sender(&self) -> PubKey {
+        self.sender_and_signature().0
+    }
+
+    fn raw_payload_len(&self) -> Option<usize> {
+        match self {
+            Self::Decoded(_) => None,
+            Self::Hot(dispatch) => Some(dispatch.payload_len()),
+        }
+    }
+}
+
+impl From<Dispatch> for PendingDispatch {
+    fn from(value: Dispatch) -> Self {
+        Self::Decoded(value)
+    }
+}
+
 #[derive(Serialize, Debug, Clone, Default)]
 pub struct TempQuorum {
     pub dispatch_status: Option<bool>,
     pub received_dispatches: Vec<PubKey>,
-    pub pending_dispatches: Vec<Dispatch>,
+    pub pending_dispatches: Vec<PendingDispatch>,
     pub verified_signature_trees: BTreeMap<HashType, SignaturesForHash>,
+    pub verified_signature_tree_hashes: BTreeMap<HashType, ()>,
     pub pending_blocks: BTreeMap<HashType, Block>,
     pub verified_blocks: BTreeMap<HashType, Block>,
     pub verified_blocks_hash: Option<HashType>,
@@ -324,6 +368,73 @@ pub struct TempQuorum {
 }
 
 impl TempQuorum {
+    pub fn try_push_pending_dispatch(
+        &mut self,
+        dispatch: PendingDispatch,
+        max_raw_dispatch_bytes: usize,
+        max_raw_dispatch_bytes_per_sender: usize,
+    ) -> Result<()> {
+        let dispatch_key = dispatch.sender_and_signature();
+        if self
+            .pending_dispatches
+            .iter()
+            .any(|pending| pending.sender_and_signature() == dispatch_key)
+        {
+            return Err(BlossomError::WireProtocol(format!(
+                "duplicate pending dispatch from {}",
+                dispatch_key.0
+            )));
+        }
+
+        if let Some(raw_payload_len) = dispatch.raw_payload_len() {
+            let pending_raw_bytes = self.pending_raw_dispatch_bytes();
+            let next_raw_bytes =
+                pending_raw_bytes
+                    .checked_add(raw_payload_len)
+                    .ok_or_else(|| {
+                        BlossomError::WireProtocol("pending raw dispatch byte overflow".to_string())
+                    })?;
+            if next_raw_bytes > max_raw_dispatch_bytes {
+                return Err(BlossomError::WireProtocol(format!(
+                    "pending raw dispatch bytes exceed quorum cap: {next_raw_bytes} > {max_raw_dispatch_bytes}"
+                )));
+            }
+
+            let sender = dispatch.sender();
+            let pending_sender_raw_bytes = self.pending_raw_dispatch_bytes_for_sender(&sender);
+            let next_sender_raw_bytes = pending_sender_raw_bytes
+                .checked_add(raw_payload_len)
+                .ok_or_else(|| {
+                    BlossomError::WireProtocol(
+                        "pending raw dispatch sender byte overflow".to_string(),
+                    )
+                })?;
+            if next_sender_raw_bytes > max_raw_dispatch_bytes_per_sender {
+                return Err(BlossomError::WireProtocol(format!(
+                    "pending raw dispatch bytes exceed sender cap: {next_sender_raw_bytes} > {max_raw_dispatch_bytes_per_sender}"
+                )));
+            }
+        }
+
+        self.pending_dispatches.push(dispatch);
+        Ok(())
+    }
+
+    pub fn pending_raw_dispatch_bytes(&self) -> usize {
+        self.pending_dispatches
+            .iter()
+            .filter_map(PendingDispatch::raw_payload_len)
+            .fold(0usize, usize::saturating_add)
+    }
+
+    pub fn pending_raw_dispatch_bytes_for_sender(&self, sender: &PubKey) -> usize {
+        self.pending_dispatches
+            .iter()
+            .filter(|dispatch| dispatch.sender() == *sender)
+            .filter_map(PendingDispatch::raw_payload_len)
+            .fold(0usize, usize::saturating_add)
+    }
+
     pub fn verify(&mut self) {
         self.verify_with_signature_checks(true);
     }
@@ -334,21 +445,54 @@ impl TempQuorum {
 
     fn verify_with_signature_checks(&mut self, verify_signatures: bool) {
         let mut processed_dispatches = HashMap::new();
-        for dispatch in &self.pending_dispatches {
+        for pending in &self.pending_dispatches {
+            let decoded_dispatch;
+            let dispatch = match pending {
+                PendingDispatch::Decoded(decoded) => decoded,
+                PendingDispatch::Hot(raw) => match raw.to_dispatch() {
+                    Ok(decoded) => {
+                        decoded_dispatch = decoded;
+                        &decoded_dispatch
+                    }
+                    Err(_) => {
+                        processed_dispatches.insert((raw.header.sender, raw.header.signature), ());
+                        continue;
+                    }
+                },
+            };
+
+            let signature_tree_hash = dispatch.body.signature_tree_hash;
             let signature_tree_ok = if verify_signatures {
-                dispatch.body.signature_tree.verify()
+                match self
+                    .verified_signature_tree_hashes
+                    .entry(signature_tree_hash)
+                {
+                    std::collections::btree_map::Entry::Occupied(_) => true,
+                    std::collections::btree_map::Entry::Vacant(entry) => {
+                        if dispatch.body.signature_tree.verify() {
+                            entry.insert(());
+                            true
+                        } else {
+                            false
+                        }
+                    }
+                }
             } else {
-                dispatch.body.signature_tree.hash() == dispatch.body.signature_tree_hash
+                dispatch.body.signature_tree.hash() == signature_tree_hash
             };
             if signature_tree_ok {
                 for (sent_block_hash, block) in &dispatch.body.blocks {
-                    let block_hash = block.hash();
+                    if self.verified_blocks.contains_key(sent_block_hash) {
+                        continue;
+                    }
                     let block_ok = if verify_signatures {
-                        block.verify_signature().is_ok()
+                        block.verify_integrity_with_hash(*sent_block_hash).is_ok()
                     } else {
-                        block.verify_unsigned_integrity().is_ok()
+                        block
+                            .verify_unsigned_integrity_with_hash(*sent_block_hash)
+                            .is_ok()
                     };
-                    if *sent_block_hash == block_hash && block_ok {
+                    if block_ok {
                         self.verified_blocks.insert(*sent_block_hash, block.clone());
                         self.timers.verified_tx += block.body.txs.len();
                     }
@@ -358,7 +502,7 @@ impl TempQuorum {
         }
 
         self.pending_dispatches.retain(|dispatch| {
-            !processed_dispatches.contains_key(&(dispatch.header.sender, dispatch.header.signature))
+            !processed_dispatches.contains_key(&dispatch.sender_and_signature())
         });
         self.verified_blocks_hash = Some(self.verified_blocks_hash());
     }
@@ -373,6 +517,32 @@ impl TempQuorum {
     pub fn verified_blocks_hash(&self) -> HashType {
         self.verified_blocks.hash()
     }
+}
+
+pub fn configured_max_pending_raw_dispatch_bytes() -> usize {
+    *CONFIGURED_MAX_PENDING_RAW_DISPATCH_BYTES.get_or_init(|| {
+        configured_pending_raw_dispatch_limit(
+            MAX_PENDING_RAW_DISPATCH_BYTES_ENV,
+            DEFAULT_MAX_PENDING_RAW_DISPATCH_BYTES,
+        )
+    })
+}
+
+pub fn configured_max_pending_raw_dispatch_bytes_per_sender() -> usize {
+    *CONFIGURED_MAX_PENDING_RAW_DISPATCH_BYTES_PER_SENDER.get_or_init(|| {
+        configured_pending_raw_dispatch_limit(
+            MAX_PENDING_RAW_DISPATCH_BYTES_PER_SENDER_ENV,
+            DEFAULT_MAX_PENDING_RAW_DISPATCH_BYTES_PER_SENDER,
+        )
+    })
+}
+
+fn configured_pending_raw_dispatch_limit(env_name: &str, default: usize) -> usize {
+    env::var(env_name)
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(default)
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
@@ -562,6 +732,7 @@ pub fn init_quorum(quorum: u32, peers: &[PubKey], self_key: &PubKey) -> TempQuor
         pending_dispatches: vec![],
         pending_blocks: BTreeMap::new(),
         verified_signature_trees: BTreeMap::new(),
+        verified_signature_tree_hashes: BTreeMap::new(),
         verified_blocks: BTreeMap::new(),
         processed_txs: HashMap::new(),
         last_signature_tree: Default::default(),
@@ -633,12 +804,16 @@ fn block_merkle_root(blocks: &BTreeMap<HashType, Block>) -> HashType {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bytes::Bytes;
+
     use crate::block::Transaction;
     use crate::blossom::{
         Dispatch, DispatchBody, Header, Proposal, ProposalBody, SignatureTree, Verification,
         VerificationBody,
     };
     use crate::crypto::{Keypair, Signature};
+    use crate::messages::Msg;
+    use crate::wire::{EncodedFrame, FRAME_PREFIX_BYTES, WireRequest, WireRequestFrame};
 
     fn node(index: u8) -> NodeIdentity {
         NodeIdentity::new(
@@ -709,6 +884,37 @@ mod tests {
         epoch
     }
 
+    fn hot_pending_dispatch(sender: PubKey, signature: Signature) -> PendingDispatch {
+        let blocks = BTreeMap::<HashType, Block>::default();
+        let blocks_hash = blocks.hash();
+        let signature_tree = SignatureTree::default();
+        let dispatch = Dispatch {
+            header: Header {
+                sender,
+                signature,
+                ..Default::default()
+            },
+            body: DispatchBody {
+                blocks_hash,
+                blocks,
+                signature_tree_hash: signature_tree.hash(),
+                signature_tree,
+            },
+        };
+        let frame =
+            EncodedFrame::encode_hot_wire_request(&WireRequest::Message(Msg::Dispatch(dispatch)))
+                .unwrap()
+                .unwrap();
+        match crate::wire::decode_wire_request_frame(Bytes::copy_from_slice(
+            &frame.as_bytes()[FRAME_PREFIX_BYTES..],
+        ))
+        .unwrap()
+        {
+            WireRequestFrame::HotDispatch(raw) => PendingDispatch::Hot(raw),
+            request => panic!("expected hot dispatch, got {request:?}"),
+        }
+    }
+
     #[test]
     fn get_mut_quorum_is_stable() {
         let (self_node, genesis) = genesis(0);
@@ -770,19 +976,111 @@ mod tests {
         };
 
         let mut verified_quorum = TempQuorum {
-            pending_dispatches: vec![dispatch.clone()],
+            pending_dispatches: vec![PendingDispatch::Decoded(dispatch.clone())],
             ..Default::default()
         };
         verified_quorum.verify();
         assert!(verified_quorum.verified_blocks.is_empty());
 
         let mut trusted_quorum = TempQuorum {
-            pending_dispatches: vec![dispatch],
+            pending_dispatches: vec![PendingDispatch::Decoded(dispatch)],
             ..Default::default()
         };
         trusted_quorum.verify_trusted();
         assert_eq!(trusted_quorum.verified_blocks.len(), 1);
         assert!(trusted_quorum.verified_blocks.contains_key(&block.hash));
+    }
+
+    #[test]
+    fn pending_dispatch_rejects_duplicate_sender_signature() {
+        let pending = hot_pending_dispatch(PubKey([7; 32]), Signature([1; 64]));
+        let raw_len = pending.raw_payload_len().unwrap();
+        let mut quorum = TempQuorum::default();
+
+        quorum
+            .try_push_pending_dispatch(pending.clone(), raw_len * 2, raw_len * 2)
+            .unwrap();
+        let err = quorum
+            .try_push_pending_dispatch(pending, raw_len * 2, raw_len * 2)
+            .unwrap_err();
+
+        assert!(matches!(
+            err,
+            BlossomError::WireProtocol(message) if message.contains("duplicate pending dispatch")
+        ));
+        assert_eq!(quorum.pending_dispatches.len(), 1);
+        assert_eq!(quorum.pending_raw_dispatch_bytes(), raw_len);
+    }
+
+    #[test]
+    fn pending_dispatch_enforces_raw_quorum_and_sender_caps() {
+        let sender = PubKey([8; 32]);
+        let first = hot_pending_dispatch(sender, Signature([1; 64]));
+        let second = hot_pending_dispatch(sender, Signature([2; 64]));
+        let raw_len = first.raw_payload_len().unwrap();
+
+        let mut quorum_cap = TempQuorum::default();
+        let err = quorum_cap
+            .try_push_pending_dispatch(first.clone(), raw_len - 1, raw_len)
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            BlossomError::WireProtocol(message) if message.contains("quorum cap")
+        ));
+        assert!(quorum_cap.pending_dispatches.is_empty());
+
+        let mut sender_cap = TempQuorum::default();
+        sender_cap
+            .try_push_pending_dispatch(first, raw_len * 2, raw_len)
+            .unwrap();
+        let err = sender_cap
+            .try_push_pending_dispatch(second, raw_len * 2, raw_len)
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            BlossomError::WireProtocol(message) if message.contains("sender cap")
+        ));
+        assert_eq!(sender_cap.pending_raw_dispatch_bytes(), raw_len);
+        assert_eq!(
+            sender_cap.pending_raw_dispatch_bytes_for_sender(&sender),
+            raw_len
+        );
+    }
+
+    #[test]
+    fn quorum_verify_skips_already_verified_blocks() {
+        let keypair = Keypair::generate();
+        let mut block = Block::default();
+        block.body.nonce = Nonce::new(1);
+        block.body.txs.push(Transaction::new("tx"));
+        block.sign(&keypair.secret);
+        let mut blocks = BTreeMap::new();
+        blocks.insert(block.hash, block.clone());
+        let dispatch = Dispatch {
+            header: Header {
+                sender: keypair.public,
+                signature: Signature::default(),
+                ..Default::default()
+            },
+            body: DispatchBody {
+                blocks_hash: blocks.hash(),
+                blocks,
+                signature_tree: SignatureTree::default(),
+                signature_tree_hash: SignatureTree::default().hash(),
+            },
+        };
+        let mut quorum = TempQuorum {
+            pending_dispatches: vec![
+                PendingDispatch::Decoded(dispatch.clone()),
+                PendingDispatch::Decoded(dispatch),
+            ],
+            ..Default::default()
+        };
+
+        quorum.verify();
+
+        assert_eq!(quorum.verified_blocks.len(), 1);
+        assert_eq!(quorum.timers.verified_tx, 1);
     }
 
     #[test]

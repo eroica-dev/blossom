@@ -23,6 +23,33 @@ impl Transaction {
         Self { hash, bytes }
     }
 
+    /// Builds a transaction with an application-supplied identifier.
+    ///
+    /// This is intended for trusted/application-specific overlays where the
+    /// caller already computed a stable key or content hash. The block hash
+    /// still commits to both this identifier and the transaction bytes, but the
+    /// transaction Merkle root represents these external identifiers rather than
+    /// Blossom-computed payload hashes.
+    #[cfg(feature = "external-transaction-hashes")]
+    pub fn from_external_hash(hash: HashType, bytes: impl Into<Vec<u8>>) -> Self {
+        Self {
+            hash,
+            bytes: bytes.into(),
+        }
+    }
+
+    /// Builds a transaction from a 64-bit external key hash, such as
+    /// fast-cache's XXH3 `hash_key` value.
+    ///
+    /// The little-endian `u64` is stored in the first eight bytes of Blossom's
+    /// 32-byte transaction identifier and the remaining bytes are zero.
+    #[cfg(feature = "external-transaction-hashes")]
+    pub fn from_external_hash_u64(hash: u64, bytes: impl Into<Vec<u8>>) -> Self {
+        let mut padded = [0; 32];
+        padded[..8].copy_from_slice(&hash.to_le_bytes());
+        Self::from_external_hash(HashType(padded), bytes)
+    }
+
     pub fn to_bytes(&self) -> Vec<u8> {
         [self.hash.as_ref(), self.bytes.as_slice()].concat()
     }
@@ -91,17 +118,26 @@ impl Block {
     }
 
     pub fn verify_integrity(&self) -> Result<()> {
-        self.verify_unsigned_integrity()?;
+        self.verify_integrity_with_hash(self.hash)
+    }
+
+    pub fn verify_integrity_with_hash(&self, expected_hash: HashType) -> Result<()> {
+        self.verify_unsigned_integrity_with_hash(expected_hash)?;
         self.signature
             .verify(self.hash.as_ref(), &self.body.validator)
     }
 
     pub fn verify_unsigned_integrity(&self) -> Result<()> {
+        self.verify_unsigned_integrity_with_hash(self.hash)
+    }
+
+    pub fn verify_unsigned_integrity_with_hash(&self, expected_hash: HashType) -> Result<()> {
         self.body.application_state.validate()?;
-        if self.hash != self.hash() {
+        let (body_hash, merkle_root) = self.body.hash_and_merkle_root();
+        if self.hash != expected_hash || body_hash != expected_hash {
             return Err(BlossomError::InvalidBlockHash);
         }
-        if self.body.merkle_root != self.body.compute_merkle_root() {
+        if self.body.merkle_root != merkle_root {
             return Err(BlossomError::InvalidBlockHash);
         }
         Ok(())
@@ -255,6 +291,26 @@ impl BlockBody {
         hasher.finalize()
     }
 
+    pub fn hash_and_merkle_root(&self) -> (HashType, HashType) {
+        let mut body_hasher = ProtocolHasher::new();
+        let mut merkle_hasher = ProtocolHasher::new();
+        body_hasher.update(self.validator.as_ref());
+        body_hasher.update(self.last_epoch.as_ref());
+        body_hasher.update(self.nonce.to_le_bytes());
+        body_hasher.update(self.created.to_le_bytes());
+        body_hasher.update(self.dispatched.to_le_bytes());
+        body_hasher.update(self.merkle_root.as_ref());
+        body_hasher.update((self.application_state.len() as u64).to_le_bytes());
+        body_hasher.update(self.application_state.as_slice());
+        for tx in &self.txs {
+            body_hasher.update(tx.hash.as_ref());
+            body_hasher.update((tx.bytes.len() as u64).to_le_bytes());
+            body_hasher.update(&tx.bytes);
+            merkle_hasher.update(tx.hash.as_ref());
+        }
+        (body_hasher.finalize(), merkle_hasher.finalize())
+    }
+
     pub fn compute_merkle_root(&self) -> HashType {
         HashType::hash_slices(self.txs.iter().map(|tx| tx.hash.as_ref()))
     }
@@ -319,6 +375,10 @@ mod tests {
         block.body.txs.push(Transaction::new("tx-2"));
 
         assert_eq!(block.body.hash(), HashType::hash(&block.body.to_bytes()));
+        assert_eq!(
+            block.body.hash_and_merkle_root().0,
+            HashType::hash(&block.body.to_bytes())
+        );
         assert_eq!(block.body.encoded_len(), block.body.to_bytes().len());
     }
 
@@ -394,6 +454,7 @@ mod tests {
         );
 
         assert_eq!(block.body.compute_merkle_root(), expected);
+        assert_eq!(block.body.hash_and_merkle_root().1, expected);
     }
 
     #[test]
@@ -404,6 +465,40 @@ mod tests {
         assert_eq!(tx.to_bytes(), [tx.hash.as_ref(), b"tx-1"].concat());
     }
 
+    #[cfg(feature = "external-transaction-hashes")]
+    #[test]
+    fn external_transaction_hashes_are_supported_and_block_committed() {
+        let external_hash = 0x1122_3344_5566_7788;
+        let tx = Transaction::from_external_hash_u64(external_hash, b"kv-payload".to_vec());
+
+        assert_eq!(&tx.hash.as_ref()[..8], &external_hash.to_le_bytes());
+        assert_eq!(&tx.hash.as_ref()[8..], &[0; 24]);
+        assert_ne!(tx.hash, HashType::hash(&tx.bytes));
+
+        let keypair = Keypair::generate();
+        let mut block = Block::default();
+        block.body.last_epoch = HashType([1; 32]);
+        block.body.nonce = Nonce::new(1);
+        block.body.txs.push(tx);
+        block.sign(&keypair.secret);
+
+        assert!(block.verify_integrity().is_ok());
+
+        let mut tampered = block.clone();
+        tampered.body.txs[0].bytes[0] ^= 0xff;
+        assert_eq!(
+            tampered.verify_integrity(),
+            Err(BlossomError::InvalidBlockHash)
+        );
+
+        let mut tampered = block;
+        tampered.body.txs[0].hash = HashType([9; 32]);
+        assert_eq!(
+            tampered.verify_integrity(),
+            Err(BlossomError::InvalidBlockHash)
+        );
+    }
+
     #[test]
     fn signed_block_integrity_rejects_hash_merkle_and_signature_tampering() {
         let keypair = Keypair::generate();
@@ -411,6 +506,11 @@ mod tests {
         block.body.txs.push(Transaction::new("tx-1"));
         block.sign(&keypair.secret);
         assert!(block.verify_integrity().is_ok());
+        assert!(block.verify_integrity_with_hash(block.hash).is_ok());
+        assert_eq!(
+            block.verify_integrity_with_hash(HashType([6; 32])),
+            Err(crate::error::BlossomError::InvalidBlockHash)
+        );
 
         let mut tampered_hash = block.clone();
         tampered_hash.hash = HashType([9; 32]);

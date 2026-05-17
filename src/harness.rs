@@ -11,8 +11,12 @@ use crate::error::{BlossomError, Result};
 use crate::node::NodeIdentity;
 use crate::nonce::Nonce;
 use crate::runtime::{EpochTarget, RuntimeConfig, TrustMode, genesis_epoch};
-use crate::tcp::{TcpNode, send_wire_frame, send_wire_request};
-use crate::wire::{EncodedFrame, WireRequest, WireResponse, read_frame, write_frame};
+use crate::tcp::{
+    TcpConnection, TcpNode, send_wire_frame, send_wire_request, send_wire_request_raw_response,
+};
+use crate::wire::{
+    EncodedFrame, WireRequest, WireResponse, read_wire_request, write_wire_response,
+};
 
 pub struct SimulatedCluster {
     nodes: Vec<SimulatedNode>,
@@ -142,6 +146,18 @@ impl SimulatedCluster {
         self.nodes[index].request_frame(frame).await
     }
 
+    pub async fn request_raw_response_frame(
+        &self,
+        index: usize,
+        request: WireRequest,
+    ) -> Result<EncodedFrame> {
+        self.nodes[index].request_raw_response_frame(request).await
+    }
+
+    pub async fn connect(&self, index: usize) -> Result<TcpConnection> {
+        self.nodes[index].connect().await
+    }
+
     pub async fn next_target(&self, index: usize) -> Result<EpochTarget> {
         match self.request(index, WireRequest::NextNonce).await? {
             WireResponse::NextNonce(target) => Ok(target),
@@ -182,6 +198,14 @@ impl SimulatedNode {
 
     pub async fn request_frame(&self, frame: &EncodedFrame) -> Result<WireResponse> {
         send_wire_frame(self.addr(), frame).await
+    }
+
+    pub async fn request_raw_response_frame(&self, request: WireRequest) -> Result<EncodedFrame> {
+        send_wire_request_raw_response(self.addr(), request).await
+    }
+
+    pub async fn connect(&self) -> Result<TcpConnection> {
+        TcpConnection::connect(self.addr()).await
     }
 }
 
@@ -288,9 +312,9 @@ async fn handle_mock_block_connection(
     mut stream: TcpStream,
     state: Arc<Mutex<MockBlockServiceState>>,
 ) -> Result<()> {
-    let request = read_frame(&mut stream).await?;
+    let request = read_wire_request(&mut stream).await?;
     let response = handle_mock_block_request(request, state);
-    write_frame(&mut stream, &response).await
+    write_wire_response(&mut stream, &response).await
 }
 
 fn handle_mock_block_request(

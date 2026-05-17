@@ -5,8 +5,9 @@ use crate::error::{BlossomError, Result};
 use crate::runtime::NodeRuntime;
 use crate::service_client::TcpServiceClient;
 use crate::wire::{
-    AddressBookUpdate, EncodedFrame, NodeHealth, WireRequest, WireResponse, read_frame,
-    write_encoded_frame, write_frame,
+    AddressBookUpdate, EncodedFrame, NodeHealth, WireRequest, WireRequestFrame, WireResponse,
+    read_encoded_frame, read_wire_request_frame_optional, read_wire_response, write_encoded_frame,
+    write_wire_request, write_wire_response,
 };
 
 #[derive(Clone)]
@@ -43,12 +44,23 @@ impl TcpNode {
     }
 
     pub async fn handle_connection(&self, mut stream: TcpStream) -> Result<()> {
-        let request = read_frame(&mut stream).await?;
-        let response = match self.handle_request(request).await {
-            Ok(response) => response,
-            Err(err) => WireResponse::Error(err.to_string()),
-        };
-        write_frame(&mut stream, &response).await
+        while let Some(request) = read_wire_request_frame_optional(&mut stream).await? {
+            let response = match self.handle_request_frame(request).await {
+                Ok(response) => response,
+                Err(err) => WireResponse::Error(err.to_string()),
+            };
+            write_wire_response(&mut stream, &response).await?;
+        }
+        Ok(())
+    }
+
+    pub async fn handle_request_frame(&self, request: WireRequestFrame) -> Result<WireResponse> {
+        match request {
+            WireRequestFrame::Request(request) => self.handle_request(request).await,
+            WireRequestFrame::HotDispatch(dispatch) => Ok(WireResponse::MessageReceipt(
+                self.runtime.receive_hot_dispatch(dispatch)?,
+            )),
+        }
     }
 
     pub async fn handle_request(&self, request: WireRequest) -> Result<WireResponse> {
@@ -98,23 +110,53 @@ impl TcpNode {
     }
 }
 
+pub struct TcpConnection {
+    stream: TcpStream,
+}
+
+impl TcpConnection {
+    pub async fn connect(addr: impl AsRef<str>) -> Result<Self> {
+        let stream = TcpStream::connect(addr.as_ref())
+            .await
+            .map_err(|err| BlossomError::Io(err.to_string()))?;
+        Ok(Self { stream })
+    }
+
+    pub async fn request(&mut self, request: &WireRequest) -> Result<WireResponse> {
+        write_wire_request(&mut self.stream, request).await?;
+        read_wire_response(&mut self.stream).await
+    }
+
+    pub async fn request_frame(&mut self, frame: &EncodedFrame) -> Result<WireResponse> {
+        write_encoded_frame(&mut self.stream, frame).await?;
+        read_wire_response(&mut self.stream).await
+    }
+
+    pub async fn request_raw_response(&mut self, request: &WireRequest) -> Result<EncodedFrame> {
+        write_wire_request(&mut self.stream, request).await?;
+        read_encoded_frame(&mut self.stream).await
+    }
+}
+
 pub async fn send_wire_request(
     addr: impl AsRef<str>,
     request: WireRequest,
 ) -> Result<WireResponse> {
-    let mut stream = TcpStream::connect(addr.as_ref())
-        .await
-        .map_err(|err| BlossomError::Io(err.to_string()))?;
-    write_frame(&mut stream, &request).await?;
-    read_frame(&mut stream).await
+    let mut connection = TcpConnection::connect(addr).await?;
+    connection.request(&request).await
 }
 
 pub async fn send_wire_frame(addr: impl AsRef<str>, frame: &EncodedFrame) -> Result<WireResponse> {
-    let mut stream = TcpStream::connect(addr.as_ref())
-        .await
-        .map_err(|err| BlossomError::Io(err.to_string()))?;
-    write_encoded_frame(&mut stream, frame).await?;
-    read_frame(&mut stream).await
+    let mut connection = TcpConnection::connect(addr).await?;
+    connection.request_frame(frame).await
+}
+
+pub async fn send_wire_request_raw_response(
+    addr: impl AsRef<str>,
+    request: WireRequest,
+) -> Result<EncodedFrame> {
+    let mut connection = TcpConnection::connect(addr).await?;
+    connection.request_raw_response(&request).await
 }
 
 #[cfg(test)]

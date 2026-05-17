@@ -22,8 +22,11 @@ use crate::overlay::{
     BroadcastReport, FanOutStrategy, add_self_consensus_service, broadcast_wire_request,
     select_fanout_targets,
 };
-use crate::state::{Epoch, EpochBody, LocalState};
-use crate::wire::WireRequest;
+use crate::state::{
+    Epoch, EpochBody, LocalState, PendingDispatch, configured_max_pending_raw_dispatch_bytes,
+    configured_max_pending_raw_dispatch_bytes_per_sender,
+};
+use crate::wire::{HotDispatch, WireRequest};
 
 #[derive(Debug, Clone)]
 pub struct RuntimeConfig {
@@ -335,7 +338,7 @@ impl NodeRuntime {
                 if message.header.verify_header(&mut state) == Some(false) {
                     return Err(BlossomError::UnknownSender);
                 }
-                message.verify(&mut state);
+                message.try_accept_into_state(&mut state)?;
                 Ok(MessageReceipt::accepted("dispatch"))
             }
             Msg::EchoResponse(message) => self.receive_echo_response(message),
@@ -348,6 +351,34 @@ impl NodeRuntime {
             Msg::Ok => Ok(MessageReceipt::accepted("ok")),
             Msg::Fail => Ok(MessageReceipt::accepted("fail")),
         }
+    }
+
+    pub fn receive_hot_dispatch(&self, message: HotDispatch) -> Result<MessageReceipt> {
+        if !self.inner.trust_mode.is_trusted() {
+            message.verify_signature()?;
+        }
+        let mut state = self.inner.state.write().expect("state lock poisoned");
+        if message.header.verify_header(&mut state) == Some(false) {
+            return Err(BlossomError::UnknownSender);
+        }
+        let sender = message.header.sender;
+        let quorum = state.get_mut_quorum(
+            &message.header.last_epoch,
+            message.header.nonce,
+            message.header.round,
+        );
+        if quorum.received_dispatches.contains(&sender) {
+            return Err(BlossomError::WireProtocol(format!(
+                "duplicate dispatch from {sender}"
+            )));
+        }
+        quorum.try_push_pending_dispatch(
+            PendingDispatch::Hot(message),
+            configured_max_pending_raw_dispatch_bytes(),
+            configured_max_pending_raw_dispatch_bytes_per_sender(),
+        )?;
+        quorum.received_dispatches.push(sender);
+        Ok(MessageReceipt::accepted("dispatch"))
     }
 
     fn receive_echo_request(&self, message: EchoRequest) -> Result<MessageReceipt> {

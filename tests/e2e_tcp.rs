@@ -7,7 +7,7 @@ use blossom::{
     ServiceKind, Signature, SimulatedCluster, TcpServiceClient, Transaction, TrustMode,
     Verification, VerificationBody, WireRequest, WireResponse,
 };
-use blossom::{DoHash, NodeIdentity};
+use blossom::{DoHash, EncodedFrame, NodeIdentity};
 
 #[tokio::test]
 async fn cluster_exposes_health_state_address_book_and_nonce() {
@@ -47,6 +47,25 @@ async fn cluster_exposes_health_state_address_book_and_nonce() {
             cluster.next_target(index).await.unwrap().nonce,
             Nonce::new(1)
         );
+    }
+
+    let mut connection = cluster.connect(0).await.unwrap();
+    match connection.request(&WireRequest::Health).await.unwrap() {
+        WireResponse::Health(health) => {
+            assert_eq!(health.status, "ok");
+            assert_eq!(health.public_key, cluster.node(0).identity.public_key());
+        }
+        response => panic!(
+            "expected health over persistent connection, got {}",
+            response.kind()
+        ),
+    }
+    match connection.request(&WireRequest::NextNonce).await.unwrap() {
+        WireResponse::NextNonce(target) => assert_eq!(target.nonce, Nonce::new(1)),
+        response => panic!(
+            "expected next nonce over persistent connection, got {}",
+            response.kind()
+        ),
     }
 }
 
@@ -213,9 +232,18 @@ async fn trusted_cluster_accepts_unsigned_block_and_dispatch() {
     assert!(dispatched_block.verify_unsigned_integrity().is_ok());
     assert!(dispatched_block.verify_integrity().is_err());
 
+    let hot_dispatch_frame = EncodedFrame::encode_hot_wire_request(&WireRequest::Message(
+        Msg::Dispatch(dispatch.clone()),
+    ))
+    .unwrap()
+    .unwrap();
+    expect_receipt(
+        cluster.request_frame(1, &hot_dispatch_frame).await,
+        "dispatch",
+    );
     expect_receipt(
         cluster
-            .request(1, WireRequest::Message(Msg::Dispatch(dispatch)))
+            .request(2, WireRequest::Message(Msg::Dispatch(dispatch)))
             .await,
         "dispatch",
     );
@@ -280,6 +308,22 @@ async fn protocol_message_variants_are_accepted_over_tcp() {
             .await,
         "dispatch",
     );
+    let hot_dispatch_frame = EncodedFrame::encode_hot_wire_request(&WireRequest::Message(
+        Msg::Dispatch(dispatch.clone()),
+    ))
+    .unwrap()
+    .unwrap();
+    expect_receipt(
+        cluster.request_frame(2, &hot_dispatch_frame).await,
+        "dispatch",
+    );
+    match cluster.request_frame(2, &hot_dispatch_frame).await.unwrap() {
+        WireResponse::Error(message) => assert!(message.contains("duplicate dispatch")),
+        response => panic!(
+            "expected duplicate hot dispatch error, got {}",
+            response.kind()
+        ),
+    }
 
     let sender = &cluster.node(0).identity;
     let blocks = dispatch

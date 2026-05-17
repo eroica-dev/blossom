@@ -7,6 +7,7 @@ license = "UNLICENSED"
 
 [features]
 default = []
+external-transaction-hashes = []
 insecure-fast-hash = ["dep:xxhash-rust"]
 
 [dependencies]
