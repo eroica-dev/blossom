@@ -41,7 +41,10 @@ block/engine services together.
 - `src/harness.rs`: in-process simulation cluster and mock block service.
 - `src/bin/blossom-node.rs`: raw TCP node process.
 - `src/bin/blossom-harness.rs`: local node-behavior simulation runner.
+- `src/bin/blossom-harness-bench.rs`: CSV-emitting full harness benchmark driver.
 - `tests/e2e_tcp.rs`: TCP end-to-end coverage for node and service behavior.
+- `benches/protocol.rs`: Criterion microbenchmarks for protocol primitives and runtime paths.
+- `benchmarks/`: shell-script benchmark runners and ignored CSV result directory.
 - `paper/`: LaTeX protocol paper source and figure assets used as the architecture reference.
 - `docs/architecture.md`: paper-informed architecture map for the extracted crate.
 - `docs/source-map.md`: source files used for the extraction.
@@ -109,6 +112,27 @@ For only the TCP end-to-end suite:
 
 ```sh
 cargo test --test e2e_tcp
+```
+
+## Benchmark
+
+Run Criterion microbenchmarks:
+
+```sh
+./benchmarks/scripts/run-criterion.sh
+```
+
+Run a full simulated-node harness benchmark:
+
+```sh
+ITERATIONS=10 NODES=6 TRANSACTIONS=3 ./benchmarks/scripts/run-harness.sh
+```
+
+Run a harness matrix:
+
+```sh
+NODE_COUNTS="1 6 12" TRANSACTION_COUNTS="0 3 32" ITERATIONS=5 \
+  ./benchmarks/scripts/run-harness-matrix.sh
 ```
 
 ## Notes

@@ -1,0 +1,39 @@
+#!/usr/bin/env bash
+# Run one local TCP harness benchmark and write a timestamped CSV.
+#
+# Environment:
+#   NODES=6
+#   TRANSACTIONS=3
+#   ITERATIONS=10
+#   WARMUP=1
+#   SERVER_CPUSET=0-3      Linux only, optional taskset pinning.
+
+set -euo pipefail
+
+here="$(cd "$(dirname "$0")" && pwd)"
+root="$(cd "$here/.." && pwd)"
+ws_root="$(cd "$root/.." && pwd)"
+# shellcheck source=_lib.sh
+. "$here/_lib.sh"
+
+cd "$ws_root"
+report_pinning
+
+mkdir -p "$root/results"
+out="$root/results/harness_$(timestamp).csv"
+
+if [[ "${DIRECT:-0}" == "1" ]]; then
+  cargo build --release --bin blossom-harness-bench
+  cmd=("$ws_root/target/release/blossom-harness-bench")
+else
+  cmd=(cargo run --release --bin blossom-harness-bench --)
+fi
+
+pinned_exec "${cmd[@]}" \
+  --nodes "${NODES:-6}" \
+  --transactions "${TRANSACTIONS:-3}" \
+  --iterations "${ITERATIONS:-10}" \
+  --warmup "${WARMUP:-1}" \
+  --csv "$out"
+
+echo "wrote $out"

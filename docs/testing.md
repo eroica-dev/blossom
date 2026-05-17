@@ -23,6 +23,14 @@ Run the interactive simulation harness:
 cargo run --bin blossom-harness -- --nodes 6 --transactions 3
 ```
 
+Run benchmark smoke checks:
+
+```sh
+cargo bench --bench protocol -- --test
+cargo run --release --bin blossom-harness-bench -- \
+  --nodes 2 --transactions 1 --iterations 1 --warmup 0
+```
+
 ## End-To-End Coverage
 
 `tests/e2e_tcp.rs` covers:
