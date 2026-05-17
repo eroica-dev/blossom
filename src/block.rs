@@ -57,14 +57,13 @@ impl Block {
     pub fn sign_with(&mut self, signer: &SecretSigner) {
         self.body.validator = signer.public_key();
         self.body.merkle_root = self.body.compute_merkle_root();
-        let body_bytes = self.body.to_bytes();
-        self.hash = HashType::hash(&body_bytes);
-        self.signature = signer.sign(&body_bytes);
+        self.hash = self.body.hash();
+        self.signature = signer.sign(self.hash.as_ref());
     }
 
     pub fn verify_signature(&self) -> Result<()> {
         self.signature
-            .verify(&self.body.to_bytes(), &self.body.validator)
+            .verify(self.body.hash().as_ref(), &self.body.validator)
     }
 
     pub fn verify_integrity(&self) -> Result<()> {
@@ -186,6 +185,12 @@ mod tests {
         block.sign(&keypair.secret);
 
         assert_eq!(block.body.validator, keypair.public);
+        assert!(
+            block
+                .signature
+                .verify(block.hash.as_ref(), &keypair.public)
+                .is_ok()
+        );
         assert!(block.verify_signature().is_ok());
     }
 
