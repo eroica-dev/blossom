@@ -13,6 +13,7 @@ pub enum BlossomError {
     UnknownSender,
     EmptyEpochChain,
     InvalidEpochNonce,
+    FailedConsensus,
 }
 
 impl fmt::Display for BlossomError {
@@ -29,6 +30,7 @@ impl fmt::Display for BlossomError {
             Self::UnknownSender => write!(f, "unknown sender"),
             Self::EmptyEpochChain => write!(f, "empty epoch chain"),
             Self::InvalidEpochNonce => write!(f, "invalid epoch nonce"),
+            Self::FailedConsensus => write!(f, "failed consensus"),
         }
     }
 }

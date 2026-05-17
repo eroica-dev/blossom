@@ -1,15 +1,18 @@
 use std::collections::{BTreeMap, HashMap};
 use std::time::{Duration, Instant};
 
+use indextreemap::IndexTreeMap;
+use rs_merkle::{MerkleTree, algorithms::Sha256};
 use serde::{Deserialize, Serialize, Serializer, ser::SerializeStruct};
 
-use crate::algorithm::{select_quorums, supermajority_count};
+use crate::algorithm::{select_quorums_from_index_tree, supermajority_count};
 use crate::block::Block;
 use crate::blossom::{
     Commit, Dispatch, EchoReDispatch, EchoRequest, EchoResponse, Proposal, SignatureTree,
     SignaturesForHash, Verification,
 };
 use crate::crypto::PubKey;
+use crate::error::{BlossomError, Result};
 use crate::hash::{DoHash, HashType};
 use crate::node::{NodeIdentity, NodeType};
 use crate::nonce::Nonce;
@@ -133,7 +136,7 @@ impl LocalState {
                     verifiers: last_epoch.body.verifiers.clone(),
                     last_epoch: *proposed_last_epoch_hash,
                     nonce: expected_nonce,
-                    merkle_root: blocks.hash(),
+                    merkle_root: block_merkle_root(&blocks),
                     blocks,
                 },
             }
@@ -163,8 +166,8 @@ impl LocalState {
             return Vec::new();
         };
 
-        let peer_rounds = select_quorums(
-            last_epoch.body.verifiers.keys().copied(),
+        let peer_rounds = select_quorums_from_index_tree(
+            &last_epoch.body.verifiers,
             &self.self_node.public_key(),
             *epoch_hash,
             self.self_node.shuffle,
@@ -199,11 +202,30 @@ impl Epoch {
     pub fn set_hash(&mut self) {
         self.hash = HashType::hash(&self.body.to_bytes());
     }
+
+    pub fn epoch_approved(&self) -> Result<()> {
+        let verifier_count = self.body.verifiers.len();
+        if verifier_count == 0 || self.signatures.len() < supermajority_count(verifier_count) {
+            return Err(BlossomError::FailedConsensus);
+        }
+
+        let message = self.hash.to_bytes();
+        for (index, signature) in &self.signatures {
+            let public_key = self
+                .body
+                .verifiers
+                .get_key_from_index(*index)
+                .ok_or(BlossomError::UnknownSender)?;
+            signature.verify(&message, public_key)?;
+        }
+
+        Ok(())
+    }
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
 pub struct EpochBody {
-    pub verifiers: BTreeMap<PubKey, NodeIdentity>,
+    pub verifiers: IndexTreeMap<PubKey, NodeIdentity>,
     pub last_epoch: HashType,
     pub nonce: Nonce,
     pub merkle_root: HashType,
@@ -558,9 +580,19 @@ pub fn init_proposals(quorum: u32) -> PropCount {
     }
 }
 
+fn block_merkle_root(blocks: &BTreeMap<HashType, Block>) -> HashType {
+    let leaves = blocks.keys().map(|hash| hash.0).collect::<Vec<_>>();
+    HashType::from_byte_hash(
+        MerkleTree::<Sha256>::from_leaves(&leaves)
+            .root()
+            .unwrap_or_default(),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::crypto::{Keypair, Signature};
 
     fn node(index: u8) -> NodeIdentity {
         NodeIdentity::new(
@@ -574,7 +606,7 @@ mod tests {
     }
 
     fn genesis(self_index: u8) -> (NodeIdentity, Epoch) {
-        let mut verifiers = BTreeMap::new();
+        let mut verifiers = IndexTreeMap::new();
         for index in 0..6 {
             let node = node(index);
             verifiers.insert(node.public_key(), node);
@@ -589,6 +621,46 @@ mod tests {
         };
         epoch.set_hash();
         (node(self_index), epoch)
+    }
+
+    fn signed_epoch(verifier_count: u8, signature_count: u8) -> Epoch {
+        let mut verifiers = IndexTreeMap::new();
+        let mut secrets = BTreeMap::new();
+        for index in 0..verifier_count {
+            let keypair = Keypair::generate();
+            verifiers.insert(
+                keypair.public,
+                NodeIdentity::new(
+                    keypair.public,
+                    None,
+                    "http",
+                    format!("node-{index}"),
+                    9000 + index as u16,
+                    false,
+                ),
+            );
+            secrets.insert(keypair.public, keypair.secret);
+        }
+
+        let mut epoch = Epoch {
+            body: EpochBody {
+                verifiers,
+                nonce: Nonce::new(1),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        epoch.set_hash();
+
+        for index in 0..signature_count as usize {
+            let public_key = epoch.body.verifiers.get_key_from_index(index).unwrap();
+            let secret_key = secrets.get(public_key).unwrap();
+            epoch
+                .signatures
+                .insert(index, Signature::sign(&epoch.hash.to_bytes(), secret_key));
+        }
+
+        epoch
     }
 
     #[test]
@@ -607,5 +679,24 @@ mod tests {
                 .dispatch_status,
             Some(false)
         );
+    }
+
+    #[test]
+    fn epoch_approval_requires_supermajority_signatures() {
+        assert!(signed_epoch(6, 4).epoch_approved().is_ok());
+        assert_eq!(
+            signed_epoch(6, 3).epoch_approved(),
+            Err(BlossomError::FailedConsensus)
+        );
+    }
+
+    #[test]
+    fn block_merkle_root_matches_single_block_leaf() {
+        let block = Block::empty_with_nonce(Nonce::new(1));
+        let hash = block.hash();
+        let mut blocks = BTreeMap::new();
+        blocks.insert(hash, block);
+
+        assert_eq!(block_merkle_root(&blocks), hash);
     }
 }

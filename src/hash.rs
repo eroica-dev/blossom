@@ -1,8 +1,10 @@
 use borsh::{BorshDeserialize, BorshSerialize};
+use indextreemap::IndexTreeMap;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::fmt;
+use std::hash::Hash;
 use std::ops::Deref;
 
 use crate::error::{BlossomError, Result};
@@ -102,6 +104,20 @@ pub trait DoHash {
 impl<K, V> DoHash for BTreeMap<K, V>
 where
     K: Ord + AsRef<[u8]>,
+{
+    fn hash(&self) -> HashType {
+        let mut bytes = Vec::with_capacity(self.len() * 32);
+        for key in self.keys() {
+            bytes.extend_from_slice(key.as_ref());
+        }
+        HashType::hash(&bytes)
+    }
+}
+
+impl<K, V> DoHash for IndexTreeMap<K, V>
+where
+    K: Sized + Default + Ord + Clone + Hash + AsRef<[u8]>,
+    V: Sized + Default + Clone,
 {
     fn hash(&self) -> HashType {
         let mut bytes = Vec::with_capacity(self.len() * 32);

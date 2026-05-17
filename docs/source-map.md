@@ -7,6 +7,7 @@ the earlier `eden-poc` repo as a structural reference.
 
 - `consensus_service/src/stc/blossom.rs` -> `src/blossom.rs`
 - `consensus_service/src/stc/state.rs` -> `src/state.rs`
+- `consensus_service/src/stc/epoch.rs` -> `src/state.rs`
 - `consensus_service/src/stc/messages.rs` -> `src/messages.rs`
 - `consensus_service/src/register.rs` -> `src/register.rs`
 - `consensus_service/src/algorithm.rs` -> `src/algorithm.rs`
@@ -43,5 +44,7 @@ future distribution-failure recovery messages.
 - The new crate keeps protocol data structures and pure state transitions, but drops Actix actors, HTTP connectors, database adapters, metrics, CLI, and deployment files.
 - The POC's generic layout informed the module boundary, while the current repo's concrete Ed25519/hash/nonce direction informed the public types.
 - The paper's protocol section is captured in `docs/architecture.md` as the guiding architecture map for future implementation work.
+- Epoch verifier membership uses Eden's `indextreemap::IndexTreeMap` so quorum selection and epoch-signature approval can address validators by deterministic index, matching the original consensus-tree code.
+- Epoch block roots use the same `rs_merkle` Merkle root construction from `consensus_service/src/stc/state.rs`.
 - The quorum round calculation keeps the original base-6 logic and applies the same floating-point tolerance to the final round count, avoiding an off-by-one at exact powers such as `216`.
 - `TempQuorum::verify` now verifies block hashes and Ed25519 signatures directly through the extracted block/crypto primitives.

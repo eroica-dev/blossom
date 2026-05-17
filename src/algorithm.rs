@@ -1,5 +1,6 @@
 use crate::crypto::PubKey;
 use crate::hash::HashType;
+use indextreemap::IndexTreeMap;
 
 pub const QUORUM_SIZE: usize = 6;
 pub const SUPERMAJORITY: f64 = 2.0 / 3.0;
@@ -10,24 +11,38 @@ pub fn select_quorums(
     seed: HashType,
     shuffle: bool,
 ) -> Vec<Vec<PubKey>> {
-    let mut ordered_nodes: Vec<PubKey> = nodes.into_iter().collect();
-    ordered_nodes.sort_unstable();
+    let mut node_map = IndexTreeMap::new();
+    for node in nodes {
+        node_map.insert(node, ());
+    }
 
-    if ordered_nodes.is_empty() {
+    select_quorums_from_index_tree(&node_map, self_key, seed, shuffle)
+}
+
+pub fn select_quorums_from_index_tree<N>(
+    node_map: &IndexTreeMap<PubKey, N>,
+    self_key: &PubKey,
+    seed: HashType,
+    shuffle: bool,
+) -> Vec<Vec<PubKey>>
+where
+    N: Default + Clone,
+{
+    if node_map.is_empty() {
         return Vec::new();
     }
 
-    let self_index = match ordered_nodes.iter().position(|node| node == self_key) {
+    let self_index = match node_map.get_index_from_key(self_key) {
         Some(index) => index,
         None => return Vec::new(),
     };
 
-    let (optimal_network_size, rounds) = find_round_number(ordered_nodes.len());
+    let (optimal_network_size, rounds) = find_round_number(node_map.len());
     if optimal_network_size == 0 || rounds == 0 {
         return Vec::new();
     }
 
-    let mut ordered_indices: Vec<usize> = (0..ordered_nodes.len()).collect();
+    let mut ordered_indices: Vec<usize> = (0..node_map.len()).collect();
     let self_index = if shuffle {
         deterministic_shuffle(&mut ordered_indices, seed);
         ordered_indices
@@ -39,7 +54,7 @@ pub fn select_quorums(
     };
 
     algorithm(
-        &ordered_nodes,
+        node_map,
         &ordered_indices,
         self_index,
         optimal_network_size,
@@ -47,15 +62,18 @@ pub fn select_quorums(
     )
 }
 
-pub fn algorithm(
-    ordered_nodes: &[PubKey],
+pub fn algorithm<N>(
+    node_map: &IndexTreeMap<PubKey, N>,
     ordered_indices: &[usize],
     mut self_index: usize,
     optimal_network_size: usize,
     rounds: usize,
-) -> Vec<Vec<PubKey>> {
+) -> Vec<Vec<PubKey>>
+where
+    N: Default + Clone,
+{
     let mut quorum_members_matrix = Vec::new();
-    if ordered_nodes.is_empty() || optimal_network_size == 0 {
+    if node_map.is_empty() || optimal_network_size == 0 {
         return quorum_members_matrix;
     }
 
@@ -84,10 +102,12 @@ pub fn algorithm(
         let mut quorum = Vec::new();
         for quorum_member in 0..QUORUM_SIZE {
             let index = first_quorum_member + (quorum_member * size_multiple * offset);
-            if index >= ordered_nodes.len() {
+            if index >= ordered_indices.len() {
                 break;
             }
-            quorum.push(ordered_nodes[index]);
+            if let Some(member) = member_at(node_map, ordered_indices, index) {
+                quorum.push(member);
+            }
         }
 
         if ordered_indices.len() >= optimal_network_size {
@@ -95,10 +115,12 @@ pub fn algorithm(
                 let index = optimal_network_size
                     + first_quorum_member
                     + (quorum_member * size_multiple * offset);
-                if index >= ordered_nodes.len() {
+                if index >= ordered_indices.len() {
                     break;
                 }
-                quorum.push(ordered_nodes[index]);
+                if let Some(member) = member_at(node_map, ordered_indices, index) {
+                    quorum.push(member);
+                }
             }
         }
 
@@ -108,6 +130,18 @@ pub fn algorithm(
     }
 
     quorum_members_matrix
+}
+
+fn member_at<N>(
+    node_map: &IndexTreeMap<PubKey, N>,
+    ordered_indices: &[usize],
+    index: usize,
+) -> Option<PubKey>
+where
+    N: Default + Clone,
+{
+    let map_index = ordered_indices.get(index).copied().unwrap_or(index);
+    node_map.get_key_from_index(map_index).copied()
 }
 
 pub fn deterministic_shuffle(indices: &mut [usize], seed: HashType) {
@@ -172,6 +206,16 @@ mod tests {
     fn selects_quorums_containing_self() {
         let nodes = (0..36).map(key).collect::<Vec<_>>();
         let quorums = select_quorums(nodes, &key(7), HashType::default(), false);
+
+        assert_eq!(quorums.len(), 2);
+        assert!(quorums.iter().all(|quorum| quorum.contains(&key(7))));
+    }
+
+    #[test]
+    fn shuffled_quorums_still_contain_self() {
+        let nodes = (0..36).map(key).collect::<Vec<_>>();
+        let seed = HashType::hash(b"shuffle seed");
+        let quorums = select_quorums(nodes, &key(7), seed, true);
 
         assert_eq!(quorums.len(), 2);
         assert!(quorums.iter().all(|quorum| quorum.contains(&key(7))));

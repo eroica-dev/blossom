@@ -23,6 +23,7 @@ pub use blossom::*;
 pub use crypto::{Keypair, PubKey, SecKey, Signature};
 pub use error::{BlossomError, Result};
 pub use hash::{DoHash, HashType};
+pub use indextreemap::IndexTreeMap;
 pub use messages::{MSGKey, Msg};
 pub use node::{NodeIdentity, NodeType};
 pub use nonce::Nonce;

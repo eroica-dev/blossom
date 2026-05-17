@@ -9,6 +9,7 @@ The repo intentionally contains only protocol logic:
 - Blossom message types: dispatch, echo response/request, verification, proposal, commit, and epoch started.
 - Quorum and round selection.
 - Consensus state, temporary quorum state, proposal/verification counting, and epoch advancement.
+- Indexed verifier membership, epoch approval checks, and Merkle-rooted epoch block sets.
 - Minimal cryptographic and block primitives needed for the protocol to compile independently.
 - Unit tests for signing, block verification, quorum selection, message matrix behavior, and quorum state reuse.
 
@@ -17,7 +18,7 @@ It does not include the old Actix actors, HTTP APIs, database adapters, metrics 
 ## Layout
 
 - `src/blossom.rs`: protocol message structs, body hashing/signing, signature tree, dispatch verification helpers.
-- `src/state.rs`: local state, epoch chain, temporary consensus/quorum state, proposal and verification counts.
+- `src/state.rs`: local state, epoch chain, indexed verifier membership, epoch approval, temporary consensus/quorum state, proposal and verification counts.
 - `src/register.rs`: Blossom message matrix and quorum queue.
 - `src/algorithm.rs`: deterministic quorum/round selection.
 - `src/crypto.rs`: Ed25519 public keys, secret keys, signatures, and key generation.
