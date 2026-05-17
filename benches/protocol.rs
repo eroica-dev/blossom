@@ -170,6 +170,28 @@ fn bench_runtime(c: &mut Criterion) {
         );
     });
 
+    group.bench_function("local_block_add_transactions_1000", |b| {
+        b.iter_batched(
+            || {
+                (0..1_000)
+                    .map(|index| {
+                        let mut bytes = vec![0; 32];
+                        bytes[..8].copy_from_slice(&(index as u64).to_le_bytes());
+                        Transaction::new(bytes)
+                    })
+                    .collect::<Vec<_>>()
+            },
+            |txs| {
+                let mut local = LocalBlock::new(1_024);
+                for tx in txs {
+                    local.add_transaction(tx);
+                }
+                black_box(local)
+            },
+            BatchSize::LargeInput,
+        );
+    });
+
     group.finish();
 }
 

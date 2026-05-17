@@ -1,4 +1,5 @@
 use std::collections::VecDeque;
+use std::mem;
 
 use serde::{Deserialize, Serialize};
 
@@ -27,8 +28,6 @@ impl LocalBlock {
     pub fn add_transaction(&mut self, tx: Transaction) -> HashType {
         let hash = tx.hash;
         self.build_block.body.txs.push(tx);
-        self.build_block.body.merkle_root = self.build_block.body.compute_merkle_root();
-        self.build_block.set_hash();
         hash
     }
 
@@ -42,8 +41,10 @@ impl LocalBlock {
         self.build_block.body.nonce = nonce;
         self.build_block.sign(secret_key);
 
-        let hash = self.enqueue_block(self.build_block.clone())?;
-        self.build_block = Block::default();
+        self.ensure_enqueueable(&self.build_block)?;
+        let hash = self.build_block.hash;
+        let block = mem::take(&mut self.build_block);
+        self.block_deque.push_back(block);
         Ok(hash)
     }
 
@@ -55,6 +56,13 @@ impl LocalBlock {
     /// Enqueue a block after the caller has already applied the appropriate
     /// integrity checks for its trust boundary.
     pub fn enqueue_preverified_block(&mut self, block: Block) -> Result<HashType> {
+        self.ensure_enqueueable(&block)?;
+        let hash = block.hash;
+        self.block_deque.push_back(block);
+        Ok(hash)
+    }
+
+    fn ensure_enqueueable(&self, block: &Block) -> Result<()> {
         if self
             .block_deque
             .iter()
@@ -66,9 +74,7 @@ impl LocalBlock {
             return Err(BlossomError::BlockQueueFull);
         }
 
-        let hash = block.hash;
-        self.block_deque.push_back(block);
-        Ok(hash)
+        Ok(())
     }
 
     pub fn dequeue_block(
@@ -157,6 +163,41 @@ mod tests {
 
         assert_eq!(queue.len(), 1);
         assert_ne!(hash, HashType::default());
+    }
+
+    #[test]
+    fn add_transaction_defers_block_hash_work_until_close() {
+        let keypair = Keypair::generate();
+        let mut queue = LocalBlock::new(2);
+        let initial_hash = queue.build_block.hash;
+        let tx_hash = queue.add_transaction(Transaction::new("tx"));
+
+        assert_eq!(tx_hash, HashType::hash(b"tx"));
+        assert_eq!(queue.build_block.hash, initial_hash);
+        assert_eq!(queue.build_block.body.merkle_root, HashType::default());
+
+        let block_hash = queue
+            .close_block(&keypair.secret, HashType([1; 32]), Nonce::new(1))
+            .unwrap();
+        let block = queue.block_deque.front().unwrap();
+
+        assert_eq!(block.hash, block_hash);
+        assert_ne!(block.body.merkle_root, HashType::default());
+        assert!(block.verify_integrity().is_ok());
+    }
+
+    #[test]
+    fn close_block_preserves_pending_block_when_queue_full() {
+        let keypair = Keypair::generate();
+        let mut queue = LocalBlock::new(0);
+        queue.add_transaction(Transaction::new("tx"));
+
+        assert_eq!(
+            queue.close_block(&keypair.secret, HashType([1; 32]), Nonce::new(1)),
+            Err(BlossomError::BlockQueueFull)
+        );
+        assert_eq!(queue.build_block.body.txs.len(), 1);
+        assert_eq!(queue.len(), 0);
     }
 
     #[test]

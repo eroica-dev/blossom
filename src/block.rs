@@ -78,7 +78,8 @@ impl Block {
 
     pub fn verify_integrity(&self) -> Result<()> {
         self.verify_unsigned_integrity()?;
-        self.verify_signature()
+        self.signature
+            .verify(self.hash.as_ref(), &self.body.validator)
     }
 
     pub fn verify_unsigned_integrity(&self) -> Result<()> {
