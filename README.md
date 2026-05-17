@@ -17,6 +17,8 @@ node surface:
 - Optional trusted-cluster mode for private known-member deployments that
   skip block/message signatures while retaining membership and hash/merkle
   integrity checks.
+- Optional `insecure-fast-hash` build feature for trusted/performance
+  experiments that swaps protocol SHA-256 commitments for XXH3.
 - A raw TCP `blossom-node` binary with a length-prefixed Borsh wire protocol for health, state, address book, block intake, dispatch, and message handling.
 - Minimal cryptographic and block primitives needed for the protocol to compile independently.
 - Unit tests for signing, block verification, quorum selection, address-book behavior, block queueing, message matrix behavior, and runtime block dispatch.
@@ -76,6 +78,12 @@ trusted membership set, `--trusted` or `BLOSSOM_TRUSTED=true` disables
 Ed25519 block/message signing and verification. This is a raw-speed mode
 for controlled deployments; nodes still reject unknown senders and invalid
 block hashes or Merkle roots.
+
+For benchmarking the non-cryptographic lower bound, build with
+`--features insecure-fast-hash`. This replaces protocol SHA-256 hashing with
+XXH3 while keeping the same `HashType` wire shape. It is not the default and
+should not be used for the verified protocol unless the deployment explicitly
+accepts non-cryptographic commitments.
 
 Wire requests:
 
@@ -148,6 +156,14 @@ Run the paper-aligned epoch-depth model in trusted mode:
 
 ```sh
 cargo run --release --bin blossom-epoch-bench -- \
+  --nodes 36 --target-transactions 1000000 \
+  --transactions-per-node 1000 --trusted
+```
+
+Run the same model with the opt-in non-cryptographic hash path:
+
+```sh
+cargo run --release --features insecure-fast-hash --bin blossom-epoch-bench -- \
   --nodes 36 --target-transactions 1000000 \
   --transactions-per-node 1000 --trusted
 ```

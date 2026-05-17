@@ -1,10 +1,13 @@
 use borsh::{BorshDeserialize, BorshSerialize};
 use indextreemap::{IndexTreeMap, SharedIndexTreeMap};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
+#[cfg(not(feature = "insecure-fast-hash"))]
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::fmt;
 use std::ops::Deref;
+#[cfg(feature = "insecure-fast-hash")]
+use xxhash_rust::xxh3::Xxh3;
 
 use crate::error::{BlossomError, Result};
 
@@ -25,20 +28,20 @@ pub struct HashType(pub [u8; 32]);
 
 impl HashType {
     pub fn hash(bytes: &[u8]) -> Self {
-        let mut sha256 = Sha256::new();
-        sha256.update(bytes);
-        Self(sha256.finalize().into())
+        let mut hasher = ProtocolHasher::new();
+        hasher.update(bytes);
+        hasher.finalize()
     }
 
     pub fn hash_slices<'a, I>(slices: I) -> Self
     where
         I: IntoIterator<Item = &'a [u8]>,
     {
-        let mut sha256 = Sha256::new();
+        let mut hasher = ProtocolHasher::new();
         for bytes in slices {
-            sha256.update(bytes);
+            hasher.update(bytes);
         }
-        Self(sha256.finalize().into())
+        hasher.finalize()
     }
 
     pub fn from_byte_hash(hash: [u8; 32]) -> Self {
@@ -109,6 +112,63 @@ impl<'de> Deserialize<'de> for HashType {
 
 pub trait DoHash {
     fn hash(&self) -> HashType;
+}
+
+#[cfg(not(feature = "insecure-fast-hash"))]
+pub struct ProtocolHasher {
+    inner: Sha256,
+}
+
+#[cfg(not(feature = "insecure-fast-hash"))]
+impl ProtocolHasher {
+    pub fn new() -> Self {
+        Self {
+            inner: Sha256::new(),
+        }
+    }
+
+    pub fn update(&mut self, bytes: impl AsRef<[u8]>) {
+        self.inner.update(bytes.as_ref());
+    }
+
+    pub fn finalize(self) -> HashType {
+        HashType::from_byte_hash(self.inner.finalize().into())
+    }
+}
+
+#[cfg(feature = "insecure-fast-hash")]
+pub struct ProtocolHasher {
+    primary: Xxh3,
+    secondary: Xxh3,
+}
+
+#[cfg(feature = "insecure-fast-hash")]
+impl ProtocolHasher {
+    pub fn new() -> Self {
+        Self {
+            primary: Xxh3::new(),
+            secondary: Xxh3::with_seed(0xb105_50ff_0d15_ea5e),
+        }
+    }
+
+    pub fn update(&mut self, bytes: impl AsRef<[u8]>) {
+        let bytes = bytes.as_ref();
+        self.primary.update(bytes);
+        self.secondary.update(bytes);
+    }
+
+    pub fn finalize(self) -> HashType {
+        let mut bytes = [0; 32];
+        bytes[..16].copy_from_slice(&self.primary.digest128().to_le_bytes());
+        bytes[16..].copy_from_slice(&self.secondary.digest128().to_le_bytes());
+        HashType::from_byte_hash(bytes)
+    }
+}
+
+impl Default for ProtocolHasher {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl<K, V> DoHash for BTreeMap<K, V>

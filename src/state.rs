@@ -2,6 +2,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::time::{Duration, Instant};
 
 use indextreemap::IndexTreeMap;
+#[cfg(not(feature = "insecure-fast-hash"))]
 use rs_merkle::{MerkleTree, algorithms::Sha256};
 use serde::{Deserialize, Serialize, Serializer, ser::SerializeStruct};
 
@@ -599,12 +600,26 @@ pub fn init_proposals(quorum: u32) -> PropCount {
 }
 
 fn block_merkle_root(blocks: &BTreeMap<HashType, Block>) -> HashType {
-    let leaves = blocks.keys().map(|hash| hash.0).collect::<Vec<_>>();
-    HashType::from_byte_hash(
-        MerkleTree::<Sha256>::from_leaves(&leaves)
-            .root()
-            .unwrap_or_default(),
-    )
+    #[cfg(feature = "insecure-fast-hash")]
+    {
+        if blocks.is_empty() {
+            return HashType::default();
+        }
+        if let Some(hash) = blocks.keys().next().copied().filter(|_| blocks.len() == 1) {
+            return hash;
+        }
+        return blocks.hash();
+    }
+
+    #[cfg(not(feature = "insecure-fast-hash"))]
+    {
+        let leaves = blocks.keys().map(|hash| hash.0).collect::<Vec<_>>();
+        HashType::from_byte_hash(
+            MerkleTree::<Sha256>::from_leaves(&leaves)
+                .root()
+                .unwrap_or_default(),
+        )
+    }
 }
 
 #[cfg(test)]

@@ -87,6 +87,13 @@ The epoch-depth benchmark uses this mode to model dispatch-only quorum
 propagation, removing echo, verification, proposal, and commit messages
 from the known-member fast path.
 
+`insecure-fast-hash` is a separate build-time benchmark/deployment
+switch for trusted environments. It replaces SHA-256 protocol
+commitments with XXH3 while keeping the same 32-byte `HashType`
+representation. The default build remains SHA-256, and the verified
+protocol should use the default unless the operator explicitly accepts
+non-cryptographic hash commitments.
+
 ### Transaction Validation
 
 After block propagation, the paper expects all non-Byzantine validators

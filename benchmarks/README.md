@@ -57,6 +57,14 @@ cargo run --release --bin blossom-epoch-bench -- \
   --transactions-per-node 1000 --transaction-bytes 32 --trusted
 ```
 
+Run the same scenario with non-cryptographic XXH3 protocol hashing:
+
+```bash
+cargo run --release --features insecure-fast-hash --bin blossom-epoch-bench -- \
+  --nodes 36 --target-transactions 1000000 \
+  --transactions-per-node 1000 --transaction-bytes 32 --trusted
+```
+
 Derive epoch depth from a target input volume:
 
 ```bash
@@ -111,3 +119,9 @@ quorum unions, but it seals blocks without Ed25519 signatures and counts only
 dispatch fanout for each quorum. This models a private deployment where
 membership is known out of band and consensus can skip echo, verification,
 proposal, and commit traffic.
+
+The `insecure-fast-hash` feature is deliberately separate from `--trusted`.
+It swaps SHA-256 protocol commitments for XXH3 so benchmark runs can isolate
+hash cost from signature and message-pattern cost. Treat results from that
+feature as trusted-environment throughput numbers, not verified-protocol
+security numbers.

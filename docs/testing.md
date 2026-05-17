@@ -11,6 +11,15 @@ Run everything:
 cargo test
 ```
 
+Run the opt-in non-cryptographic hash build:
+
+```sh
+cargo test --features insecure-fast-hash
+```
+
+That feature is for trusted/performance experiments. The default test run is
+the secure SHA-256 protocol path.
+
 Run only the end-to-end suite:
 
 ```sh

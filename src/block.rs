@@ -1,11 +1,10 @@
 use borsh::{BorshDeserialize, BorshSerialize};
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::crypto::{PubKey, SecKey, SecretSigner, Signature};
 use crate::error::Result;
-use crate::hash::HashType;
+use crate::hash::{HashType, ProtocolHasher};
 use crate::nonce::Nonce;
 
 #[derive(Serialize, Deserialize, BorshSerialize, BorshDeserialize, Debug, Clone, Default)]
@@ -161,19 +160,19 @@ impl BlockBody {
     }
 
     pub fn hash(&self) -> HashType {
-        let mut sha256 = Sha256::new();
-        sha256.update(self.validator.as_ref());
-        sha256.update(self.last_epoch.as_ref());
-        sha256.update(self.nonce.to_le_bytes());
-        sha256.update(self.created.to_le_bytes());
-        sha256.update(self.dispatched.to_le_bytes());
-        sha256.update(self.merkle_root.as_ref());
+        let mut hasher = ProtocolHasher::new();
+        hasher.update(self.validator.as_ref());
+        hasher.update(self.last_epoch.as_ref());
+        hasher.update(self.nonce.to_le_bytes());
+        hasher.update(self.created.to_le_bytes());
+        hasher.update(self.dispatched.to_le_bytes());
+        hasher.update(self.merkle_root.as_ref());
         for tx in &self.txs {
-            sha256.update(tx.hash.as_ref());
-            sha256.update((tx.bytes.len() as u64).to_le_bytes());
-            sha256.update(&tx.bytes);
+            hasher.update(tx.hash.as_ref());
+            hasher.update((tx.bytes.len() as u64).to_le_bytes());
+            hasher.update(&tx.bytes);
         }
-        HashType::from_byte_hash(sha256.finalize().into())
+        hasher.finalize()
     }
 
     pub fn compute_merkle_root(&self) -> HashType {
