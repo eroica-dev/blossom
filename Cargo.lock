@@ -93,6 +93,7 @@ name = "blossom"
 version = "0.1.0"
 dependencies = [
  "borsh",
+ "bytes",
  "clap",
  "criterion",
  "ed25519-dalek",

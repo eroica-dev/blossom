@@ -7,10 +7,12 @@ use std::time::Instant;
 use clap::Parser;
 
 use blossom::algorithm::select_quorums;
+use blossom::wire::FRAME_PREFIX_BYTES;
 use blossom::{
-    Block, BlossomBody, Commit, CommitBody, Dispatch, DispatchBody, DoHash, EchoResponse,
-    EchoResponseBody, HashType, Header, Keypair, Msg, NodeIdentity, Nonce, Proposal, ProposalBody,
-    PubKey, SignatureTree, Transaction, Verification, VerificationBody, WireRequest, framed_len,
+    Block, BlockHandle, BlockIndex, BlossomBody, Commit, CommitBody, DoHash, EchoResponse,
+    EchoResponseBody, HashType, Header, Keypair, Msg, Nonce, Proposal, ProposalBody, PubKey,
+    SecretSigner, SignatureTree, Transaction, Verification, VerificationBody, WireRequest,
+    encoded_len, framed_len,
 };
 
 type MainResult<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
@@ -42,12 +44,20 @@ struct Args {
 #[derive(Debug, Clone)]
 struct BenchNode {
     keypair: Keypair,
-    identity: NodeIdentity,
+    signer: SecretSigner,
 }
 
 #[derive(Debug, Clone)]
 struct NodeEpochState {
-    blocks: BTreeMap<HashType, Block>,
+    blocks: BlockIndex,
+}
+
+#[derive(Debug, Clone)]
+struct DispatchProfile {
+    sender: PubKey,
+    blocks_hash: HashType,
+    signature_tree_hash: HashType,
+    framed_len: usize,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -163,17 +173,10 @@ fn epoch_depth(args: &Args) -> usize {
 
 fn build_nodes(count: usize) -> Vec<BenchNode> {
     (0..count)
-        .map(|index| {
+        .map(|_| {
             let keypair = Keypair::generate();
-            let identity = NodeIdentity::new(
-                keypair.public,
-                Some(keypair.secret),
-                "memory",
-                format!("node-{index}"),
-                9000 + index as u16,
-                false,
-            );
-            BenchNode { keypair, identity }
+            let signer = keypair.signer();
+            BenchNode { keypair, signer }
         })
         .collect()
 }
@@ -201,11 +204,12 @@ fn run_epoch(
                 nonce,
                 transactions(epoch, node_index, transactions_per_node, transaction_bytes),
             );
+            let block = BlockHandle::new(block)?;
             let mut blocks = BTreeMap::new();
-            blocks.insert(block.hash, block);
-            NodeEpochState { blocks }
+            blocks.insert(block.hash(), block);
+            Ok(NodeEpochState { blocks })
         })
-        .collect::<Vec<_>>();
+        .collect::<MainResult<Vec<_>>>()?;
     let block_build_us = block_start.elapsed().as_micros();
     let block_bytes = states
         .iter()
@@ -321,7 +325,7 @@ fn signed_block(
     block.body.last_epoch = last_epoch;
     block.body.nonce = nonce;
     block.body.txs = txs;
-    block.sign(&node.keypair.secret);
+    block.sign_with(&node.signer);
     block
 }
 
@@ -411,16 +415,15 @@ fn count_quorum_messages(
     totals: &mut MessageTotals,
 ) -> MainResult<()> {
     for sender in quorum {
-        let dispatch = dispatch_for(
+        let dispatch = dispatch_profile_for(
             &nodes[*sender],
-            states[*sender].blocks.clone(),
+            &states[*sender].blocks,
             last_epoch,
             nonce,
             round,
         )?;
-        let dispatch_len = framed_len(&WireRequest::Message(Msg::Dispatch(dispatch.clone())))?;
         totals.dispatch_messages += quorum.len().saturating_sub(1);
-        totals.dispatch_bytes += dispatch_len * quorum.len().saturating_sub(1);
+        totals.dispatch_bytes += dispatch.framed_len * quorum.len().saturating_sub(1);
 
         for echo_sender in quorum {
             if echo_sender == sender {
@@ -473,22 +476,50 @@ fn count_quorum_messages(
     Ok(())
 }
 
+fn dispatch_profile_for(
+    node: &BenchNode,
+    blocks: &BlockIndex,
+    last_epoch: HashType,
+    nonce: Nonce,
+    round: u8,
+) -> MainResult<DispatchProfile> {
+    let signature_tree = SignatureTree::default();
+    let signature_tree_hash = signature_tree.hash();
+    let blocks_hash = blocks.hash();
+    let header = signed_header_bytes(
+        node,
+        last_epoch,
+        nonce,
+        round,
+        &dispatch_body_bytes(blocks_hash, signature_tree_hash),
+    )?;
+    let framed_len = framed_dispatch_len(&header, blocks, &signature_tree)?;
+
+    Ok(DispatchProfile {
+        sender: header.sender,
+        blocks_hash,
+        signature_tree_hash,
+        framed_len,
+    })
+}
+
+#[cfg(test)]
 fn dispatch_for(
     node: &BenchNode,
     blocks: BTreeMap<HashType, Block>,
     last_epoch: HashType,
     nonce: Nonce,
     round: u8,
-) -> MainResult<Dispatch> {
+) -> MainResult<blossom::Dispatch> {
     let signature_tree = SignatureTree::default();
     let signature_tree_hash = signature_tree.hash();
-    let body = DispatchBody {
+    let body = blossom::DispatchBody {
         blocks_hash: blocks.hash(),
         blocks,
         signature_tree,
         signature_tree_hash,
     };
-    Ok(Dispatch {
+    Ok(blossom::Dispatch {
         header: signed_header(node, last_epoch, nonce, round, &body)?,
         body,
     })
@@ -496,15 +527,15 @@ fn dispatch_for(
 
 fn echo_for(
     node: &BenchNode,
-    dispatch: &Dispatch,
+    dispatch: &DispatchProfile,
     last_epoch: HashType,
     nonce: Nonce,
     round: u8,
 ) -> MainResult<EchoResponse> {
     let body = EchoResponseBody {
-        sender: dispatch.header.sender,
-        blocks_hash: dispatch.body.blocks_hash,
-        signature_tree_hash: dispatch.body.signature_tree_hash,
+        sender: dispatch.sender,
+        blocks_hash: dispatch.blocks_hash,
+        signature_tree_hash: dispatch.signature_tree_hash,
     };
     Ok(EchoResponse {
         header: signed_header(node, last_epoch, nonce, round, &body)?,
@@ -580,12 +611,65 @@ fn signed_header<T: BlossomBody>(
         last_epoch,
         nonce,
         round,
-        signature: body.signature(&node.identity)?,
+        signature: node.signer.sign(&body.to_bytes()),
     })
 }
 
-fn encoded_block_len(block: &Block) -> MainResult<usize> {
-    Ok(borsh::object_length(block)?)
+fn signed_header_bytes(
+    node: &BenchNode,
+    last_epoch: HashType,
+    nonce: Nonce,
+    round: u8,
+    body_bytes: &[u8],
+) -> MainResult<Header> {
+    Ok(Header {
+        sender: node.keypair.public,
+        last_epoch,
+        nonce,
+        round,
+        signature: node.signer.sign(body_bytes),
+    })
+}
+
+fn encoded_block_len(block: &BlockHandle) -> MainResult<usize> {
+    Ok(block.encoded_len())
+}
+
+fn dispatch_body_bytes(blocks_hash: HashType, signature_tree_hash: HashType) -> Vec<u8> {
+    [blocks_hash.as_ref(), signature_tree_hash.as_ref()].concat()
+}
+
+fn framed_dispatch_len(
+    header: &Header,
+    blocks: &BlockIndex,
+    signature_tree: &SignatureTree,
+) -> MainResult<usize> {
+    const BORSH_ENUM_TAG_BYTES: usize = 1;
+    const BORSH_MAP_LEN_BYTES: usize = 4;
+    const HASH_BYTES: usize = 32;
+
+    let blocks_len = BORSH_MAP_LEN_BYTES
+        + blocks
+            .values()
+            .map(|block| HASH_BYTES + block.encoded_len())
+            .sum::<usize>();
+
+    Ok(FRAME_PREFIX_BYTES
+        + BORSH_ENUM_TAG_BYTES
+        + BORSH_ENUM_TAG_BYTES
+        + encoded_len(header)?
+        + blocks_len
+        + HASH_BYTES
+        + encoded_len(signature_tree)?
+        + HASH_BYTES)
+}
+
+#[cfg(test)]
+fn materialize_blocks(blocks: &BlockIndex) -> BTreeMap<HashType, Block> {
+    blocks
+        .iter()
+        .map(|(hash, block)| (*hash, block.to_owned_block()))
+        .collect()
 }
 
 fn epoch_hash(last_epoch: HashType, nonce: Nonce, blocks_hash: HashType) -> HashType {
@@ -695,5 +779,23 @@ mod tests {
         };
 
         assert_eq!(epoch_depth(&args), 28);
+    }
+
+    #[test]
+    fn dispatch_profile_len_matches_full_wire_dispatch() {
+        let nodes = build_nodes(1);
+        let last_epoch = HashType::hash(b"epoch");
+        let nonce = Nonce::new(9);
+        let block = signed_block(&nodes[0], last_epoch, nonce, transactions(0, 0, 3, 32));
+        let block = BlockHandle::new(block).unwrap();
+        let mut blocks = BlockIndex::new();
+        blocks.insert(block.hash(), block);
+
+        let profile = dispatch_profile_for(&nodes[0], &blocks, last_epoch, nonce, 0).unwrap();
+        let dispatch =
+            dispatch_for(&nodes[0], materialize_blocks(&blocks), last_epoch, nonce, 0).unwrap();
+        let framed = framed_len(&WireRequest::Message(Msg::Dispatch(dispatch))).unwrap();
+
+        assert_eq!(profile.framed_len, framed);
     }
 }

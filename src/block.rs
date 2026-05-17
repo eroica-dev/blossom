@@ -2,7 +2,7 @@ use borsh::{BorshDeserialize, BorshSerialize};
 use serde::{Deserialize, Serialize};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::crypto::{PubKey, SecKey, Signature};
+use crate::crypto::{PubKey, SecKey, SecretSigner, Signature};
 use crate::error::Result;
 use crate::hash::HashType;
 use crate::nonce::Nonce;
@@ -49,10 +49,15 @@ impl Block {
     }
 
     pub fn sign(&mut self, secret_key: &SecKey) {
-        self.body.validator = PubKey::from(secret_key_to_public(secret_key).as_array());
+        let signer = SecretSigner::new(*secret_key);
+        self.sign_with(&signer);
+    }
+
+    pub fn sign_with(&mut self, signer: &SecretSigner) {
+        self.body.validator = signer.public_key();
         self.body.merkle_root = self.body.compute_merkle_root();
         self.set_hash();
-        self.signature = Signature::sign(&self.body.to_bytes(), secret_key);
+        self.signature = signer.sign(&self.body.to_bytes());
     }
 
     pub fn verify_signature(&self) -> Result<()> {
@@ -141,12 +146,6 @@ fn now_micros() -> u128 {
         .as_micros()
 }
 
-fn secret_key_to_public(secret_key: &SecKey) -> PubKey {
-    let signing_key = ed25519_dalek::SigningKey::from_bytes(secret_key.as_array());
-    let verifying_key = ed25519_dalek::VerifyingKey::from(&signing_key);
-    PubKey(verifying_key.to_bytes())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -158,6 +157,18 @@ mod tests {
         let mut block = Block::default();
         block.body.txs.push(Transaction::new("tx-1"));
         block.sign(&keypair.secret);
+
+        assert_eq!(block.body.validator, keypair.public);
+        assert!(block.verify_signature().is_ok());
+    }
+
+    #[test]
+    fn block_can_sign_with_cached_signer() {
+        let keypair = Keypair::generate();
+        let signer = keypair.signer();
+        let mut block = Block::default();
+        block.body.txs.push(Transaction::new("tx-1"));
+        block.sign_with(&signer);
 
         assert_eq!(block.body.validator, keypair.public);
         assert!(block.verify_signature().is_ok());

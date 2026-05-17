@@ -27,6 +27,10 @@ impl Keypair {
             secret: SecKey(signing_key.to_bytes()),
         }
     }
+
+    pub fn signer(&self) -> SecretSigner {
+        SecretSigner::new(self.secret)
+    }
 }
 
 #[derive(
@@ -227,6 +231,43 @@ impl Signature {
     }
 }
 
+#[derive(Clone)]
+pub struct SecretSigner {
+    public_key: PubKey,
+    signing_key: SigningKey,
+}
+
+impl SecretSigner {
+    pub fn new(secret_key: SecKey) -> Self {
+        let signing_key = SigningKey::from_bytes(secret_key.as_array());
+        let public_key = PubKey(signing_key.verifying_key().to_bytes());
+        Self {
+            public_key,
+            signing_key,
+        }
+    }
+
+    pub fn public_key(&self) -> PubKey {
+        self.public_key
+    }
+
+    pub fn sign(&self, message: &[u8]) -> Signature {
+        Signature(self.signing_key.sign(message).to_bytes())
+    }
+
+    pub fn matches_public_key(&self, public_key: &PubKey) -> bool {
+        self.public_key == *public_key
+    }
+}
+
+impl fmt::Debug for SecretSigner {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SecretSigner")
+            .field("public_key", &self.public_key)
+            .finish_non_exhaustive()
+    }
+}
+
 impl Default for Signature {
     fn default() -> Self {
         Self([0; SIGNATURE_LENGTH])
@@ -299,6 +340,18 @@ mod tests {
 
         assert!(signature.verify(message, &keypair.public).is_ok());
         assert!(signature.verify(b"not blossom", &keypair.public).is_err());
+    }
+
+    #[test]
+    fn secret_signer_reuses_key_material_without_changing_signatures() {
+        let keypair = Keypair::generate();
+        let signer = keypair.signer();
+        let message = b"cached signer";
+        let signature = signer.sign(message);
+
+        assert_eq!(signer.public_key(), keypair.public);
+        assert!(signer.matches_public_key(&keypair.public));
+        assert!(signature.verify(message, &keypair.public).is_ok());
     }
 
     #[test]

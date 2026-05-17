@@ -1,7 +1,7 @@
 use borsh::{BorshDeserialize, BorshSerialize};
 use serde::{Deserialize, Serialize};
 
-use crate::crypto::{Keypair, PubKey, SecKey, Signature};
+use crate::crypto::{Keypair, PubKey, SecKey, SecretSigner, Signature};
 use crate::error::{BlossomError, Result};
 
 #[derive(
@@ -63,9 +63,17 @@ impl NodeIdentity {
         self.public_key
     }
 
-    pub fn sign(&self, message: &[u8]) -> Result<Signature> {
+    pub fn signer(&self) -> Result<SecretSigner> {
         let secret_key = self.secret_key.ok_or(BlossomError::MissingSecretKey)?;
-        Ok(Signature::sign(message, &secret_key))
+        let signer = SecretSigner::new(secret_key);
+        if !signer.matches_public_key(&self.public_key) {
+            return Err(BlossomError::KeyMismatch);
+        }
+        Ok(signer)
+    }
+
+    pub fn sign(&self, message: &[u8]) -> Result<Signature> {
+        Ok(self.signer()?.sign(message))
     }
 
     pub fn verify(signature: &Signature, message: &[u8], public_key: &PubKey) -> Result<()> {
@@ -104,6 +112,15 @@ mod tests {
         let node = NodeIdentity::new(PubKey([9; 32]), None, "tcp", "localhost", 1, false);
 
         assert_eq!(node.sign(b"message"), Err(BlossomError::MissingSecretKey));
+    }
+
+    #[test]
+    fn mismatched_secret_key_cannot_sign() {
+        let public = Keypair::generate().public;
+        let secret = Keypair::generate().secret;
+        let node = NodeIdentity::new(public, Some(secret), "tcp", "localhost", 1, false);
+
+        assert_eq!(node.sign(b"message"), Err(BlossomError::KeyMismatch));
     }
 
     #[test]

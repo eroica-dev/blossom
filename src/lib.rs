@@ -8,6 +8,7 @@
 pub mod address_book;
 pub mod algorithm;
 pub mod block;
+pub mod block_store;
 pub mod blossom;
 pub mod crypto;
 pub mod error;
@@ -27,8 +28,9 @@ pub mod wire;
 pub use address_book::{AddressBook, Service, ServiceKind};
 pub use algorithm::{QUORUM_SIZE, SUPERMAJORITY};
 pub use block::{Block, BlockBody, Transaction};
+pub use block_store::{BlockHandle, BlockIndex, BlockRecord};
 pub use blossom::*;
-pub use crypto::{Keypair, PubKey, SecKey, Signature};
+pub use crypto::{Keypair, PubKey, SecKey, SecretSigner, Signature};
 pub use error::{BlossomError, Result};
 pub use harness::{MockBlockService, SimulatedCluster, SimulatedNode, signed_block};
 pub use hash::{DoHash, HashType};

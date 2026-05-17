@@ -11,6 +11,7 @@ use crate::blossom::{
     BlossomBody, Commit, Dispatch, DispatchBody, EchoResponse, EpochStarted, Header, Proposal,
     SignatureTree, Verification,
 };
+use crate::crypto::{SecretSigner, Signature};
 use crate::error::{BlossomError, Result};
 use crate::hash::{DoHash, HashType};
 use crate::local_block::LocalBlock;
@@ -47,6 +48,7 @@ struct RuntimeInner {
     state: RwLock<LocalState>,
     local_blocks: RwLock<LocalBlock>,
     address_book: RwLock<AddressBook>,
+    signer: Option<SecretSigner>,
 }
 
 #[derive(Serialize, Deserialize, BorshSerialize, BorshDeserialize, Debug, Clone, PartialEq, Eq)]
@@ -79,6 +81,7 @@ pub struct MessageReceipt {
 
 impl NodeRuntime {
     pub fn new(mut config: RuntimeConfig) -> Self {
+        let signer = config.self_node.signer().ok();
         let genesis = config
             .genesis
             .take()
@@ -96,6 +99,7 @@ impl NodeRuntime {
                 state: RwLock::new(LocalState::new(config.self_node, genesis)),
                 local_blocks: RwLock::new(LocalBlock::new(config.block_cap)),
                 address_book: RwLock::new(config.address_book),
+                signer,
             }),
         }
     }
@@ -231,7 +235,7 @@ impl NodeRuntime {
             last_epoch: target.last_epoch,
             nonce: target.nonce,
             round,
-            signature: body.signature(&self_node)?,
+            signature: self.sign_body(&self_node, &body)?,
         };
 
         let mut state = self.inner.state.write().expect("state lock poisoned");
@@ -371,9 +375,22 @@ impl NodeRuntime {
         let mut block = Block::default();
         block.body.last_epoch = target.last_epoch;
         block.body.nonce = target.nonce;
-        let secret_key = self_node.secret_key.ok_or(BlossomError::MissingSecretKey)?;
-        block.sign(&secret_key);
+        match self.inner.signer.as_ref() {
+            Some(signer) => block.sign_with(signer),
+            None => {
+                let secret_key = self_node.secret_key.ok_or(BlossomError::MissingSecretKey)?;
+                block.sign(&secret_key);
+            }
+        }
         Ok(block)
+    }
+
+    fn sign_body<T: BlossomBody>(&self, self_node: &NodeIdentity, body: &T) -> Result<Signature> {
+        let body_bytes = body.to_bytes();
+        match self.inner.signer.as_ref() {
+            Some(signer) => Ok(signer.sign(&body_bytes)),
+            None => self_node.sign(&body_bytes),
+        }
     }
 }
 
