@@ -1,0 +1,20 @@
+[package]
+name = "blossom"
+version = "0.1.0"
+edition = "2024"
+description = "Extracted Blossom consensus protocol logic from Eden."
+license = "UNLICENSED"
+
+[dependencies]
+borsh = { version = "1.5.7", features = ["derive"] }
+ed25519-dalek = { version = "2.2.0", features = ["batch", "rand_core"] }
+hex = { version = "0.4.3", features = ["serde"] }
+log = "0.4.28"
+rand_core = { version = "0.6.4", features = ["getrandom"] }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.145"
+sha2 = "0.10.9"
+thiserror = "1.0.69"
+
+[dev-dependencies]
+env_logger = "0.11.8"
