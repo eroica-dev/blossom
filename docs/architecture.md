@@ -24,6 +24,8 @@ them against local state, and close a local block. In this crate, that
 surface is represented by:
 
 - `src/block.rs`: signed block and transaction envelope primitives.
+- `src/block.rs`: bounded opaque application-state payloads carried in
+  the block metadata and committed by the block hash/signature.
 - `src/local_block.rs`: queued block intake from the block service and
   locally closed blocks.
 - `src/address_book.rs`: service registry for block, engine, relay,
@@ -36,6 +38,14 @@ surface is represented by:
 The extraction intentionally keeps transaction semantics minimal.
 Application transaction schemas, ledger adapters, block size policy, and
 mempool behavior belong above this crate or in a follow-up ledger layer.
+
+Blocks also expose a generic application-state channel. The payload is
+opaque `Vec<u8>` data with a 4 KiB soft budget and an 8 KiB hard limit.
+Blossom validates only the size and commits the bytes into the block hash;
+version tags, parsing, compatibility, decay, and timeout behavior belong
+to the application. Once an epoch commits, every validator observes the
+same payloads in the same block order, and the block nonce/epoch acts as
+the publication timestamp.
 
 ### Block Propagation
 
@@ -148,11 +158,16 @@ This lets applications reuse Blossom's structured fan-out for overlay
 messages, gossip, DHT routing, or private-agent coordination without
 committing a block or advancing an epoch.
 
+Application-state payloads sent through overlay-only traffic are useful
+for best-effort gossip, but they do not have the ordering or common-view
+semantics that come from committed consensus blocks.
+
 ## Implemented Now
 
 - Primary Blossom message structures.
 - Deterministic quorum and round selection.
 - Overlay runtime and runtime broadcast APIs using the quorum topology.
+- Bounded block application-state payloads for piggy-backed coordination.
 - Primary dispatch, echo, verification, proposal, and commit message
   flow.
 - Local consensus, temporary quorum state, and epoch chain structures.

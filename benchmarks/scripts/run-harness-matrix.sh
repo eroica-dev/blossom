@@ -5,6 +5,7 @@
 #   NODE_COUNTS="1 6 12"
 #   TRANSACTION_COUNTS="0 3 32"
 #   TX_BYTES=32
+#   APP_STATE_BYTES=0
 #   ITERATIONS=5
 #   WARMUP=1
 #   DELIVERY_MODE=all-peers   all-peers or first-accepted
@@ -41,6 +42,7 @@ for nodes in ${NODE_COUNTS:-1 6 12}; do
       --nodes "$nodes" \
       --transactions "$txs" \
       --transaction-bytes "${TX_BYTES:-32}" \
+      --application-state-bytes "${APP_STATE_BYTES:-0}" \
       --iterations "${ITERATIONS:-5}" \
       --warmup "${WARMUP:-1}" \
       --delivery-mode "${DELIVERY_MODE:-all-peers}" \

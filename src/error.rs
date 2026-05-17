@@ -24,6 +24,10 @@ pub enum BlossomError {
         expected: crate::nonce::Nonce,
         actual: crate::nonce::Nonce,
     },
+    BlockApplicationStateTooLarge {
+        max: usize,
+        actual: usize,
+    },
     DuplicateBlock,
     BlockQueueFull,
     ExternalService(String),
@@ -53,6 +57,12 @@ impl fmt::Display for BlossomError {
             Self::InvalidBlockLastEpoch => write!(f, "invalid block last epoch"),
             Self::InvalidBlockNonce { expected, actual } => {
                 write!(f, "invalid block nonce: expected {expected}, got {actual}")
+            }
+            Self::BlockApplicationStateTooLarge { max, actual } => {
+                write!(
+                    f,
+                    "block application state is too large: max {max} bytes, got {actual}"
+                )
             }
             Self::DuplicateBlock => write!(f, "duplicate block for nonce"),
             Self::BlockQueueFull => write!(f, "block queue is full"),

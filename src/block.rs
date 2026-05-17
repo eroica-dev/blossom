@@ -3,9 +3,12 @@ use serde::{Deserialize, Serialize};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::crypto::{PubKey, SecKey, SecretSigner, Signature};
-use crate::error::Result;
+use crate::error::{BlossomError, Result};
 use crate::hash::{HashType, ProtocolHasher};
 use crate::nonce::Nonce;
+
+pub const BLOCK_APPLICATION_STATE_SOFT_LIMIT_BYTES: usize = 4 * 1024;
+pub const BLOCK_APPLICATION_STATE_MAX_BYTES: usize = 8 * 1024;
 
 #[derive(Serialize, Deserialize, BorshSerialize, BorshDeserialize, Debug, Clone, Default)]
 pub struct Transaction {
@@ -48,6 +51,18 @@ impl Block {
         self.hash = self.hash();
     }
 
+    pub fn set_application_state(&mut self, bytes: impl Into<Vec<u8>>) -> Result<()> {
+        self.body.set_application_state(bytes)
+    }
+
+    pub fn application_state(&self) -> &[u8] {
+        self.body.application_state.as_slice()
+    }
+
+    pub fn application_state_len(&self) -> usize {
+        self.body.application_state.len()
+    }
+
     pub fn sign(&mut self, secret_key: &SecKey) {
         let signer = SecretSigner::new(*secret_key);
         self.sign_with(&signer);
@@ -82,11 +97,12 @@ impl Block {
     }
 
     pub fn verify_unsigned_integrity(&self) -> Result<()> {
+        self.body.application_state.validate()?;
         if self.hash != self.hash() {
-            return Err(crate::error::BlossomError::InvalidBlockHash);
+            return Err(BlossomError::InvalidBlockHash);
         }
         if self.body.merkle_root != self.body.compute_merkle_root() {
-            return Err(crate::error::BlossomError::InvalidBlockHash);
+            return Err(BlossomError::InvalidBlockHash);
         }
         Ok(())
     }
@@ -108,6 +124,7 @@ pub struct BlockBody {
     pub created: u128,
     pub dispatched: u128,
     pub merkle_root: HashType,
+    pub application_state: BlockApplicationState,
     pub txs: Vec<Transaction>,
 }
 
@@ -120,12 +137,69 @@ impl Default for BlockBody {
             created: now_micros(),
             dispatched: 0,
             merkle_root: HashType::default(),
+            application_state: BlockApplicationState::default(),
             txs: Vec::new(),
         }
     }
 }
 
+#[derive(
+    Serialize, Deserialize, BorshSerialize, BorshDeserialize, Debug, Clone, Default, PartialEq, Eq,
+)]
+pub struct BlockApplicationState {
+    bytes: Vec<u8>,
+}
+
+impl BlockApplicationState {
+    pub fn new(bytes: impl Into<Vec<u8>>) -> Result<Self> {
+        let bytes = bytes.into();
+        validate_application_state_len(bytes.len())?;
+        Ok(Self { bytes })
+    }
+
+    pub fn empty() -> Self {
+        Self::default()
+    }
+
+    pub fn as_slice(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    pub fn into_bytes(self) -> Vec<u8> {
+        self.bytes
+    }
+
+    pub fn len(&self) -> usize {
+        self.bytes.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.bytes.is_empty()
+    }
+
+    pub fn exceeds_soft_limit(&self) -> bool {
+        self.len() > BLOCK_APPLICATION_STATE_SOFT_LIMIT_BYTES
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        validate_application_state_len(self.len())
+    }
+}
+
 impl BlockBody {
+    pub fn set_application_state(&mut self, bytes: impl Into<Vec<u8>>) -> Result<()> {
+        self.application_state = BlockApplicationState::new(bytes)?;
+        Ok(())
+    }
+
+    pub fn application_state(&self) -> &[u8] {
+        self.application_state.as_slice()
+    }
+
+    pub fn application_state_len(&self) -> usize {
+        self.application_state.len()
+    }
+
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut bytes = Vec::with_capacity(self.encoded_len());
         self.append_bytes_to(&mut bytes);
@@ -139,6 +213,8 @@ impl BlockBody {
         bytes.extend_from_slice(&self.created.to_le_bytes());
         bytes.extend_from_slice(&self.dispatched.to_le_bytes());
         bytes.extend_from_slice(self.merkle_root.as_ref());
+        bytes.extend_from_slice(&(self.application_state.len() as u64).to_le_bytes());
+        bytes.extend_from_slice(self.application_state.as_slice());
         for tx in &self.txs {
             bytes.extend_from_slice(tx.hash.as_ref());
             bytes.extend_from_slice(&(tx.bytes.len() as u64).to_le_bytes());
@@ -152,6 +228,8 @@ impl BlockBody {
             + 16
             + 16
             + 32
+            + 8
+            + self.application_state.len()
             + self
                 .txs
                 .iter()
@@ -167,6 +245,8 @@ impl BlockBody {
         hasher.update(self.created.to_le_bytes());
         hasher.update(self.dispatched.to_le_bytes());
         hasher.update(self.merkle_root.as_ref());
+        hasher.update((self.application_state.len() as u64).to_le_bytes());
+        hasher.update(self.application_state.as_slice());
         for tx in &self.txs {
             hasher.update(tx.hash.as_ref());
             hasher.update((tx.bytes.len() as u64).to_le_bytes());
@@ -178,6 +258,16 @@ impl BlockBody {
     pub fn compute_merkle_root(&self) -> HashType {
         HashType::hash_slices(self.txs.iter().map(|tx| tx.hash.as_ref()))
     }
+}
+
+fn validate_application_state_len(len: usize) -> Result<()> {
+    if len > BLOCK_APPLICATION_STATE_MAX_BYTES {
+        return Err(BlossomError::BlockApplicationStateTooLarge {
+            max: BLOCK_APPLICATION_STATE_MAX_BYTES,
+            actual: len,
+        });
+    }
+    Ok(())
 }
 
 fn now_micros() -> u128 {
@@ -224,11 +314,70 @@ mod tests {
     #[test]
     fn block_body_hash_matches_canonical_bytes() {
         let mut block = Block::default();
+        block.set_application_state([1, 2, 3, 4]).unwrap();
         block.body.txs.push(Transaction::new("tx-1"));
         block.body.txs.push(Transaction::new("tx-2"));
 
         assert_eq!(block.body.hash(), HashType::hash(&block.body.to_bytes()));
         assert_eq!(block.body.encoded_len(), block.body.to_bytes().len());
+    }
+
+    #[test]
+    fn application_state_is_opaque_bounded_and_hash_committed() {
+        let keypair = Keypair::generate();
+        let mut block = Block::default();
+        block
+            .set_application_state(b"v1:cache-pressure=low")
+            .unwrap();
+        let without_state_hash = Block::default().hash();
+        block.sign(&keypair.secret);
+
+        assert_eq!(block.application_state(), b"v1:cache-pressure=low");
+        assert_eq!(block.application_state_len(), 21);
+        assert_ne!(block.hash, without_state_hash);
+        assert!(block.verify_integrity().is_ok());
+
+        let mut tampered = block.clone();
+        tampered
+            .body
+            .set_application_state(b"v1:cache-pressure=high")
+            .unwrap();
+        assert_eq!(
+            tampered.verify_integrity(),
+            Err(BlossomError::InvalidBlockHash)
+        );
+    }
+
+    #[test]
+    fn application_state_limits_are_enforced() {
+        let soft =
+            BlockApplicationState::new(vec![0; BLOCK_APPLICATION_STATE_SOFT_LIMIT_BYTES + 1])
+                .unwrap();
+        assert!(soft.exceeds_soft_limit());
+
+        let too_large = vec![0; BLOCK_APPLICATION_STATE_MAX_BYTES + 1];
+        assert_eq!(
+            BlockApplicationState::new(too_large),
+            Err(BlossomError::BlockApplicationStateTooLarge {
+                max: BLOCK_APPLICATION_STATE_MAX_BYTES,
+                actual: BLOCK_APPLICATION_STATE_MAX_BYTES + 1
+            })
+        );
+
+        let keypair = Keypair::generate();
+        let mut block = Block::default();
+        block.body.application_state = BlockApplicationState {
+            bytes: vec![0; BLOCK_APPLICATION_STATE_MAX_BYTES + 1],
+        };
+        block.sign(&keypair.secret);
+
+        assert_eq!(
+            block.verify_integrity(),
+            Err(BlossomError::BlockApplicationStateTooLarge {
+                max: BLOCK_APPLICATION_STATE_MAX_BYTES,
+                actual: BLOCK_APPLICATION_STATE_MAX_BYTES + 1
+            })
+        );
     }
 
     #[test]

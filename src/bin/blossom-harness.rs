@@ -104,7 +104,10 @@ fn expect(response: WireResponse, label: &str) -> MainResult<()> {
             Ok(())
         }
         WireResponse::BlockAccepted(block) => {
-            println!("{label}: accepted block {}", block.hash);
+            println!(
+                "{label}: accepted block {} application_state_bytes={}",
+                block.hash, block.application_state_bytes
+            );
             Ok(())
         }
         WireResponse::MessageReceipt(receipt) => {

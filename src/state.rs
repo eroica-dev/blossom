@@ -232,6 +232,16 @@ pub struct EpochBody {
 }
 
 impl EpochBody {
+    pub fn application_states(&self) -> impl Iterator<Item = (&HashType, &PubKey, &[u8])> {
+        self.blocks.iter().map(|(hash, block)| {
+            (
+                hash,
+                &block.body.validator,
+                block.body.application_state.as_slice(),
+            )
+        })
+    }
+
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut bytes = Vec::new();
         bytes.extend_from_slice(self.last_epoch.as_ref());

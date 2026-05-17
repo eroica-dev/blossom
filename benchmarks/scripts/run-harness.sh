@@ -5,6 +5,7 @@
 #   NODES=6
 #   TRANSACTIONS=3
 #   TX_BYTES=32
+#   APP_STATE_BYTES=0
 #   ITERATIONS=10
 #   WARMUP=1
 #   DELIVERY_MODE=all-peers   all-peers or first-accepted
@@ -35,6 +36,7 @@ pinned_exec "${cmd[@]}" \
   --nodes "${NODES:-6}" \
   --transactions "${TRANSACTIONS:-3}" \
   --transaction-bytes "${TX_BYTES:-32}" \
+  --application-state-bytes "${APP_STATE_BYTES:-0}" \
   --iterations "${ITERATIONS:-10}" \
   --warmup "${WARMUP:-1}" \
   --delivery-mode "${DELIVERY_MODE:-all-peers}" \

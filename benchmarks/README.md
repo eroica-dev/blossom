@@ -49,6 +49,13 @@ EPOCH_DEPTH=3 NODES=36 TXS_PER_NODE=1000 TX_BYTES=32 \
   ./benchmarks/scripts/run-epoch-depth.sh
 ```
 
+Add block-header application-state load to either harness:
+
+```bash
+APP_STATE_BYTES=4096 EPOCH_DEPTH=1 NODES=36 TXS_PER_NODE=1000 \
+  ./benchmarks/scripts/run-epoch-depth.sh
+```
+
 Run the trusted known-member fast path directly:
 
 ```bash
@@ -93,8 +100,10 @@ the current Blossom quorum size.
 Harness CSVs include the exact Borsh frame sizes counted for each phase:
 `register_wire_bytes`, `next_nonce_wire_bytes`, `submit_wire_bytes`,
 `dispatch_wire_bytes`, `deliver_wire_bytes`, and `total_wire_bytes`. They also
-record `tx_payload_bytes` and `block_bytes`, so a run can distinguish raw
-transaction payload from protocol overhead.
+record `tx_payload_bytes`, `application_state_bytes`,
+`accepted_application_state_bytes`, and `block_bytes`, so a run can distinguish
+raw transaction payload and piggy-backed coordination state from protocol
+overhead.
 
 The runtime defaults to a 32 MiB maximum frame. Large load runs need a larger
 limit because one million 32-byte transactions produces a submit frame of
@@ -113,6 +122,10 @@ block, every quorum round performs a union of peer block sets, and convergence
 means all nodes finish the epoch with the same ordered block set. `EPOCH_DEPTH`
 measures consecutive epochs; `TARGET_TRANSACTIONS` derives the required depth
 from `NODES * TXS_PER_NODE`.
+
+`APP_STATE_BYTES` adds an opaque per-block application-state payload to
+measure the cost of piggy-backed coordination data. Blossom's default hard
+limit is 8 KiB per block.
 
 With `--trusted`, `blossom-epoch-bench` still computes the same deterministic
 quorum unions, but it seals blocks without Ed25519 signatures and counts only

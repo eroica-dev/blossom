@@ -24,6 +24,8 @@ struct Args {
     transactions: usize,
     #[arg(long, default_value_t = 32)]
     transaction_bytes: usize,
+    #[arg(long, default_value_t = 0)]
+    application_state_bytes: usize,
     #[arg(long, default_value_t = 10)]
     iterations: usize,
     #[arg(long, default_value_t = 1)]
@@ -57,8 +59,10 @@ struct HarnessBenchRow {
     nodes: usize,
     transactions: usize,
     transaction_bytes: usize,
+    application_state_bytes: usize,
     delivery_mode: DeliveryMode,
     tx_payload_bytes: usize,
+    accepted_application_state_bytes: usize,
     block_bytes: usize,
     register_wire_bytes: usize,
     next_nonce_wire_bytes: usize,
@@ -93,6 +97,7 @@ async fn main() -> MainResult<()> {
             args.nodes,
             args.transactions,
             args.transaction_bytes,
+            args.application_state_bytes,
             args.delivery_mode,
         )
         .await?;
@@ -104,6 +109,7 @@ async fn main() -> MainResult<()> {
             args.nodes,
             args.transactions,
             args.transaction_bytes,
+            args.application_state_bytes,
             args.delivery_mode,
         )
         .await?;
@@ -124,6 +130,7 @@ async fn run_iteration(
     nodes: usize,
     transactions: usize,
     transaction_bytes: usize,
+    application_state_bytes: usize,
     delivery_mode: DeliveryMode,
 ) -> MainResult<HarnessBenchRow> {
     let total_start = Instant::now();
@@ -168,8 +175,16 @@ async fn run_iteration(
     let tx_build_us = tx_build_start.elapsed().as_micros();
 
     let block_sign_start = Instant::now();
-    let block = signed_block(target, block_service.keypair.secret, txs);
+    let mut block = signed_block(target, block_service.keypair.secret, txs);
+    if application_state_bytes > 0 {
+        block.set_application_state(application_state_payload(
+            iteration,
+            application_state_bytes,
+        ))?;
+        block.sign(&block_service.keypair.secret);
+    }
     let block_sign_us = block_sign_start.elapsed().as_micros();
+    let application_state_bytes = block.application_state_len();
     let block_bytes = encoded_len(&block)?;
 
     let submit_start = Instant::now();
@@ -179,11 +194,11 @@ async fn run_iteration(
     let submit_response_bytes = framed_len(&submit_response)?;
     let submit_wire_bytes = submit_request_bytes + submit_response_bytes;
     total_wire_bytes += submit_wire_bytes;
-    match submit_response {
-        WireResponse::BlockAccepted(_) => {}
+    let accepted_application_state_bytes = match submit_response {
+        WireResponse::BlockAccepted(accepted) => accepted.application_state_bytes,
         WireResponse::Error(message) => return Err(BlossomError::WireProtocol(message).into()),
         response => return Err(unexpected("block submission", response).into()),
-    }
+    };
     let submit_us = submit_start.elapsed().as_micros();
 
     let dispatch_start = Instant::now();
@@ -243,8 +258,10 @@ async fn run_iteration(
         nodes,
         transactions,
         transaction_bytes,
+        application_state_bytes,
         delivery_mode,
         tx_payload_bytes,
+        accepted_application_state_bytes,
         block_bytes,
         register_wire_bytes,
         next_nonce_wire_bytes,
@@ -295,6 +312,20 @@ fn transaction_payload(iteration: usize, index: usize, len: usize) -> Vec<u8> {
     bytes
 }
 
+fn application_state_payload(iteration: usize, len: usize) -> Vec<u8> {
+    let mut bytes = vec![0; len];
+    let mut seed = (iteration as u64) ^ 0xa076_1d64_78bd_642f;
+
+    for chunk in bytes.chunks_mut(8) {
+        seed = splitmix64(seed);
+        let seed_bytes = seed.to_le_bytes();
+        let take = chunk.len();
+        chunk.copy_from_slice(&seed_bytes[..take]);
+    }
+
+    bytes
+}
+
 fn splitmix64(mut value: u64) -> u64 {
     value = value.wrapping_add(0x9e37_79b9_7f4a_7c15);
     let mut z = value;
@@ -326,7 +357,7 @@ fn write_csv(path: &PathBuf, append: bool, rows: &[HarnessBenchRow]) -> MainResu
     if write_header {
         writeln!(
             file,
-            "iteration,nodes,transactions,transaction_bytes,delivery_mode,tx_payload_bytes,block_bytes,register_wire_bytes,next_nonce_wire_bytes,submit_wire_bytes,dispatch_wire_bytes,deliver_wire_bytes,total_wire_bytes,spawn_us,tx_build_us,block_sign_us,register_us,next_nonce_us,submit_us,dispatch_us,deliver_us,total_us,blocks_dispatched,deliveries_attempted,deliveries_accepted,nonce_announced,delivered"
+            "iteration,nodes,transactions,transaction_bytes,application_state_bytes,delivery_mode,tx_payload_bytes,accepted_application_state_bytes,block_bytes,register_wire_bytes,next_nonce_wire_bytes,submit_wire_bytes,dispatch_wire_bytes,deliver_wire_bytes,total_wire_bytes,spawn_us,tx_build_us,block_sign_us,register_us,next_nonce_us,submit_us,dispatch_us,deliver_us,total_us,blocks_dispatched,deliveries_attempted,deliveries_accepted,nonce_announced,delivered"
         )?;
     }
     for row in rows {
@@ -338,13 +369,15 @@ fn write_csv(path: &PathBuf, append: bool, rows: &[HarnessBenchRow]) -> MainResu
 impl HarnessBenchRow {
     fn to_csv(&self) -> String {
         format!(
-            "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
+            "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
             self.iteration,
             self.nodes,
             self.transactions,
             self.transaction_bytes,
+            self.application_state_bytes,
             self.delivery_mode.as_str(),
             self.tx_payload_bytes,
+            self.accepted_application_state_bytes,
             self.block_bytes,
             self.register_wire_bytes,
             self.next_nonce_wire_bytes,

@@ -121,6 +121,7 @@ async fn block_submission_duplicate_rejection_send_block_and_dispatch_are_end_to
         WireResponse::BlockAccepted(accepted) => {
             assert_eq!(accepted.hash, block.hash);
             assert_eq!(accepted.nonce, Nonce::new(1));
+            assert_eq!(accepted.application_state_bytes, 0);
         }
         response => panic!("expected accepted block, got {}", response.kind()),
     }
@@ -179,6 +180,9 @@ async fn trusted_cluster_accepts_unsigned_block_and_dispatch() {
     let mut block = Block::default();
     block.body.last_epoch = target.last_epoch;
     block.body.nonce = target.nonce;
+    block
+        .set_application_state(b"v1:cache-pressure=72")
+        .unwrap();
     block.body.txs.push(Transaction::new("trusted-tx"));
     block.seal_unsigned(cluster.node(0).keypair.public);
 
@@ -190,6 +194,10 @@ async fn trusted_cluster_accepts_unsigned_block_and_dispatch() {
         WireResponse::BlockAccepted(accepted) => {
             assert_eq!(accepted.hash, block.hash);
             assert_eq!(accepted.nonce, target.nonce);
+            assert_eq!(
+                accepted.application_state_bytes,
+                b"v1:cache-pressure=72".len()
+            );
         }
         response => panic!("expected accepted block, got {}", response.kind()),
     }
@@ -198,6 +206,10 @@ async fn trusted_cluster_accepts_unsigned_block_and_dispatch() {
     assert_eq!(dispatch.header.signature, Signature::default());
     let dispatched_block = dispatch.body.blocks.values().next().unwrap();
     assert_eq!(dispatched_block.signature, Signature::default());
+    assert_eq!(
+        dispatched_block.application_state(),
+        b"v1:cache-pressure=72"
+    );
     assert!(dispatched_block.verify_unsigned_integrity().is_ok());
     assert!(dispatched_block.verify_integrity().is_err());
 

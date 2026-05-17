@@ -28,7 +28,10 @@ pub mod wire;
 
 pub use address_book::{AddressBook, Service, ServiceKind};
 pub use algorithm::{QUORUM_SIZE, SUPERMAJORITY};
-pub use block::{Block, BlockBody, Transaction};
+pub use block::{
+    BLOCK_APPLICATION_STATE_MAX_BYTES, BLOCK_APPLICATION_STATE_SOFT_LIMIT_BYTES, Block,
+    BlockApplicationState, BlockBody, Transaction,
+};
 pub use block_store::{BlockHandle, BlockIndex, BlockRecord};
 pub use blossom::*;
 pub use crypto::{Keypair, PubKey, SecKey, SecretSigner, Signature};

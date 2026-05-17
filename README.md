@@ -12,6 +12,8 @@ node surface:
 - Quorum and round selection.
 - Consensus state, temporary quorum state, proposal/verification counting, and epoch advancement.
 - Indexed verifier membership, epoch approval checks, and Merkle-rooted epoch block sets.
+- Bounded opaque application state in each block header for piggy-backed
+  coordination signals.
 - Address book and service registration for block, engine, consensus, relay, and address-book services.
 - Overlay runtime APIs for address-book-backed fan-out without starting
   the epoch state machine.
@@ -39,7 +41,8 @@ block/engine services together.
 - `src/register.rs`: Blossom message matrix and quorum queue.
 - `src/algorithm.rs`: deterministic quorum/round selection.
 - `src/crypto.rs`: Ed25519 public keys, secret keys, signatures, and key generation.
-- `src/block.rs`: minimal signed block and transaction envelope used by dispatch verification.
+- `src/block.rs`: signed block, transaction envelope, and bounded opaque
+  application-state payload used by dispatch verification.
 - `src/address_book.rs`: service registry copied from the Eden runtime shape.
 - `src/local_block.rs`: local signed block queue and build-block helper.
 - `src/overlay.rs`: overlay runtime, fan-out strategies, and broadcast reports.
@@ -136,6 +139,29 @@ for deployers that want consensus nodes to send application-level
 messages through the selected topology. The address book supports
 multiple services per kind, so each consensus peer can be registered
 independently.
+
+## Piggy-Back Application State
+
+Blocks can carry a bounded opaque application-state payload alongside the
+validator, epoch, nonce, timestamps, and Merkle root. Blossom commits to
+the bytes in the block hash and signature, but does not parse them.
+Applications should put their own version tag at the start of the payload
+and apply their own compatibility rules.
+
+```rust
+use blossom::{BLOCK_APPLICATION_STATE_MAX_BYTES, Block};
+
+let mut block = Block::default();
+block.set_application_state(b"v1:bytes_used=1048576;budget=4194304")?;
+assert!(block.application_state_len() <= BLOCK_APPLICATION_STATE_MAX_BYTES);
+```
+
+The soft budget is 4 KiB and the hard consensus-enforced limit is 8 KiB
+per block. Oversized payloads are rejected by block integrity checks.
+Under full consensus, committed blocks give every node the same
+application-state snapshots in the same epoch order. In overlay-only mode,
+the same bytes can be broadcast, but ordering is transport/eventual rather
+than epoch-committed.
 
 ## Run The Harness
 

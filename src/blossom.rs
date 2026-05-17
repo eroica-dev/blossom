@@ -266,7 +266,7 @@ impl DispatchBody {
                 continue;
             }
             let block_ok = if verify_signatures {
-                block.verify_signature().is_ok()
+                block.verify_integrity().is_ok()
             } else {
                 block.verify_unsigned_integrity().is_ok()
             };
@@ -653,6 +653,7 @@ mod tests {
     use super::*;
     use crate::block::{Block, Transaction};
     use crate::crypto::Keypair;
+    use crate::error::BlossomError;
     use crate::node::NodeIdentity;
     use crate::nonce::Nonce;
 
@@ -732,6 +733,39 @@ mod tests {
         assert!(accepted.is_empty());
         assert_eq!(accepted_hash, HashType::default());
         assert_eq!(tree_hash, HashType::default());
+    }
+
+    #[test]
+    fn verified_dispatch_rejects_signed_blocks_with_bad_merkle_roots() {
+        let keypair = Keypair::generate();
+        let signer = keypair.signer();
+        let mut block = Block::default();
+        block.body.validator = keypair.public;
+        block.body.nonce = Nonce::new(1);
+        block.body.txs.push(Transaction::new("tx"));
+        block.body.merkle_root = HashType([9; 32]);
+        block.hash = block.body.hash();
+        block.signature = signer.sign(block.hash.as_ref());
+
+        assert!(block.verify_signature().is_ok());
+        assert_eq!(
+            block.verify_integrity(),
+            Err(BlossomError::InvalidBlockHash)
+        );
+
+        let mut blocks = BTreeMap::new();
+        blocks.insert(block.hash, block);
+        let body = DispatchBody {
+            blocks_hash: blocks.hash(),
+            blocks,
+            signature_tree: SignatureTree::default(),
+            signature_tree_hash: SignatureTree::default().hash(),
+        };
+
+        let (accepted, accepted_hash, _, _) = body.verify_body(&BTreeMap::new());
+
+        assert!(accepted.is_empty());
+        assert_eq!(accepted_hash, accepted.hash());
     }
 
     #[test]

@@ -3,7 +3,7 @@ use std::mem;
 
 use serde::{Deserialize, Serialize};
 
-use crate::block::{Block, Transaction};
+use crate::block::{Block, BlockApplicationState, Transaction};
 use crate::crypto::{PubKey, SecKey};
 use crate::error::{BlossomError, Result};
 use crate::hash::HashType;
@@ -14,6 +14,7 @@ pub struct LocalBlock {
     pub build_block: Block,
     pub block_deque: VecDeque<Block>,
     pub block_cap: usize,
+    pub application_state: BlockApplicationState,
 }
 
 impl LocalBlock {
@@ -22,7 +23,17 @@ impl LocalBlock {
             build_block: Block::default(),
             block_deque: VecDeque::new(),
             block_cap,
+            application_state: BlockApplicationState::default(),
         }
+    }
+
+    pub fn set_application_state(&mut self, bytes: impl Into<Vec<u8>>) -> Result<()> {
+        self.application_state = BlockApplicationState::new(bytes)?;
+        Ok(())
+    }
+
+    pub fn application_state(&self) -> &BlockApplicationState {
+        &self.application_state
     }
 
     pub fn add_transaction(&mut self, tx: Transaction) -> HashType {
@@ -39,6 +50,7 @@ impl LocalBlock {
     ) -> Result<HashType> {
         self.build_block.body.last_epoch = last_epoch;
         self.build_block.body.nonce = nonce;
+        self.build_block.body.application_state = self.application_state.clone();
         self.build_block.sign(secret_key);
 
         self.ensure_enqueueable(&self.build_block)?;
@@ -155,6 +167,7 @@ mod tests {
     fn closes_build_block_into_signed_queue() {
         let keypair = Keypair::generate();
         let mut queue = LocalBlock::new(2);
+        queue.set_application_state(b"v1:load=42").unwrap();
         queue.add_transaction(Transaction::new("tx"));
 
         let hash = queue
@@ -163,6 +176,11 @@ mod tests {
 
         assert_eq!(queue.len(), 1);
         assert_ne!(hash, HashType::default());
+        assert_eq!(
+            queue.block_deque.front().unwrap().application_state(),
+            b"v1:load=42"
+        );
+        assert_eq!(queue.application_state().as_slice(), b"v1:load=42");
     }
 
     #[test]

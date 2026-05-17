@@ -7,6 +7,7 @@
 #   TARGET_TRANSACTIONS=1000000   optional; derives epoch depth from cap
 #   TXS_PER_NODE=1000
 #   TX_BYTES=32
+#   APP_STATE_BYTES=0             opaque per-block application state
 #   SHUFFLE=0                     set to 1 for seed-driven epoch shuffling
 #   SERVER_CPUSET=0-3             Linux only, optional taskset pinning.
 
@@ -36,6 +37,7 @@ args=(
   --epoch-depth "${EPOCH_DEPTH:-1}"
   --transactions-per-node "${TXS_PER_NODE:-1000}"
   --transaction-bytes "${TX_BYTES:-32}"
+  --application-state-bytes "${APP_STATE_BYTES:-0}"
   --csv "$out"
 )
 

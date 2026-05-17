@@ -51,6 +51,7 @@ cargo run --release --bin blossom-harness-bench -- \
   `SendNonce`, `BlockNonce`, `GetBlock`, and `SendBlock`.
 - Signed block submission, duplicate block rejection, invalid nonce
   rejection, `SendBlock`, and local dispatch generation.
+- Opaque block application-state payload propagation through TCP dispatch.
 - Protocol message intake for every current `Msg` variant:
   `Dispatch`, `EchoResponse`, `EchoRequest`, `EchoReDispatch`,
   `Verification`, `Proposal`, `Commit`, `EpochStarted`, `Ok`, and
@@ -73,6 +74,8 @@ The library unit tests cover expected behavior and failure behavior for:
   formatting
 - transaction hashing, block signing, block integrity, and tamper
   detection
+- block application-state hash commitment, size limits, and runtime
+  publication on empty dispatch blocks
 - deterministic quorum selection, shuffling, supermajority thresholds,
   message matrices, and quorum queues
 - signature trees, dispatch body verification, message enum conversion,

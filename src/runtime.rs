@@ -6,7 +6,7 @@ use indextreemap::IndexTreeMap;
 use serde::{Deserialize, Serialize};
 
 use crate::address_book::{AddressBook, Service, ServiceKind};
-use crate::block::Block;
+use crate::block::{Block, BlockApplicationState};
 use crate::blossom::{
     BlossomBody, Commit, Dispatch, DispatchBody, EchoReDispatch, EchoRequest, EchoResponse,
     EpochStarted, Header, Proposal, SignatureTree, Verification,
@@ -105,6 +105,7 @@ pub struct NodeStatus {
 pub struct AcceptedBlock {
     pub hash: HashType,
     pub nonce: Nonce,
+    pub application_state_bytes: usize,
 }
 
 #[derive(Serialize, Deserialize, BorshSerialize, BorshDeserialize, Debug, Clone, PartialEq, Eq)]
@@ -187,6 +188,23 @@ impl NodeRuntime {
             .add(service)
     }
 
+    pub fn set_application_state(&self, bytes: impl Into<Vec<u8>>) -> Result<()> {
+        self.inner
+            .local_blocks
+            .write()
+            .expect("block lock poisoned")
+            .set_application_state(bytes)
+    }
+
+    pub fn application_state(&self) -> BlockApplicationState {
+        self.inner
+            .local_blocks
+            .read()
+            .expect("block lock poisoned")
+            .application_state()
+            .clone()
+    }
+
     pub fn fanout_targets(&self, strategy: &FanOutStrategy) -> Vec<Service> {
         let self_node = self.self_node();
         let address_book = self
@@ -239,6 +257,7 @@ impl NodeRuntime {
         self.verify_block_integrity(&block)?;
         self.validate_block_service(&block)?;
 
+        let application_state_bytes = block.application_state_len();
         let hash = self
             .inner
             .local_blocks
@@ -248,6 +267,7 @@ impl NodeRuntime {
         Ok(AcceptedBlock {
             hash,
             nonce: target.nonce,
+            application_state_bytes,
         })
     }
 
@@ -256,21 +276,24 @@ impl NodeRuntime {
         let self_node = self.self_node();
         let block_service = self.block_service();
 
-        let maybe_block = self
-            .inner
-            .local_blocks
-            .write()
-            .expect("block lock poisoned")
-            .dequeue_block(
+        let (maybe_block, application_state) = {
+            let mut local_blocks = self
+                .inner
+                .local_blocks
+                .write()
+                .expect("block lock poisoned");
+            let maybe_block = local_blocks.dequeue_block(
                 block_service.as_ref().map(|service| service.public_key),
                 target.last_epoch,
                 target.nonce,
                 round,
             )?;
+            (maybe_block, local_blocks.application_state().clone())
+        };
 
         let block = match maybe_block {
             Some(block) => block,
-            None => self.empty_block(&self_node, &target)?,
+            None => self.empty_block(&self_node, &target, application_state)?,
         };
 
         let mut blocks = BTreeMap::new();
@@ -435,10 +458,16 @@ impl NodeRuntime {
             .cloned()
     }
 
-    fn empty_block(&self, self_node: &NodeIdentity, target: &EpochTarget) -> Result<Block> {
+    fn empty_block(
+        &self,
+        self_node: &NodeIdentity,
+        target: &EpochTarget,
+        application_state: BlockApplicationState,
+    ) -> Result<Block> {
         let mut block = Block::default();
         block.body.last_epoch = target.last_epoch;
         block.body.nonce = target.nonce;
+        block.body.application_state = application_state;
         if self.inner.trust_mode.is_trusted() {
             block.seal_unsigned(self_node.public_key());
             return Ok(block);
@@ -591,6 +620,7 @@ mod tests {
 
         let accepted = runtime.submit_block(block).unwrap();
         assert_eq!(accepted.nonce, target.nonce);
+        assert_eq!(accepted.application_state_bytes, 0);
         assert_eq!(runtime.status().unwrap().pending_blocks, 1);
     }
 
@@ -694,6 +724,9 @@ mod tests {
     #[test]
     fn dispatch_without_queued_block_sends_signed_empty_block() {
         let (runtime, _) = runtime();
+        runtime
+            .set_application_state(b"v1:bandwidth=1048576")
+            .unwrap();
         let target = runtime.next_epoch_target().unwrap();
 
         let dispatch = runtime.dispatch_local_block(0).unwrap();
@@ -702,6 +735,7 @@ mod tests {
         assert_eq!(dispatch.body.blocks.len(), 1);
         let block = dispatch.body.blocks.values().next().unwrap();
         assert!(block.is_empty());
+        assert_eq!(block.application_state(), b"v1:bandwidth=1048576");
         assert!(block.verify_integrity().is_ok());
     }
 
@@ -783,6 +817,7 @@ mod tests {
 
         let accepted = runtime.submit_block(block).unwrap();
         assert_eq!(accepted.nonce, target.nonce);
+        assert_eq!(accepted.application_state_bytes, 0);
         assert_eq!(runtime.status().unwrap().pending_blocks, 1);
     }
 

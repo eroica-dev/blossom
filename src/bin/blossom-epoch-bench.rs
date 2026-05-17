@@ -33,6 +33,8 @@ struct Args {
     transactions_per_node: usize,
     #[arg(long, default_value_t = 32)]
     transaction_bytes: usize,
+    #[arg(long, default_value_t = 0)]
+    application_state_bytes: usize,
     #[arg(long, default_value_t = false)]
     shuffle: bool,
     #[arg(long, default_value_t = false)]
@@ -105,6 +107,8 @@ struct EpochBenchRow {
     trusted: bool,
     transactions_per_node: usize,
     transaction_bytes: usize,
+    application_state_bytes_per_block: usize,
+    epoch_application_state_bytes: usize,
     epoch_transactions: usize,
     cumulative_transactions: usize,
     block_count: usize,
@@ -149,6 +153,7 @@ async fn main() -> MainResult<()> {
             Nonce::new((epoch + 1) as u64),
             args.transactions_per_node,
             args.transaction_bytes,
+            args.application_state_bytes,
             args.shuffle,
             args.trusted,
         )?;
@@ -194,6 +199,7 @@ fn run_epoch(
     nonce: Nonce,
     transactions_per_node: usize,
     transaction_bytes: usize,
+    application_state_bytes: usize,
     shuffle: bool,
     trusted: bool,
 ) -> MainResult<EpochBenchRow> {
@@ -209,6 +215,7 @@ fn run_epoch(
                 last_epoch,
                 nonce,
                 transactions(epoch, node_index, transactions_per_node, transaction_bytes),
+                application_state_bytes,
                 trusted,
             );
             let block = BlockHandle::new(block)?;
@@ -297,6 +304,8 @@ fn run_epoch(
         trusted,
         transactions_per_node,
         transaction_bytes,
+        application_state_bytes_per_block: application_state_bytes,
+        epoch_application_state_bytes: nodes.len() * application_state_bytes,
         epoch_transactions: nodes.len() * transactions_per_node,
         cumulative_transactions: (epoch + 1) * nodes.len() * transactions_per_node,
         block_count: nodes.len(),
@@ -330,12 +339,22 @@ fn signed_block(
     last_epoch: HashType,
     nonce: Nonce,
     txs: Vec<Transaction>,
+    application_state_bytes: usize,
     trusted: bool,
 ) -> Block {
     let mut block = Block::default();
     block.body.validator = node.keypair.public;
     block.body.last_epoch = last_epoch;
     block.body.nonce = nonce;
+    if application_state_bytes > 0 {
+        block
+            .set_application_state(application_state_payload(
+                node.keypair.public,
+                nonce,
+                application_state_bytes,
+            ))
+            .expect("benchmark application-state payload should fit");
+    }
     block.body.txs = txs;
     if trusted {
         block.seal_unsigned(node.keypair.public);
@@ -369,6 +388,22 @@ fn transaction_payload(epoch: usize, node_index: usize, tx_index: usize, len: us
         .wrapping_mul(0x9e37_79b9_7f4a_7c15)
         .wrapping_add((node_index as u64) << 32)
         .wrapping_add(tx_index as u64);
+
+    for chunk in bytes.chunks_mut(8) {
+        seed = splitmix64(seed);
+        let seed_bytes = seed.to_le_bytes();
+        let take = chunk.len();
+        chunk.copy_from_slice(&seed_bytes[..take]);
+    }
+
+    bytes
+}
+
+fn application_state_payload(public_key: PubKey, nonce: Nonce, len: usize) -> Vec<u8> {
+    let mut bytes = vec![0; len];
+    let mut seed = u64::from_le_bytes(public_key.as_ref()[..8].try_into().unwrap_or([0; 8]))
+        ^ nonce.value()
+        ^ 0xa076_1d64_78bd_642f;
 
     for chunk in bytes.chunks_mut(8) {
         seed = splitmix64(seed);
@@ -794,7 +829,7 @@ fn write_csv(path: &PathBuf, append: bool, rows: &[EpochBenchRow]) -> MainResult
     if write_header {
         writeln!(
             file,
-            "epoch,epoch_depth,nodes,rounds,quorums,shuffle,trusted,transactions_per_node,transaction_bytes,epoch_transactions,cumulative_transactions,block_count,min_blocks_per_node,max_blocks_per_node,unique_epoch_hashes,converged,block_build_us,propagation_us,finalize_us,total_us,block_bytes,dispatch_messages,echo_messages,verification_messages,proposal_messages,commit_messages,total_messages,dispatch_bytes,echo_bytes,verification_bytes,proposal_bytes,commit_bytes,total_wire_bytes,epoch_hash"
+            "epoch,epoch_depth,nodes,rounds,quorums,shuffle,trusted,transactions_per_node,transaction_bytes,application_state_bytes_per_block,epoch_application_state_bytes,epoch_transactions,cumulative_transactions,block_count,min_blocks_per_node,max_blocks_per_node,unique_epoch_hashes,converged,block_build_us,propagation_us,finalize_us,total_us,block_bytes,dispatch_messages,echo_messages,verification_messages,proposal_messages,commit_messages,total_messages,dispatch_bytes,echo_bytes,verification_bytes,proposal_bytes,commit_bytes,total_wire_bytes,epoch_hash"
         )?;
     }
     for row in rows {
@@ -806,7 +841,7 @@ fn write_csv(path: &PathBuf, append: bool, rows: &[EpochBenchRow]) -> MainResult
 impl EpochBenchRow {
     fn to_csv(&self) -> String {
         format!(
-            "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
+            "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
             self.epoch,
             self.epoch_depth,
             self.nodes,
@@ -816,6 +851,8 @@ impl EpochBenchRow {
             self.trusted,
             self.transactions_per_node,
             self.transaction_bytes,
+            self.application_state_bytes_per_block,
+            self.epoch_application_state_bytes,
             self.epoch_transactions,
             self.cumulative_transactions,
             self.block_count,
@@ -872,6 +909,7 @@ mod tests {
             target_transactions: Some(1_000_000),
             transactions_per_node: 1_000,
             transaction_bytes: 32,
+            application_state_bytes: 0,
             shuffle: false,
             trusted: false,
             csv: None,
@@ -891,6 +929,7 @@ mod tests {
             last_epoch,
             nonce,
             transactions(0, 0, 3, 32),
+            0,
             false,
         );
         let block = BlockHandle::new(block).unwrap();
@@ -924,12 +963,15 @@ mod tests {
             Nonce::new(1),
             2,
             8,
+            64,
             false,
             true,
         )
         .unwrap();
 
         assert!(row.trusted);
+        assert_eq!(row.application_state_bytes_per_block, 64);
+        assert_eq!(row.epoch_application_state_bytes, 36 * 64);
         assert!(row.converged);
         assert!(row.dispatch_messages > 0);
         assert_eq!(row.echo_messages, 0);
