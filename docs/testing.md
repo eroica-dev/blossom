@@ -46,6 +46,9 @@ cargo run --release --bin blossom-harness-bench -- \
   `Dispatch`, `EchoResponse`, `EchoRequest`, `EchoReDispatch`,
   `Verification`, `Proposal`, `Commit`, `EpochStarted`, `Ok`, and
   `Fail`.
+- Trusted-cluster intake where unsigned blocks and default-signature
+  dispatches are accepted from known members and still rejected from
+  unknown senders.
 
 ## Unit Coverage
 
@@ -70,6 +73,9 @@ The library unit tests cover expected behavior and failure behavior for:
   Merkle-rooted block sets
 - runtime status, block-service key enforcement, empty dispatches, and
   message rejection paths
+- trusted runtime behavior for unsigned block submission, unsigned
+  dispatch intake, known-member enforcement, trusted dispatch-body
+  verification, and trusted quorum verification
 - frame-size rejection, TCP request dispatch, and harness helper behavior
 
 ## Harness
@@ -77,7 +83,8 @@ The library unit tests cover expected behavior and failure behavior for:
 `src/harness.rs` provides:
 
 - `SimulatedCluster`: starts N local TCP Blossom nodes with a shared
-  genesis verifier set.
+  genesis verifier set. Use `spawn_trusted` or `spawn_with_trust_mode`
+  to exercise the trusted known-member fast path.
 - `SimulatedNode`: request helper for a running simulated node.
 - `MockBlockService`: TCP service that records nonce updates, serves
   blocks by nonce, and records received blocks.

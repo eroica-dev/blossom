@@ -8,8 +8,8 @@ use serde::{Deserialize, Serialize};
 use crate::address_book::{AddressBook, Service, ServiceKind};
 use crate::block::Block;
 use crate::blossom::{
-    BlossomBody, Commit, Dispatch, DispatchBody, EchoResponse, EpochStarted, Header, Proposal,
-    SignatureTree, Verification,
+    BlossomBody, Commit, Dispatch, DispatchBody, EchoReDispatch, EchoRequest, EchoResponse,
+    EpochStarted, Header, Proposal, SignatureTree, Verification,
 };
 use crate::crypto::{SecretSigner, Signature};
 use crate::error::{BlossomError, Result};
@@ -26,6 +26,7 @@ pub struct RuntimeConfig {
     pub genesis: Option<Epoch>,
     pub address_book: AddressBook,
     pub block_cap: usize,
+    pub trust_mode: TrustMode,
 }
 
 impl RuntimeConfig {
@@ -35,7 +36,20 @@ impl RuntimeConfig {
             genesis: None,
             address_book: AddressBook::new(),
             block_cap: 100,
+            trust_mode: TrustMode::Verified,
         }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TrustMode {
+    Verified,
+    Trusted,
+}
+
+impl TrustMode {
+    pub fn is_trusted(self) -> bool {
+        self == Self::Trusted
     }
 }
 
@@ -49,6 +63,7 @@ struct RuntimeInner {
     local_blocks: RwLock<LocalBlock>,
     address_book: RwLock<AddressBook>,
     signer: Option<SecretSigner>,
+    trust_mode: TrustMode,
 }
 
 #[derive(Serialize, Deserialize, BorshSerialize, BorshDeserialize, Debug, Clone, PartialEq, Eq)]
@@ -100,6 +115,7 @@ impl NodeRuntime {
                 local_blocks: RwLock::new(LocalBlock::new(config.block_cap)),
                 address_book: RwLock::new(config.address_book),
                 signer,
+                trust_mode: config.trust_mode,
             }),
         }
     }
@@ -183,7 +199,7 @@ impl NodeRuntime {
             });
         }
 
-        block.verify_integrity()?;
+        self.verify_block_integrity(&block)?;
         self.validate_block_service(&block)?;
 
         let hash = self
@@ -191,7 +207,7 @@ impl NodeRuntime {
             .local_blocks
             .write()
             .expect("block lock poisoned")
-            .enqueue_block(block)?;
+            .enqueue_preverified_block(block)?;
         Ok(AcceptedBlock {
             hash,
             nonce: target.nonce,
@@ -254,9 +270,7 @@ impl NodeRuntime {
     pub fn receive_message(&self, message: Msg) -> Result<MessageReceipt> {
         match message {
             Msg::Dispatch(message) => {
-                message
-                    .header
-                    .verify_signature(MSGKey::Dispatch, &message.body)?;
+                self.verify_message_signature(&message.header, MSGKey::Dispatch, &message.body)?;
                 let mut state = self.inner.state.write().expect("state lock poisoned");
                 if message.header.verify_header(&mut state) == Some(false) {
                     return Err(BlossomError::UnknownSender);
@@ -269,17 +283,31 @@ impl NodeRuntime {
             Msg::Proposal(message) => self.receive_proposal(message),
             Msg::Commit(message) => self.receive_commit(message),
             Msg::EpochStarted(message) => self.receive_epoch_started(message),
-            Msg::EchoRequest(_) => Ok(MessageReceipt::accepted("echo_request")),
-            Msg::EchoReDispatch(_) => Ok(MessageReceipt::accepted("echo_redispatch")),
+            Msg::EchoRequest(message) => self.receive_echo_request(message),
+            Msg::EchoReDispatch(message) => self.receive_echo_redispatch(message),
             Msg::Ok => Ok(MessageReceipt::accepted("ok")),
             Msg::Fail => Ok(MessageReceipt::accepted("fail")),
         }
     }
 
+    fn receive_echo_request(&self, message: EchoRequest) -> Result<MessageReceipt> {
+        let mut state = self.inner.state.write().expect("state lock poisoned");
+        if message.header.verify_header(&mut state) == Some(false) {
+            return Err(BlossomError::UnknownSender);
+        }
+        Ok(MessageReceipt::accepted("echo_request"))
+    }
+
+    fn receive_echo_redispatch(&self, message: EchoReDispatch) -> Result<MessageReceipt> {
+        let mut state = self.inner.state.write().expect("state lock poisoned");
+        if message.header.verify_header(&mut state) == Some(false) {
+            return Err(BlossomError::UnknownSender);
+        }
+        Ok(MessageReceipt::accepted("echo_redispatch"))
+    }
+
     fn receive_echo_response(&self, message: EchoResponse) -> Result<MessageReceipt> {
-        message
-            .header
-            .verify_signature(MSGKey::EchoResponse, &message.body)?;
+        self.verify_message_signature(&message.header, MSGKey::EchoResponse, &message.body)?;
         let mut state = self.inner.state.write().expect("state lock poisoned");
         if message.header.verify_header(&mut state) == Some(false) {
             return Err(BlossomError::UnknownSender);
@@ -288,9 +316,7 @@ impl NodeRuntime {
     }
 
     fn receive_verification(&self, message: Verification) -> Result<MessageReceipt> {
-        message
-            .header
-            .verify_signature(MSGKey::Verification, &message.body)?;
+        self.verify_message_signature(&message.header, MSGKey::Verification, &message.body)?;
         let mut state = self.inner.state.write().expect("state lock poisoned");
         if message.header.verify_header(&mut state) == Some(false) {
             return Err(BlossomError::UnknownSender);
@@ -305,9 +331,7 @@ impl NodeRuntime {
     }
 
     fn receive_proposal(&self, message: Proposal) -> Result<MessageReceipt> {
-        message
-            .header
-            .verify_signature(MSGKey::Proposal, &message.body)?;
+        self.verify_message_signature(&message.header, MSGKey::Proposal, &message.body)?;
         let mut state = self.inner.state.write().expect("state lock poisoned");
         if message.header.verify_header(&mut state) == Some(false) {
             return Err(BlossomError::UnknownSender);
@@ -328,9 +352,7 @@ impl NodeRuntime {
     }
 
     fn receive_commit(&self, message: Commit) -> Result<MessageReceipt> {
-        message
-            .header
-            .verify_signature(MSGKey::Commit, &message.body)?;
+        self.verify_message_signature(&message.header, MSGKey::Commit, &message.body)?;
         let mut state = self.inner.state.write().expect("state lock poisoned");
         if message.header.verify_header(&mut state) == Some(false) {
             return Err(BlossomError::UnknownSender);
@@ -345,9 +367,7 @@ impl NodeRuntime {
     }
 
     fn receive_epoch_started(&self, message: EpochStarted) -> Result<MessageReceipt> {
-        message
-            .header
-            .verify_signature(MSGKey::EpochStarted, &message.body)?;
+        self.verify_message_signature(&message.header, MSGKey::EpochStarted, &message.body)?;
         let mut state = self.inner.state.write().expect("state lock poisoned");
         if message.header.verify_header(&mut state) == Some(false) {
             return Err(BlossomError::UnknownSender);
@@ -382,6 +402,10 @@ impl NodeRuntime {
         let mut block = Block::default();
         block.body.last_epoch = target.last_epoch;
         block.body.nonce = target.nonce;
+        if self.inner.trust_mode.is_trusted() {
+            block.seal_unsigned(self_node.public_key());
+            return Ok(block);
+        }
         match self.inner.signer.as_ref() {
             Some(signer) => block.sign_with(signer),
             None => {
@@ -390,6 +414,27 @@ impl NodeRuntime {
             }
         }
         Ok(block)
+    }
+
+    fn verify_block_integrity(&self, block: &Block) -> Result<()> {
+        if self.inner.trust_mode.is_trusted() {
+            block.verify_unsigned_integrity()
+        } else {
+            block.verify_integrity()
+        }
+    }
+
+    fn verify_message_signature<T: BlossomBody>(
+        &self,
+        header: &Header,
+        kind: MSGKey,
+        body: &T,
+    ) -> Result<()> {
+        if self.inner.trust_mode.is_trusted() {
+            Ok(())
+        } else {
+            header.verify_signature(kind, body)
+        }
     }
 
     fn sign_body<T: BlossomBody>(
@@ -401,6 +446,10 @@ impl NodeRuntime {
         round: u8,
         body: &T,
     ) -> Result<Signature> {
+        if self.inner.trust_mode.is_trusted() {
+            return Ok(Signature::default());
+        }
+
         let message_hash = Header::signature_hash_for_body(
             &self_node.public_key(),
             &last_epoch,
@@ -463,6 +512,10 @@ mod tests {
     }
 
     fn runtime_with_peers() -> (NodeRuntime, Vec<Keypair>, EpochTarget) {
+        runtime_with_peers_mode(TrustMode::Verified)
+    }
+
+    fn runtime_with_peers_mode(trust_mode: TrustMode) -> (NodeRuntime, Vec<Keypair>, EpochTarget) {
         let keypairs = (0..6).map(|_| Keypair::generate()).collect::<Vec<_>>();
         let nodes = keypairs
             .iter()
@@ -481,6 +534,7 @@ mod tests {
         let genesis = genesis_epoch(nodes.clone());
         let mut config = RuntimeConfig::new(nodes[0].clone());
         config.genesis = Some(genesis.clone());
+        config.trust_mode = trust_mode;
         let runtime = NodeRuntime::new(config);
         let target = EpochTarget {
             last_epoch: genesis.hash,
@@ -631,6 +685,92 @@ mod tests {
         assert_eq!(
             runtime.receive_message(Msg::Dispatch(bad_signature_dispatch)),
             Err(BlossomError::SignatureError)
+        );
+    }
+
+    #[test]
+    fn trusted_runtime_accepts_unsigned_known_member_work() {
+        let (runtime, keypairs, target) = runtime_with_peers_mode(TrustMode::Trusted);
+        let known_sender = {
+            let mut state = runtime.inner.state.write().expect("state lock poisoned");
+            state
+                .get_mut_consensus(&target.last_epoch, target.nonce)
+                .peers(0)
+                .into_iter()
+                .next()
+                .expect("round should include a peer")
+        };
+        let body = DispatchBody::default();
+        let dispatch = Dispatch {
+            header: Header {
+                sender: known_sender,
+                last_epoch: target.last_epoch,
+                nonce: target.nonce,
+                round: 0,
+                signature: crate::Signature::default(),
+            },
+            body,
+        };
+
+        let receipt = runtime.receive_message(Msg::Dispatch(dispatch)).unwrap();
+        assert_eq!(receipt.kind, "dispatch");
+
+        let mut block = Block::default();
+        block.body.last_epoch = target.last_epoch;
+        block.body.nonce = target.nonce;
+        block.seal_unsigned(keypairs[0].public);
+
+        let accepted = runtime.submit_block(block).unwrap();
+        assert_eq!(accepted.nonce, target.nonce);
+        assert_eq!(runtime.status().unwrap().pending_blocks, 1);
+    }
+
+    #[test]
+    fn trusted_runtime_still_rejects_unsigned_unknown_sender() {
+        let (runtime, _, target) = runtime_with_peers_mode(TrustMode::Trusted);
+        let unknown = Keypair::generate();
+        let dispatch = Dispatch {
+            header: Header {
+                sender: unknown.public,
+                last_epoch: target.last_epoch,
+                nonce: target.nonce,
+                round: 0,
+                signature: crate::Signature::default(),
+            },
+            body: DispatchBody::default(),
+        };
+
+        assert_eq!(
+            runtime.receive_message(Msg::Dispatch(dispatch)),
+            Err(BlossomError::UnknownSender)
+        );
+    }
+
+    #[test]
+    fn echo_recovery_messages_reject_unknown_senders() {
+        let (runtime, _, target) = runtime_with_peers();
+        let unknown = Keypair::generate();
+        let header = Header {
+            sender: unknown.public,
+            last_epoch: target.last_epoch,
+            nonce: target.nonce,
+            round: 0,
+            signature: crate::Signature::default(),
+        };
+
+        assert_eq!(
+            runtime.receive_message(Msg::EchoRequest(EchoRequest {
+                header: header.clone(),
+                requested_blocks: BTreeMap::new(),
+            })),
+            Err(BlossomError::UnknownSender)
+        );
+        assert_eq!(
+            runtime.receive_message(Msg::EchoReDispatch(EchoReDispatch {
+                header,
+                redispatched_blocks: BTreeMap::new(),
+            })),
+            Err(BlossomError::UnknownSender)
         );
     }
 }

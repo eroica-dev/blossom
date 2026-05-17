@@ -233,6 +233,21 @@ impl DispatchBody {
         &self,
         already_verified_blocks: &BTreeMap<HashType, Block>,
     ) -> (BTreeMap<HashType, Block>, HashType, SignatureTree, HashType) {
+        self.verify_body_with_signature_checks(already_verified_blocks, true)
+    }
+
+    pub fn verify_body_trusted(
+        &self,
+        already_verified_blocks: &BTreeMap<HashType, Block>,
+    ) -> (BTreeMap<HashType, Block>, HashType, SignatureTree, HashType) {
+        self.verify_body_with_signature_checks(already_verified_blocks, false)
+    }
+
+    fn verify_body_with_signature_checks(
+        &self,
+        already_verified_blocks: &BTreeMap<HashType, Block>,
+        verify_signatures: bool,
+    ) -> (BTreeMap<HashType, Block>, HashType, SignatureTree, HashType) {
         let mut accepted_blocks = BTreeMap::new();
 
         if self.blocks.hash() != self.blocks_hash {
@@ -251,13 +266,24 @@ impl DispatchBody {
             if *sent_hash != block.hash() {
                 continue;
             }
-            if block.verify_signature().is_err() {
+            let block_ok = if verify_signatures {
+                block.verify_signature().is_ok()
+            } else {
+                block.verify_unsigned_integrity().is_ok()
+            };
+            if !block_ok {
                 continue;
             }
             accepted_blocks.insert(*sent_hash, block.clone());
         }
 
-        let signature_tree = if self.signature_tree.verify() {
+        let signature_tree = if verify_signatures {
+            if self.signature_tree.verify() {
+                self.signature_tree.clone()
+            } else {
+                SignatureTree::default()
+            }
+        } else if self.signature_tree.hash() == self.signature_tree_hash {
             self.signature_tree.clone()
         } else {
             SignatureTree::default()
@@ -706,6 +732,31 @@ mod tests {
         assert!(accepted.is_empty());
         assert_eq!(accepted_hash, HashType::default());
         assert_eq!(tree_hash, HashType::default());
+    }
+
+    #[test]
+    fn trusted_dispatch_body_accepts_unsigned_integrity_checked_blocks() {
+        let keypair = Keypair::generate();
+        let mut block = Block::default();
+        block.body.nonce = Nonce::new(1);
+        block.body.txs.push(Transaction::new("tx"));
+        block.seal_unsigned(keypair.public);
+        let mut blocks = BTreeMap::new();
+        blocks.insert(block.hash, block.clone());
+        let body = DispatchBody {
+            blocks_hash: blocks.hash(),
+            blocks,
+            signature_tree: SignatureTree::default(),
+            signature_tree_hash: SignatureTree::default().hash(),
+        };
+
+        let (verified, _, _, _) = body.verify_body(&BTreeMap::new());
+        assert!(verified.is_empty());
+
+        let (trusted, trusted_hash, _, _) = body.verify_body_trusted(&BTreeMap::new());
+        assert_eq!(trusted.len(), 1);
+        assert_eq!(trusted.get(&block.hash).unwrap().hash, block.hash);
+        assert_eq!(trusted_hash, trusted.hash());
     }
 
     #[test]

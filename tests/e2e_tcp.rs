@@ -1,10 +1,11 @@
 use std::collections::BTreeMap;
 
 use blossom::{
-    BlossomBody, Commit, CommitBody, Dispatch, EchoReDispatch, EchoRequest, EchoResponse,
+    Block, BlossomBody, Commit, CommitBody, Dispatch, EchoReDispatch, EchoRequest, EchoResponse,
     EchoResponseBody, EpochStarted, EpochStartedBody, EpochTarget, HashType, Header, MSGKey,
     MockBlockService, Msg, Nonce, Proposal, ProposalBody, ServiceKind, Signature, SimulatedCluster,
-    TcpServiceClient, Transaction, Verification, VerificationBody, WireRequest, WireResponse,
+    TcpServiceClient, Transaction, TrustMode, Verification, VerificationBody, WireRequest,
+    WireResponse,
 };
 use blossom::{DoHash, NodeIdentity};
 
@@ -146,6 +147,45 @@ async fn block_submission_duplicate_rejection_send_block_and_dispatch_are_end_to
         WireResponse::Ok => {}
         response => panic!("expected send block ok, got {}", response.kind()),
     }
+}
+
+#[tokio::test]
+async fn trusted_cluster_accepts_unsigned_block_and_dispatch() {
+    let cluster = SimulatedCluster::spawn_with_trust_mode(6, TrustMode::Trusted)
+        .await
+        .unwrap();
+    let target = cluster.next_target(0).await.unwrap();
+    let mut block = Block::default();
+    block.body.last_epoch = target.last_epoch;
+    block.body.nonce = target.nonce;
+    block.body.txs.push(Transaction::new("trusted-tx"));
+    block.seal_unsigned(cluster.node(0).keypair.public);
+
+    match cluster
+        .request(0, WireRequest::SubmitBlock(block.clone()))
+        .await
+        .unwrap()
+    {
+        WireResponse::BlockAccepted(accepted) => {
+            assert_eq!(accepted.hash, block.hash);
+            assert_eq!(accepted.nonce, target.nonce);
+        }
+        response => panic!("expected accepted block, got {}", response.kind()),
+    }
+
+    let dispatch = expect_dispatch(cluster.request(0, WireRequest::Dispatch { round: 0 }).await);
+    assert_eq!(dispatch.header.signature, Signature::default());
+    let dispatched_block = dispatch.body.blocks.values().next().unwrap();
+    assert_eq!(dispatched_block.signature, Signature::default());
+    assert!(dispatched_block.verify_unsigned_integrity().is_ok());
+    assert!(dispatched_block.verify_integrity().is_err());
+
+    expect_receipt(
+        cluster
+            .request(1, WireRequest::Message(Msg::Dispatch(dispatch)))
+            .await,
+        "dispatch",
+    );
 }
 
 #[tokio::test]

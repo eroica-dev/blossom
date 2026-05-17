@@ -5,7 +5,7 @@ use tokio::net::TcpListener;
 
 use blossom::{
     BlossomError, NodeIdentity, NodeRuntime, PubKey, Result as BlossomResult, RuntimeConfig,
-    SecKey, Service, TcpNode,
+    SecKey, Service, TcpNode, TrustMode,
 };
 
 type MainResult<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
@@ -25,6 +25,8 @@ struct Args {
     secret_key: Option<String>,
     #[arg(long, env = "BLOSSOM_BLOCK_CAP", default_value_t = 100)]
     block_cap: usize,
+    #[arg(long, env = "BLOSSOM_TRUSTED", default_value_t = false)]
+    trusted: bool,
     #[arg(long, value_name = "KIND:PUBKEY@HOST:PORT")]
     service: Vec<String>,
 }
@@ -35,6 +37,9 @@ async fn main() -> MainResult<()> {
     let self_node = identity_from_args(&args)?;
     let mut config = RuntimeConfig::new(self_node);
     config.block_cap = args.block_cap;
+    if args.trusted {
+        config.trust_mode = TrustMode::Trusted;
+    }
     let runtime = NodeRuntime::new(config);
 
     for spec in &args.service {

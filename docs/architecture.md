@@ -78,6 +78,15 @@ missing dispatches, delayed peers, and likely faulty peers. Verification
 and proposal messages aggregate the quorum's view of accepted block
 sets, and commit records the outgoing result for the round.
 
+Trusted mode is an explicit private-cluster optimization. When
+`RuntimeConfig::trust_mode` is `Trusted`, nodes assume the verifier set
+was provisioned out of band and skip Ed25519 block/message signing and
+verification. The runtime still checks that message senders belong to the
+current round and that blocks match their content hash and Merkle root.
+The epoch-depth benchmark uses this mode to model dispatch-only quorum
+propagation, removing echo, verification, proposal, and commit messages
+from the known-member fast path.
+
 ### Transaction Validation
 
 After block propagation, the paper expects all non-Byzantine validators
@@ -126,6 +135,8 @@ validator.
 - Local consensus, temporary quorum state, and epoch chain structures.
 - Dispatch body verification against block hashes, block signatures,
   and signature-tree hashes.
+- Trusted block/message paths that skip signatures while preserving
+  membership and hash/merkle integrity checks.
 - Message matrix behavior for expected quorum messages.
 - Address book, local block queue, node status, block intake, dispatch
   generation, and protocol message intake.

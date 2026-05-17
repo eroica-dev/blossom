@@ -316,12 +316,30 @@ pub struct TempQuorum {
 
 impl TempQuorum {
     pub fn verify(&mut self) {
+        self.verify_with_signature_checks(true);
+    }
+
+    pub fn verify_trusted(&mut self) {
+        self.verify_with_signature_checks(false);
+    }
+
+    fn verify_with_signature_checks(&mut self, verify_signatures: bool) {
         let mut processed_dispatches = HashMap::new();
         for dispatch in &self.pending_dispatches {
-            if dispatch.body.signature_tree.verify() {
+            let signature_tree_ok = if verify_signatures {
+                dispatch.body.signature_tree.verify()
+            } else {
+                dispatch.body.signature_tree.hash() == dispatch.body.signature_tree_hash
+            };
+            if signature_tree_ok {
                 for (sent_block_hash, block) in &dispatch.body.blocks {
                     let block_hash = block.hash();
-                    if *sent_block_hash == block_hash && block.verify_signature().is_ok() {
+                    let block_ok = if verify_signatures {
+                        block.verify_signature().is_ok()
+                    } else {
+                        block.verify_unsigned_integrity().is_ok()
+                    };
+                    if *sent_block_hash == block_hash && block_ok {
                         self.verified_blocks.insert(*sent_block_hash, block.clone());
                         self.timers.verified_tx += block.body.txs.len();
                     }
@@ -592,7 +610,11 @@ fn block_merkle_root(blocks: &BTreeMap<HashType, Block>) -> HashType {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::blossom::{Header, Proposal, ProposalBody, Verification, VerificationBody};
+    use crate::block::Transaction;
+    use crate::blossom::{
+        Dispatch, DispatchBody, Header, Proposal, ProposalBody, SignatureTree, Verification,
+        VerificationBody,
+    };
     use crate::crypto::{Keypair, Signature};
 
     fn node(index: u8) -> NodeIdentity {
@@ -699,6 +721,45 @@ mod tests {
         blocks.insert(hash, block);
 
         assert_eq!(block_merkle_root(&blocks), hash);
+    }
+
+    #[test]
+    fn trusted_quorum_verify_accepts_unsigned_dispatch_blocks() {
+        let keypair = Keypair::generate();
+        let mut block = Block::default();
+        block.body.nonce = Nonce::new(1);
+        block.body.txs.push(Transaction::new("tx"));
+        block.seal_unsigned(keypair.public);
+        let mut blocks = BTreeMap::new();
+        blocks.insert(block.hash, block.clone());
+        let dispatch = Dispatch {
+            header: Header {
+                sender: keypair.public,
+                signature: Signature::default(),
+                ..Default::default()
+            },
+            body: DispatchBody {
+                blocks_hash: blocks.hash(),
+                blocks,
+                signature_tree: SignatureTree::default(),
+                signature_tree_hash: SignatureTree::default().hash(),
+            },
+        };
+
+        let mut verified_quorum = TempQuorum {
+            pending_dispatches: vec![dispatch.clone()],
+            ..Default::default()
+        };
+        verified_quorum.verify();
+        assert!(verified_quorum.verified_blocks.is_empty());
+
+        let mut trusted_quorum = TempQuorum {
+            pending_dispatches: vec![dispatch],
+            ..Default::default()
+        };
+        trusted_quorum.verify_trusted();
+        assert_eq!(trusted_quorum.verified_blocks.len(), 1);
+        assert!(trusted_quorum.verified_blocks.contains_key(&block.hash));
     }
 
     #[test]

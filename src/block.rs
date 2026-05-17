@@ -56,9 +56,19 @@ impl Block {
 
     pub fn sign_with(&mut self, signer: &SecretSigner) {
         self.body.validator = signer.public_key();
+        self.seal();
+        self.signature = signer.sign(self.hash.as_ref());
+    }
+
+    pub fn seal_unsigned(&mut self, validator: PubKey) {
+        self.body.validator = validator;
+        self.seal();
+        self.signature = Signature::default();
+    }
+
+    fn seal(&mut self) {
         self.body.merkle_root = self.body.compute_merkle_root();
         self.hash = self.body.hash();
-        self.signature = signer.sign(self.hash.as_ref());
     }
 
     pub fn verify_signature(&self) -> Result<()> {
@@ -67,13 +77,18 @@ impl Block {
     }
 
     pub fn verify_integrity(&self) -> Result<()> {
+        self.verify_unsigned_integrity()?;
+        self.verify_signature()
+    }
+
+    pub fn verify_unsigned_integrity(&self) -> Result<()> {
         if self.hash != self.hash() {
             return Err(crate::error::BlossomError::InvalidBlockHash);
         }
         if self.body.merkle_root != self.body.compute_merkle_root() {
             return Err(crate::error::BlossomError::InvalidBlockHash);
         }
-        self.verify_signature()
+        Ok(())
     }
 
     pub fn len(&self) -> usize {
@@ -268,6 +283,29 @@ mod tests {
         assert_eq!(
             tampered_signature.verify_integrity(),
             Err(crate::error::BlossomError::SignatureError)
+        );
+    }
+
+    #[test]
+    fn unsigned_sealed_block_preserves_hash_and_merkle_integrity() {
+        let keypair = Keypair::generate();
+        let mut block = Block::default();
+        block.body.txs.push(Transaction::new("tx-1"));
+        block.seal_unsigned(keypair.public);
+
+        assert_eq!(block.body.validator, keypair.public);
+        assert_eq!(block.signature, Signature::default());
+        assert!(block.verify_unsigned_integrity().is_ok());
+        assert_eq!(
+            block.verify_integrity(),
+            Err(crate::error::BlossomError::SignatureError)
+        );
+
+        let mut tampered = block;
+        tampered.body.txs.push(Transaction::new("tx-2"));
+        assert_eq!(
+            tampered.verify_unsigned_integrity(),
+            Err(crate::error::BlossomError::InvalidBlockHash)
         );
     }
 

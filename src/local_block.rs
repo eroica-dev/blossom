@@ -49,6 +49,12 @@ impl LocalBlock {
 
     pub fn enqueue_block(&mut self, block: Block) -> Result<HashType> {
         block.verify_integrity()?;
+        self.enqueue_preverified_block(block)
+    }
+
+    /// Enqueue a block after the caller has already applied the appropriate
+    /// integrity checks for its trust boundary.
+    pub fn enqueue_preverified_block(&mut self, block: Block) -> Result<HashType> {
         if self
             .block_deque
             .iter()
@@ -171,6 +177,25 @@ mod tests {
             queue.enqueue_block(second),
             Err(BlossomError::BlockQueueFull)
         );
+    }
+
+    #[test]
+    fn preverified_enqueue_allows_trust_mode_unsigned_blocks() {
+        let keypair = Keypair::generate();
+        let mut queue = LocalBlock::new(1);
+        let mut block = Block::default();
+        block.body.last_epoch = HashType([1; 32]);
+        block.body.nonce = Nonce::new(1);
+        block.seal_unsigned(keypair.public);
+
+        assert_eq!(
+            queue.enqueue_block(block.clone()),
+            Err(BlossomError::SignatureError)
+        );
+        let hash = queue.enqueue_preverified_block(block).unwrap();
+
+        assert_ne!(hash, HashType::default());
+        assert_eq!(queue.len(), 1);
     }
 
     #[test]

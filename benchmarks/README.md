@@ -49,6 +49,14 @@ EPOCH_DEPTH=3 NODES=36 TXS_PER_NODE=1000 TX_BYTES=32 \
   ./benchmarks/scripts/run-epoch-depth.sh
 ```
 
+Run the trusted known-member fast path directly:
+
+```bash
+cargo run --release --bin blossom-epoch-bench -- \
+  --nodes 36 --target-transactions 1000000 \
+  --transactions-per-node 1000 --transaction-bytes 32 --trusted
+```
+
 Derive epoch depth from a target input volume:
 
 ```bash
@@ -97,3 +105,9 @@ block, every quorum round performs a union of peer block sets, and convergence
 means all nodes finish the epoch with the same ordered block set. `EPOCH_DEPTH`
 measures consecutive epochs; `TARGET_TRANSACTIONS` derives the required depth
 from `NODES * TXS_PER_NODE`.
+
+With `--trusted`, `blossom-epoch-bench` still computes the same deterministic
+quorum unions, but it seals blocks without Ed25519 signatures and counts only
+dispatch fanout for each quorum. This models a private deployment where
+membership is known out of band and consensus can skip echo, verification,
+proposal, and commit traffic.

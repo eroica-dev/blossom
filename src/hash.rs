@@ -1,10 +1,9 @@
 use borsh::{BorshDeserialize, BorshSerialize};
-use indextreemap::IndexTreeMap;
+use indextreemap::{IndexTreeMap, SharedIndexTreeMap};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::fmt;
-use std::hash::Hash;
 use std::ops::Deref;
 
 use crate::error::{BlossomError, Result};
@@ -123,11 +122,19 @@ where
 
 impl<K, V> DoHash for IndexTreeMap<K, V>
 where
-    K: Sized + Default + Ord + Clone + Hash + AsRef<[u8]>,
-    V: Sized + Default + Clone,
+    K: Sized + Ord + AsRef<[u8]>,
 {
     fn hash(&self) -> HashType {
-        HashType::hash_slices(self.keys().map(AsRef::as_ref))
+        HashType::hash_slices(self.keys_ref().map(AsRef::as_ref))
+    }
+}
+
+impl<K, V> DoHash for SharedIndexTreeMap<K, V>
+where
+    K: AsRef<[u8]>,
+{
+    fn hash(&self) -> HashType {
+        HashType::hash_slices(self.keys_ref().map(AsRef::as_ref))
     }
 }
 

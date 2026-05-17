@@ -2,8 +2,9 @@ use std::collections::BTreeMap;
 
 use blossom::algorithm::select_quorums;
 use blossom::{
-    Block, Dispatch, DispatchBody, HashType, Keypair, LocalBlock, MessageMatrix, NodeIdentity,
-    Nonce, PubKey, RuntimeConfig, SignatureTree, Transaction, genesis_epoch,
+    Block, BlockHandle, BlockIndex, Dispatch, DispatchBody, HashType, Keypair, LocalBlock,
+    MessageMatrix, NodeIdentity, Nonce, PubKey, RuntimeConfig, SignatureTree, Transaction,
+    TrustMode, genesis_epoch,
 };
 use blossom::{DoHash, NodeRuntime, WireRequest, framed_len};
 use criterion::{BatchSize, BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
@@ -34,10 +35,27 @@ fn bench_hash_and_block(c: &mut Criterion) {
         );
     });
 
+    group.bench_function("block_seal_unsigned_32_txs", |b| {
+        b.iter_batched(
+            || block_with_txs(32),
+            |mut block| {
+                block.seal_unsigned(keypair.public);
+                black_box(block)
+            },
+            BatchSize::SmallInput,
+        );
+    });
+
     let mut signed = block_with_txs(32);
     signed.sign(&keypair.secret);
     group.bench_function("block_verify_integrity_32_txs", |b| {
         b.iter(|| black_box(&signed).verify_integrity().unwrap());
+    });
+
+    let mut unsigned = block_with_txs(32);
+    unsigned.seal_unsigned(keypair.public);
+    group.bench_function("block_verify_unsigned_integrity_32_txs", |b| {
+        b.iter(|| black_box(&unsigned).verify_unsigned_integrity().unwrap());
     });
 
     group.finish();
@@ -119,6 +137,17 @@ fn bench_runtime(c: &mut Criterion) {
         );
     });
 
+    group.bench_function("trusted_submit_block_and_dispatch", |b| {
+        b.iter_batched(
+            runtime_and_unsigned_block,
+            |(runtime, block)| {
+                runtime.submit_block(block).unwrap();
+                black_box(runtime.dispatch_local_block(0).unwrap())
+            },
+            BatchSize::SmallInput,
+        );
+    });
+
     group.bench_function("local_block_close_and_dequeue", |b| {
         let keypair = Keypair::generate();
         b.iter_batched(
@@ -139,6 +168,46 @@ fn bench_runtime(c: &mut Criterion) {
             },
             BatchSize::SmallInput,
         );
+    });
+
+    group.finish();
+}
+
+fn bench_block_index(c: &mut Criterion) {
+    let mut group = c.benchmark_group("block_index");
+    let count = 216usize;
+    let btree = btree_block_index(0, count);
+    let shared = shared_block_index(0, count);
+
+    group.bench_function(BenchmarkId::new("clone_btree", count), |b| {
+        b.iter(|| black_box(black_box(&btree).clone()));
+    });
+    group.bench_function(BenchmarkId::new("clone_shared", count), |b| {
+        b.iter(|| black_box(black_box(&shared).clone()));
+    });
+
+    let btree_groups = (0..6)
+        .map(|group| btree_block_index(group * 36, 36))
+        .collect::<Vec<_>>();
+    let shared_groups = (0..6)
+        .map(|group| shared_block_index(group * 36, 36))
+        .collect::<Vec<_>>();
+
+    group.bench_function("union_btree_6x36", |b| {
+        b.iter(|| {
+            let mut output = BTreeMap::new();
+            for map in black_box(&btree_groups) {
+                output.extend(map.clone());
+            }
+            black_box(output)
+        });
+    });
+    group.bench_function("union_shared_6x36", |b| {
+        b.iter(|| {
+            let groups = black_box(&shared_groups);
+            let output = groups[0].union_from(groups[1..].iter());
+            black_box(output)
+        });
     });
 
     group.finish();
@@ -256,12 +325,63 @@ fn runtime_and_block() -> (NodeRuntime, Block) {
     (runtime, block)
 }
 
+fn runtime_and_unsigned_block() -> (NodeRuntime, Block) {
+    let keypair = Keypair::generate();
+    let self_node = NodeIdentity::new(
+        keypair.public,
+        Some(keypair.secret),
+        "tcp",
+        "127.0.0.1",
+        8080,
+        false,
+    );
+    let genesis = genesis_epoch([self_node.clone()]);
+    let mut config = RuntimeConfig::new(self_node);
+    config.genesis = Some(genesis.clone());
+    config.trust_mode = TrustMode::Trusted;
+    let runtime = NodeRuntime::new(config);
+
+    let mut block = block_with_txs(4);
+    block.body.last_epoch = genesis.hash;
+    block.body.nonce = genesis.body.nonce.new_next();
+    block.seal_unsigned(keypair.public);
+    (runtime, block)
+}
+
+fn btree_block_index(start: usize, count: usize) -> BTreeMap<HashType, BlockHandle> {
+    (start..start + count)
+        .map(|index| {
+            let block = indexed_signed_block(index);
+            let handle = BlockHandle::new(block).unwrap();
+            (handle.hash(), handle)
+        })
+        .collect()
+}
+
+fn shared_block_index(start: usize, count: usize) -> BlockIndex {
+    let mut index = BlockIndex::new();
+    for (hash, handle) in btree_block_index(start, count) {
+        index.insert(hash, handle);
+    }
+    index
+}
+
+fn indexed_signed_block(index: usize) -> Block {
+    let keypair = Keypair::generate();
+    let mut block = block_with_payload_txs(4, 32);
+    block.body.last_epoch = HashType([1; 32]);
+    block.body.nonce = Nonce::new(index as u64 + 1);
+    block.sign(&keypair.secret);
+    block
+}
+
 criterion_group!(
     benches,
     bench_hash_and_block,
     bench_quorum_and_matrix,
     bench_protocol_messages,
     bench_runtime,
+    bench_block_index,
     bench_block_scaling
 );
 criterion_main!(benches);

@@ -34,14 +34,14 @@ pub use crypto::{Keypair, PubKey, SecKey, SecretSigner, Signature};
 pub use error::{BlossomError, Result};
 pub use harness::{MockBlockService, SimulatedCluster, SimulatedNode, signed_block};
 pub use hash::{DoHash, HashType};
-pub use indextreemap::IndexTreeMap;
+pub use indextreemap::{IndexTreeMap, SharedIndexTreeMap};
 pub use local_block::LocalBlock;
 pub use messages::{MSGKey, Msg};
 pub use node::{NodeIdentity, NodeType};
 pub use nonce::Nonce;
 pub use register::{MessageMatrix, QuorumQueue, Status};
 pub use runtime::{
-    AcceptedBlock, EpochTarget, MessageReceipt, NodeRuntime, NodeStatus, RuntimeConfig,
+    AcceptedBlock, EpochTarget, MessageReceipt, NodeRuntime, NodeStatus, RuntimeConfig, TrustMode,
     genesis_epoch,
 };
 pub use service_client::TcpServiceClient;

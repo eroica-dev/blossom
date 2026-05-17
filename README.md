@@ -14,6 +14,9 @@ node surface:
 - Indexed verifier membership, epoch approval checks, and Merkle-rooted epoch block sets.
 - Address book and service registration for block, engine, consensus, relay, and address-book services.
 - Local block intake/queueing for signed block-service output.
+- Optional trusted-cluster mode for private known-member deployments that
+  skip block/message signatures while retaining membership and hash/merkle
+  integrity checks.
 - A raw TCP `blossom-node` binary with a length-prefixed Borsh wire protocol for health, state, address book, block intake, dispatch, and message handling.
 - Minimal cryptographic and block primitives needed for the protocol to compile independently.
 - Unit tests for signing, block verification, quorum selection, address-book behavior, block queueing, message matrix behavior, and runtime block dispatch.
@@ -67,6 +70,12 @@ cargo run --bin blossom-node -- \
   --port 8080 \
   --service block:<pubkey>@127.0.0.1:9000
 ```
+
+For a private cluster where all validators are provisioned from the same
+trusted membership set, `--trusted` or `BLOSSOM_TRUSTED=true` disables
+Ed25519 block/message signing and verification. This is a raw-speed mode
+for controlled deployments; nodes still reject unknown senders and invalid
+block hashes or Merkle roots.
 
 Wire requests:
 
@@ -133,6 +142,14 @@ Run a harness matrix:
 ```sh
 NODE_COUNTS="1 6 12" TRANSACTION_COUNTS="0 3 32" ITERATIONS=5 \
   ./benchmarks/scripts/run-harness-matrix.sh
+```
+
+Run the paper-aligned epoch-depth model in trusted mode:
+
+```sh
+cargo run --release --bin blossom-epoch-bench -- \
+  --nodes 36 --target-transactions 1000000 \
+  --transactions-per-node 1000 --trusted
 ```
 
 ## Notes

@@ -1,13 +1,13 @@
-use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use bytes::Bytes;
+use indextreemap::SharedIndexTreeMap;
 
 use crate::block::Block;
 use crate::error::{BlossomError, Result};
 use crate::hash::HashType;
 
-pub type BlockIndex = BTreeMap<HashType, BlockHandle>;
+pub type BlockIndex = SharedIndexTreeMap<HashType, BlockHandle>;
 
 #[derive(Debug)]
 pub struct BlockRecord {

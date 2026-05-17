@@ -10,7 +10,7 @@ use crate::crypto::{Keypair, SecKey};
 use crate::error::{BlossomError, Result};
 use crate::node::NodeIdentity;
 use crate::nonce::Nonce;
-use crate::runtime::{EpochTarget, RuntimeConfig, genesis_epoch};
+use crate::runtime::{EpochTarget, RuntimeConfig, TrustMode, genesis_epoch};
 use crate::tcp::{TcpNode, send_wire_request};
 use crate::wire::{WireRequest, WireResponse, read_frame, write_frame};
 
@@ -42,6 +42,14 @@ pub struct MockBlockServiceState {
 
 impl SimulatedCluster {
     pub async fn spawn(count: usize) -> Result<Self> {
+        Self::spawn_with_trust_mode(count, TrustMode::Verified).await
+    }
+
+    pub async fn spawn_trusted(count: usize) -> Result<Self> {
+        Self::spawn_with_trust_mode(count, TrustMode::Trusted).await
+    }
+
+    pub async fn spawn_with_trust_mode(count: usize, trust_mode: TrustMode) -> Result<Self> {
         if count == 0 {
             return Err(BlossomError::WireProtocol(
                 "simulated cluster must contain at least one node".to_string(),
@@ -84,6 +92,7 @@ impl SimulatedCluster {
         for (index, listener, keypair, identity) in entries {
             let mut config = RuntimeConfig::new(identity.clone());
             config.genesis = Some(genesis.clone());
+            config.trust_mode = trust_mode;
             let runtime = crate::NodeRuntime::new(config);
             let node = TcpNode::new(runtime);
             let handle = tokio::spawn(async move {
@@ -372,6 +381,13 @@ mod tests {
             cluster.node(0).identity.public_key(),
             cluster.node(1).identity.public_key()
         );
+    }
+
+    #[tokio::test]
+    async fn simulated_cluster_can_spawn_in_trusted_mode() {
+        let cluster = SimulatedCluster::spawn_trusted(2).await.unwrap();
+
+        assert_eq!(cluster.len(), 2);
     }
 
     #[tokio::test]

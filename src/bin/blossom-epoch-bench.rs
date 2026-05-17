@@ -11,8 +11,8 @@ use blossom::wire::FRAME_PREFIX_BYTES;
 use blossom::{
     Block, BlockHandle, BlockIndex, BlossomBody, Commit, CommitBody, DoHash, EchoResponse,
     EchoResponseBody, HashType, Header, Keypair, MSGKey, Msg, Nonce, Proposal, ProposalBody,
-    PubKey, SecretSigner, SignatureTree, Transaction, Verification, VerificationBody, WireRequest,
-    encoded_len, framed_len,
+    PubKey, SecretSigner, Signature, SignatureTree, Transaction, Verification, VerificationBody,
+    WireRequest, encoded_len, framed_len,
 };
 
 type MainResult<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
@@ -35,6 +35,8 @@ struct Args {
     transaction_bytes: usize,
     #[arg(long, default_value_t = false)]
     shuffle: bool,
+    #[arg(long, default_value_t = false)]
+    trusted: bool,
     #[arg(long)]
     csv: Option<PathBuf>,
     #[arg(long)]
@@ -100,6 +102,7 @@ struct EpochBenchRow {
     rounds: usize,
     quorums: usize,
     shuffle: bool,
+    trusted: bool,
     transactions_per_node: usize,
     transaction_bytes: usize,
     epoch_transactions: usize,
@@ -147,6 +150,7 @@ async fn main() -> MainResult<()> {
             args.transactions_per_node,
             args.transaction_bytes,
             args.shuffle,
+            args.trusted,
         )?;
         last_epoch = row.epoch_hash;
         println!("{}", row.to_csv());
@@ -190,6 +194,7 @@ fn run_epoch(
     transactions_per_node: usize,
     transaction_bytes: usize,
     shuffle: bool,
+    trusted: bool,
 ) -> MainResult<EpochBenchRow> {
     let total_start = Instant::now();
 
@@ -203,9 +208,10 @@ fn run_epoch(
                 last_epoch,
                 nonce,
                 transactions(epoch, node_index, transactions_per_node, transaction_bytes),
+                trusted,
             );
             let block = BlockHandle::new(block)?;
-            let mut blocks = BTreeMap::new();
+            let mut blocks = BlockIndex::new();
             blocks.insert(block.hash(), block);
             Ok(NodeEpochState { blocks })
         })
@@ -216,7 +222,7 @@ fn run_epoch(
         .map(|state| {
             state
                 .blocks
-                .values()
+                .values_ref()
                 .map(encoded_block_len)
                 .sum::<MainResult<usize>>()
         })
@@ -244,13 +250,16 @@ fn run_epoch(
                 &before_round,
                 last_epoch,
                 nonce,
+                trusted,
                 &mut totals,
             )?;
 
-            let mut union = BTreeMap::new();
-            for member in quorum {
-                union.extend(before_round[*member].blocks.clone());
-            }
+            let Some((first, rest)) = quorum.split_first() else {
+                continue;
+            };
+            let union = before_round[*first]
+                .blocks
+                .union_from(rest.iter().map(|member| &before_round[*member].blocks));
             for member in quorum {
                 states[*member].blocks = union.clone();
             }
@@ -284,6 +293,7 @@ fn run_epoch(
         rounds: topology.len(),
         quorums,
         shuffle,
+        trusted,
         transactions_per_node,
         transaction_bytes,
         epoch_transactions: nodes.len() * transactions_per_node,
@@ -319,13 +329,18 @@ fn signed_block(
     last_epoch: HashType,
     nonce: Nonce,
     txs: Vec<Transaction>,
+    trusted: bool,
 ) -> Block {
     let mut block = Block::default();
     block.body.validator = node.keypair.public;
     block.body.last_epoch = last_epoch;
     block.body.nonce = nonce;
     block.body.txs = txs;
-    block.sign_with(&node.signer);
+    if trusted {
+        block.seal_unsigned(node.keypair.public);
+    } else {
+        block.sign_with(&node.signer);
+    }
     block
 }
 
@@ -412,6 +427,7 @@ fn count_quorum_messages(
     states: &[NodeEpochState],
     last_epoch: HashType,
     nonce: Nonce,
+    trusted: bool,
     totals: &mut MessageTotals,
 ) -> MainResult<()> {
     for sender in quorum {
@@ -421,9 +437,14 @@ fn count_quorum_messages(
             last_epoch,
             nonce,
             round,
+            trusted,
         )?;
         totals.dispatch_messages += quorum.len().saturating_sub(1);
         totals.dispatch_bytes += dispatch.framed_len * quorum.len().saturating_sub(1);
+
+        if trusted {
+            continue;
+        }
 
         for echo_sender in quorum {
             if echo_sender == sender {
@@ -436,9 +457,18 @@ fn count_quorum_messages(
         }
     }
 
+    if trusted {
+        return Ok(());
+    }
+
     let union = quorum
         .iter()
-        .flat_map(|member| states[*member].blocks.iter().map(|(hash, _)| (*hash, ())))
+        .flat_map(|member| {
+            states[*member]
+                .blocks
+                .iter_ref()
+                .map(|(hash, _)| (*hash, ()))
+        })
         .collect::<BTreeMap<_, _>>();
     let union_hash = union.hash();
 
@@ -482,6 +512,7 @@ fn dispatch_profile_for(
     last_epoch: HashType,
     nonce: Nonce,
     round: u8,
+    trusted: bool,
 ) -> MainResult<DispatchProfile> {
     let signature_tree = SignatureTree::default();
     let signature_tree_hash = signature_tree.hash();
@@ -493,6 +524,7 @@ fn dispatch_profile_for(
         nonce,
         round,
         &dispatch_body_bytes(blocks_hash, signature_tree_hash),
+        trusted,
     )?;
     let framed_len = framed_dispatch_len(&header, blocks, &signature_tree)?;
 
@@ -511,6 +543,7 @@ fn dispatch_for(
     last_epoch: HashType,
     nonce: Nonce,
     round: u8,
+    trusted: bool,
 ) -> MainResult<blossom::Dispatch> {
     let signature_tree = SignatureTree::default();
     let signature_tree_hash = signature_tree.hash();
@@ -521,7 +554,15 @@ fn dispatch_for(
         signature_tree_hash,
     };
     Ok(blossom::Dispatch {
-        header: signed_header(node, MSGKey::Dispatch, last_epoch, nonce, round, &body)?,
+        header: signed_header(
+            node,
+            MSGKey::Dispatch,
+            last_epoch,
+            nonce,
+            round,
+            &body,
+            trusted,
+        )?,
         body,
     })
 }
@@ -539,7 +580,15 @@ fn echo_for(
         signature_tree_hash: dispatch.signature_tree_hash,
     };
     Ok(EchoResponse {
-        header: signed_header(node, MSGKey::EchoResponse, last_epoch, nonce, round, &body)?,
+        header: signed_header(
+            node,
+            MSGKey::EchoResponse,
+            last_epoch,
+            nonce,
+            round,
+            &body,
+            false,
+        )?,
         body,
     })
 }
@@ -557,7 +606,15 @@ fn verification_for(
         blocks: blocks.clone(),
     };
     Ok(Verification {
-        header: signed_header(node, MSGKey::Verification, last_epoch, nonce, round, &body)?,
+        header: signed_header(
+            node,
+            MSGKey::Verification,
+            last_epoch,
+            nonce,
+            round,
+            &body,
+            false,
+        )?,
         body,
     })
 }
@@ -579,7 +636,15 @@ fn proposal_for(
         signature_tree_hash: Some(blocks.hash()),
     };
     Ok(Proposal {
-        header: signed_header(node, MSGKey::Proposal, last_epoch, nonce, round, &body)?,
+        header: signed_header(
+            node,
+            MSGKey::Proposal,
+            last_epoch,
+            nonce,
+            round,
+            &body,
+            false,
+        )?,
         body,
     })
 }
@@ -595,7 +660,7 @@ fn commit_for(
         signature_tree_insert: None,
     };
     Ok(Commit {
-        header: signed_header(node, MSGKey::Commit, last_epoch, nonce, round, &body)?,
+        header: signed_header(node, MSGKey::Commit, last_epoch, nonce, round, &body, false)?,
         body,
     })
 }
@@ -607,21 +672,27 @@ fn signed_header<T: BlossomBody>(
     nonce: Nonce,
     round: u8,
     body: &T,
+    trusted: bool,
 ) -> MainResult<Header> {
-    let message_hash = Header::signature_hash_for_body(
-        &node.keypair.public,
-        &last_epoch,
-        nonce,
-        round,
-        kind,
-        body,
-    );
+    let signature = if trusted {
+        Signature::default()
+    } else {
+        let message_hash = Header::signature_hash_for_body(
+            &node.keypair.public,
+            &last_epoch,
+            nonce,
+            round,
+            kind,
+            body,
+        );
+        node.signer.sign(message_hash.as_ref())
+    };
     Ok(Header {
         sender: node.keypair.public,
         last_epoch,
         nonce,
         round,
-        signature: node.signer.sign(message_hash.as_ref()),
+        signature,
     })
 }
 
@@ -632,21 +703,27 @@ fn signed_header_bytes(
     nonce: Nonce,
     round: u8,
     body_bytes: &[u8],
+    trusted: bool,
 ) -> MainResult<Header> {
-    let message_hash = Header::signature_hash_for_bytes(
-        &node.keypair.public,
-        &last_epoch,
-        nonce,
-        round,
-        kind,
-        body_bytes,
-    );
+    let signature = if trusted {
+        Signature::default()
+    } else {
+        let message_hash = Header::signature_hash_for_bytes(
+            &node.keypair.public,
+            &last_epoch,
+            nonce,
+            round,
+            kind,
+            body_bytes,
+        );
+        node.signer.sign(message_hash.as_ref())
+    };
     Ok(Header {
         sender: node.keypair.public,
         last_epoch,
         nonce,
         round,
-        signature: node.signer.sign(message_hash.as_ref()),
+        signature,
     })
 }
 
@@ -669,7 +746,7 @@ fn framed_dispatch_len(
 
     let blocks_len = BORSH_MAP_LEN_BYTES
         + blocks
-            .values()
+            .values_ref()
             .map(|block| HASH_BYTES + block.encoded_len())
             .sum::<usize>();
 
@@ -686,7 +763,7 @@ fn framed_dispatch_len(
 #[cfg(test)]
 fn materialize_blocks(blocks: &BlockIndex) -> BTreeMap<HashType, Block> {
     blocks
-        .iter()
+        .iter_ref()
         .map(|(hash, block)| (*hash, block.to_owned_block()))
         .collect()
 }
@@ -715,7 +792,7 @@ fn write_csv(path: &PathBuf, append: bool, rows: &[EpochBenchRow]) -> MainResult
     if write_header {
         writeln!(
             file,
-            "epoch,epoch_depth,nodes,rounds,quorums,shuffle,transactions_per_node,transaction_bytes,epoch_transactions,cumulative_transactions,block_count,min_blocks_per_node,max_blocks_per_node,unique_epoch_hashes,converged,block_build_us,propagation_us,finalize_us,total_us,block_bytes,dispatch_messages,echo_messages,verification_messages,proposal_messages,commit_messages,total_messages,dispatch_bytes,echo_bytes,verification_bytes,proposal_bytes,commit_bytes,total_wire_bytes,epoch_hash"
+            "epoch,epoch_depth,nodes,rounds,quorums,shuffle,trusted,transactions_per_node,transaction_bytes,epoch_transactions,cumulative_transactions,block_count,min_blocks_per_node,max_blocks_per_node,unique_epoch_hashes,converged,block_build_us,propagation_us,finalize_us,total_us,block_bytes,dispatch_messages,echo_messages,verification_messages,proposal_messages,commit_messages,total_messages,dispatch_bytes,echo_bytes,verification_bytes,proposal_bytes,commit_bytes,total_wire_bytes,epoch_hash"
         )?;
     }
     for row in rows {
@@ -727,13 +804,14 @@ fn write_csv(path: &PathBuf, append: bool, rows: &[EpochBenchRow]) -> MainResult
 impl EpochBenchRow {
     fn to_csv(&self) -> String {
         format!(
-            "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
+            "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
             self.epoch,
             self.epoch_depth,
             self.nodes,
             self.rounds,
             self.quorums,
             self.shuffle,
+            self.trusted,
             self.transactions_per_node,
             self.transaction_bytes,
             self.epoch_transactions,
@@ -793,6 +871,7 @@ mod tests {
             transactions_per_node: 1_000,
             transaction_bytes: 32,
             shuffle: false,
+            trusted: false,
             csv: None,
             append: false,
         };
@@ -805,16 +884,56 @@ mod tests {
         let nodes = build_nodes(1);
         let last_epoch = HashType::hash(b"epoch");
         let nonce = Nonce::new(9);
-        let block = signed_block(&nodes[0], last_epoch, nonce, transactions(0, 0, 3, 32));
+        let block = signed_block(
+            &nodes[0],
+            last_epoch,
+            nonce,
+            transactions(0, 0, 3, 32),
+            false,
+        );
         let block = BlockHandle::new(block).unwrap();
         let mut blocks = BlockIndex::new();
         blocks.insert(block.hash(), block);
 
-        let profile = dispatch_profile_for(&nodes[0], &blocks, last_epoch, nonce, 0).unwrap();
-        let dispatch =
-            dispatch_for(&nodes[0], materialize_blocks(&blocks), last_epoch, nonce, 0).unwrap();
+        let profile =
+            dispatch_profile_for(&nodes[0], &blocks, last_epoch, nonce, 0, false).unwrap();
+        let dispatch = dispatch_for(
+            &nodes[0],
+            materialize_blocks(&blocks),
+            last_epoch,
+            nonce,
+            0,
+            false,
+        )
+        .unwrap();
         let framed = framed_len(&WireRequest::Message(Msg::Dispatch(dispatch))).unwrap();
 
         assert_eq!(profile.framed_len, framed);
+    }
+
+    #[test]
+    fn trusted_epoch_counts_dispatch_only_and_converges() {
+        let nodes = build_nodes(36);
+        let row = run_epoch(
+            0,
+            1,
+            &nodes,
+            HashType::default(),
+            Nonce::new(1),
+            2,
+            8,
+            false,
+            true,
+        )
+        .unwrap();
+
+        assert!(row.trusted);
+        assert!(row.converged);
+        assert!(row.dispatch_messages > 0);
+        assert_eq!(row.echo_messages, 0);
+        assert_eq!(row.verification_messages, 0);
+        assert_eq!(row.proposal_messages, 0);
+        assert_eq!(row.commit_messages, 0);
+        assert_eq!(row.total_messages, row.dispatch_messages);
     }
 }

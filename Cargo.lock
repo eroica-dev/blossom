@@ -545,9 +545,9 @@ dependencies = [
 
 [[package]]
 name = "indextreemap"
-version = "0.1.25"
+version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5b7784bd122f0efa001286c54ebb7a5e0425170922b21e3626c852a70f232955"
+checksum = "8da02f77ec2e796359b8be67098f95eb06931a177977f3055ff2df807f873163"
 dependencies = [
  "serde",
 ]
