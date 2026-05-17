@@ -1,13 +1,16 @@
 use std::fmt;
 use std::ops::Deref;
+use std::sync::Arc;
 
 use borsh::{BorshDeserialize, BorshSerialize};
 use ed25519_dalek::{
     PUBLIC_KEY_LENGTH, SECRET_KEY_LENGTH, SIGNATURE_LENGTH, Signature as DalekSignature, Signer,
     SigningKey, Verifier, VerifyingKey,
+    hazmat::{ExpandedSecretKey, raw_sign},
 };
 use rand_core::OsRng;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use sha2::Sha512;
 
 use crate::error::{BlossomError, Result};
 
@@ -231,19 +234,23 @@ impl Signature {
     }
 }
 
-#[derive(Clone)]
 pub struct SecretSigner {
     public_key: PubKey,
-    signing_key: SigningKey,
+    verifying_key: VerifyingKey,
+    expanded_key: Arc<ExpandedSecretKey>,
 }
 
 impl SecretSigner {
     pub fn new(secret_key: SecKey) -> Self {
         let signing_key = SigningKey::from_bytes(secret_key.as_array());
-        let public_key = PubKey(signing_key.verifying_key().to_bytes());
+        let verifying_key = signing_key.verifying_key();
+        // Keep dalek's hazmat API private and derive this only from the normal seed.
+        let expanded_key = ExpandedSecretKey::from(secret_key.as_array());
+        let public_key = PubKey(verifying_key.to_bytes());
         Self {
             public_key,
-            signing_key,
+            verifying_key,
+            expanded_key: Arc::new(expanded_key),
         }
     }
 
@@ -252,11 +259,21 @@ impl SecretSigner {
     }
 
     pub fn sign(&self, message: &[u8]) -> Signature {
-        Signature(self.signing_key.sign(message).to_bytes())
+        Signature(raw_sign::<Sha512>(&self.expanded_key, message, &self.verifying_key).to_bytes())
     }
 
     pub fn matches_public_key(&self, public_key: &PubKey) -> bool {
         self.public_key == *public_key
+    }
+}
+
+impl Clone for SecretSigner {
+    fn clone(&self) -> Self {
+        Self {
+            public_key: self.public_key,
+            verifying_key: self.verifying_key,
+            expanded_key: Arc::clone(&self.expanded_key),
+        }
     }
 }
 
@@ -348,9 +365,11 @@ mod tests {
         let signer = keypair.signer();
         let message = b"cached signer";
         let signature = signer.sign(message);
+        let expected = Signature::sign(message, &keypair.secret);
 
         assert_eq!(signer.public_key(), keypair.public);
         assert!(signer.matches_public_key(&keypair.public));
+        assert_eq!(signature, expected);
         assert!(signature.verify(message, &keypair.public).is_ok());
     }
 

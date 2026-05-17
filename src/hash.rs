@@ -31,6 +31,17 @@ impl HashType {
         Self(sha256.finalize().into())
     }
 
+    pub fn hash_slices<'a, I>(slices: I) -> Self
+    where
+        I: IntoIterator<Item = &'a [u8]>,
+    {
+        let mut sha256 = Sha256::new();
+        for bytes in slices {
+            sha256.update(bytes);
+        }
+        Self(sha256.finalize().into())
+    }
+
     pub fn from_byte_hash(hash: [u8; 32]) -> Self {
         Self(hash)
     }
@@ -106,11 +117,7 @@ where
     K: Ord + AsRef<[u8]>,
 {
     fn hash(&self) -> HashType {
-        let mut bytes = Vec::with_capacity(self.len() * 32);
-        for key in self.keys() {
-            bytes.extend_from_slice(key.as_ref());
-        }
-        HashType::hash(&bytes)
+        HashType::hash_slices(self.keys().map(AsRef::as_ref))
     }
 }
 
@@ -120,11 +127,7 @@ where
     V: Sized + Default + Clone,
 {
     fn hash(&self) -> HashType {
-        let mut bytes = Vec::with_capacity(self.len() * 32);
-        for key in self.keys() {
-            bytes.extend_from_slice(key.as_ref());
-        }
-        HashType::hash(&bytes)
+        HashType::hash_slices(self.keys().map(AsRef::as_ref))
     }
 }
 

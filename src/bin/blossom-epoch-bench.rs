@@ -675,7 +675,7 @@ fn materialize_blocks(blocks: &BlockIndex) -> BTreeMap<HashType, Block> {
 fn epoch_hash(last_epoch: HashType, nonce: Nonce, blocks_hash: HashType) -> HashType {
     let mut bytes = Vec::with_capacity(72);
     bytes.extend_from_slice(last_epoch.as_ref());
-    bytes.extend_from_slice(&nonce.to_bytes());
+    bytes.extend_from_slice(&nonce.to_le_bytes());
     bytes.extend_from_slice(blocks_hash.as_ref());
     HashType::hash(&bytes)
 }

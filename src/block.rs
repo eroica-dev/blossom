@@ -1,5 +1,6 @@
 use borsh::{BorshDeserialize, BorshSerialize};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::crypto::{PubKey, SecKey, SecretSigner, Signature};
@@ -56,8 +57,9 @@ impl Block {
     pub fn sign_with(&mut self, signer: &SecretSigner) {
         self.body.validator = signer.public_key();
         self.body.merkle_root = self.body.compute_merkle_root();
-        self.set_hash();
-        self.signature = signer.sign(&self.body.to_bytes());
+        let body_bytes = self.body.to_bytes();
+        self.hash = HashType::hash(&body_bytes);
+        self.signature = signer.sign(&body_bytes);
     }
 
     pub fn verify_signature(&self) -> Result<()> {
@@ -111,10 +113,15 @@ impl Default for BlockBody {
 
 impl BlockBody {
     pub fn to_bytes(&self) -> Vec<u8> {
-        let mut bytes = Vec::new();
+        let mut bytes = Vec::with_capacity(self.encoded_len());
+        self.append_bytes_to(&mut bytes);
+        bytes
+    }
+
+    pub fn append_bytes_to(&self, bytes: &mut Vec<u8>) {
         bytes.extend_from_slice(self.validator.as_ref());
         bytes.extend_from_slice(self.last_epoch.as_ref());
-        bytes.extend_from_slice(&self.nonce.to_bytes());
+        bytes.extend_from_slice(&self.nonce.to_le_bytes());
         bytes.extend_from_slice(&self.created.to_le_bytes());
         bytes.extend_from_slice(&self.dispatched.to_le_bytes());
         bytes.extend_from_slice(self.merkle_root.as_ref());
@@ -123,19 +130,39 @@ impl BlockBody {
             bytes.extend_from_slice(&(tx.bytes.len() as u64).to_le_bytes());
             bytes.extend_from_slice(&tx.bytes);
         }
-        bytes
+    }
+
+    pub fn encoded_len(&self) -> usize {
+        32 + 32
+            + 8
+            + 16
+            + 16
+            + 32
+            + self
+                .txs
+                .iter()
+                .map(|tx| 32 + 8 + tx.bytes.len())
+                .sum::<usize>()
     }
 
     pub fn hash(&self) -> HashType {
-        HashType::hash(&self.to_bytes())
+        let mut sha256 = Sha256::new();
+        sha256.update(self.validator.as_ref());
+        sha256.update(self.last_epoch.as_ref());
+        sha256.update(self.nonce.to_le_bytes());
+        sha256.update(self.created.to_le_bytes());
+        sha256.update(self.dispatched.to_le_bytes());
+        sha256.update(self.merkle_root.as_ref());
+        for tx in &self.txs {
+            sha256.update(tx.hash.as_ref());
+            sha256.update((tx.bytes.len() as u64).to_le_bytes());
+            sha256.update(&tx.bytes);
+        }
+        HashType::from_byte_hash(sha256.finalize().into())
     }
 
     pub fn compute_merkle_root(&self) -> HashType {
-        let mut bytes = Vec::with_capacity(self.txs.len() * 32);
-        for tx in &self.txs {
-            bytes.extend_from_slice(tx.hash.as_ref());
-        }
-        HashType::hash(&bytes)
+        HashType::hash_slices(self.txs.iter().map(|tx| tx.hash.as_ref()))
     }
 }
 
@@ -172,6 +199,32 @@ mod tests {
 
         assert_eq!(block.body.validator, keypair.public);
         assert!(block.verify_signature().is_ok());
+    }
+
+    #[test]
+    fn block_body_hash_matches_canonical_bytes() {
+        let mut block = Block::default();
+        block.body.txs.push(Transaction::new("tx-1"));
+        block.body.txs.push(Transaction::new("tx-2"));
+
+        assert_eq!(block.body.hash(), HashType::hash(&block.body.to_bytes()));
+        assert_eq!(block.body.encoded_len(), block.body.to_bytes().len());
+    }
+
+    #[test]
+    fn merkle_root_matches_concatenated_transaction_hashes() {
+        let mut block = Block::default();
+        block.body.txs.push(Transaction::new("tx-1"));
+        block.body.txs.push(Transaction::new("tx-2"));
+        let expected = HashType::hash(
+            &[
+                block.body.txs[0].hash.as_ref(),
+                block.body.txs[1].hash.as_ref(),
+            ]
+            .concat(),
+        );
+
+        assert_eq!(block.body.compute_merkle_root(), expected);
     }
 
     #[test]

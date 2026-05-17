@@ -236,7 +236,7 @@ impl EpochBody {
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut bytes = Vec::new();
         bytes.extend_from_slice(self.last_epoch.as_ref());
-        bytes.extend_from_slice(&self.nonce.to_bytes());
+        bytes.extend_from_slice(&self.nonce.to_le_bytes());
         bytes.extend_from_slice(self.merkle_root.as_ref());
         for key in self.verifiers.keys() {
             bytes.extend_from_slice(key.as_ref());
