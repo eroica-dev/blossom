@@ -1,12 +1,11 @@
 use std::io;
 
 use clap::Parser;
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::TcpListener;
 
 use blossom::{
-    AddressBookUpdate, BlossomError, NodeHealth, NodeIdentity, NodeRuntime, PubKey,
-    Result as BlossomResult, RuntimeConfig, SecKey, Service, ServiceKind, TcpServiceClient,
-    WireRequest, WireResponse, read_frame, write_frame,
+    BlossomError, NodeIdentity, NodeRuntime, PubKey, Result as BlossomResult, RuntimeConfig,
+    SecKey, Service, TcpNode,
 };
 
 type MainResult<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
@@ -30,12 +29,6 @@ struct Args {
     service: Vec<String>,
 }
 
-#[derive(Clone)]
-struct AppState {
-    runtime: NodeRuntime,
-    services: TcpServiceClient,
-}
-
 #[tokio::main]
 async fn main() -> MainResult<()> {
     let args = Args::parse();
@@ -50,78 +43,14 @@ async fn main() -> MainResult<()> {
         runtime.register_service(service);
     }
 
-    let state = AppState {
-        runtime,
-        services: TcpServiceClient::new(),
-    };
+    let node = TcpNode::new(runtime);
     let bind = format!("{}:{}", args.host, args.port);
     let listener = TcpListener::bind(&bind).await?;
 
     println!("blossom node listening on tcp://{bind}");
-    println!("public key: {}", state.runtime.self_node().public_key());
-
-    loop {
-        let (stream, _) = listener.accept().await?;
-        let state = state.clone();
-        tokio::spawn(async move {
-            if let Err(err) = handle_connection(stream, state).await {
-                log::error!("connection failed: {err}");
-            }
-        });
-    }
-}
-
-async fn handle_connection(mut stream: TcpStream, state: AppState) -> BlossomResult<()> {
-    let request = read_frame(&mut stream).await?;
-    let response = match handle_request(state, request).await {
-        Ok(response) => response,
-        Err(err) => WireResponse::Error(err.to_string()),
-    };
-    write_frame(&mut stream, &response).await
-}
-
-async fn handle_request(state: AppState, request: WireRequest) -> BlossomResult<WireResponse> {
-    match request {
-        WireRequest::Health => Ok(WireResponse::Health(NodeHealth {
-            status: "ok".to_string(),
-            public_key: state.runtime.self_node().public_key(),
-        })),
-        WireRequest::State => Ok(WireResponse::State(state.runtime.status()?)),
-        WireRequest::AddressBook => Ok(WireResponse::AddressBook(state.runtime.address_book())),
-        WireRequest::RegisterService(service) => {
-            let previous = state.runtime.register_service(service.clone());
-            let nonce_announced = if service.kind == ServiceKind::Block {
-                let target = state.runtime.next_epoch_target()?;
-                state.services.send_nonce(&service, target.nonce).await?;
-                Some(target.nonce)
-            } else {
-                None
-            };
-            Ok(WireResponse::AddressBookUpdated(AddressBookUpdate {
-                service,
-                previous,
-                nonce_announced,
-            }))
-        }
-        WireRequest::NextNonce => Ok(WireResponse::NextNonce(state.runtime.next_epoch_target()?)),
-        WireRequest::SubmitBlock(block) => Ok(WireResponse::BlockAccepted(
-            state.runtime.submit_block(block)?,
-        )),
-        WireRequest::Dispatch { round } => Ok(WireResponse::Dispatch(
-            state.runtime.dispatch_local_block(round)?,
-        )),
-        WireRequest::Message(message) => Ok(WireResponse::MessageReceipt(
-            state.runtime.receive_message(message)?,
-        )),
-        WireRequest::SendNonce(_) | WireRequest::BlockNonce(_) => Ok(WireResponse::Ok),
-        WireRequest::GetBlock(_) => Err(BlossomError::WireProtocol(
-            "this node does not serve block-service block retrieval".to_string(),
-        )),
-        WireRequest::SendBlock(block) => {
-            state.runtime.submit_block(block)?;
-            Ok(WireResponse::Ok)
-        }
-    }
+    println!("public key: {}", node.runtime.self_node().public_key());
+    node.serve(listener).await?;
+    Ok(())
 }
 
 fn identity_from_args(args: &Args) -> MainResult<NodeIdentity> {

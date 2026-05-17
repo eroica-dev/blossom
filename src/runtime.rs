@@ -124,8 +124,11 @@ impl NodeRuntime {
             .len();
         let services = self.address_book();
 
+        let mut node = state.self_node.clone();
+        node.secret_key = None;
+
         Ok(NodeStatus {
-            node: state.self_node.clone(),
+            node,
             last_epoch: epoch.hash,
             last_epoch_nonce: epoch.body.nonce,
             next_nonce: epoch.body.nonce.new_next(),

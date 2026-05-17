@@ -58,3 +58,4 @@ future distribution-failure recovery messages.
 - `TempQuorum::verify` now verifies block hashes and Ed25519 signatures directly through the extracted block/crypto primitives.
 - `NodeRuntime::submit_block` mirrors Eden's `POST /block` behavior by accepting only signed blocks for the next epoch nonce, rejecting duplicate queued nonces, and enforcing the registered block-service key when present.
 - `src/wire.rs` replaces route-based transport with a compact custom protocol: one length-prefixed Borsh `WireRequest` followed by one length-prefixed Borsh `WireResponse`.
+- `src/tcp.rs`, `src/harness.rs`, and `tests/e2e_tcp.rs` make the TCP node path reusable by the production binary, the simulation harness, and the end-to-end test suite.

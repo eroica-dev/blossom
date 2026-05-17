@@ -36,11 +36,16 @@ block/engine services together.
 - `src/local_block.rs`: local signed block queue and build-block helper.
 - `src/runtime.rs`: deployable node runtime over local state, address book, and block intake.
 - `src/wire.rs`: length-prefixed Borsh request/response protocol.
+- `src/tcp.rs`: reusable TCP node server and request client.
 - `src/service_client.rs`: TCP client helpers for block and engine service interactions.
+- `src/harness.rs`: in-process simulation cluster and mock block service.
 - `src/bin/blossom-node.rs`: raw TCP node process.
+- `src/bin/blossom-harness.rs`: local node-behavior simulation runner.
+- `tests/e2e_tcp.rs`: TCP end-to-end coverage for node and service behavior.
 - `paper/`: LaTeX protocol paper source and figure assets used as the architecture reference.
 - `docs/architecture.md`: paper-informed architecture map for the extracted crate.
 - `docs/source-map.md`: source files used for the extraction.
+- `docs/testing.md`: end-to-end testing and harness guide.
 
 ## Run A Node
 
@@ -51,7 +56,7 @@ cargo run --bin blossom-node -- --host 127.0.0.1 --port 8080
 The node generates a keypair if `BLOSSOM_PUBLIC_KEY` and
 `BLOSSOM_SECRET_KEY` are not provided. For a stable deployment, provide
 both values and register external services with `--service` or
-`POST /address-book`.
+`WireRequest::RegisterService`.
 
 ```sh
 cargo run --bin blossom-node -- \
@@ -84,10 +89,26 @@ Borsh-encoded WireRequest
 
 The response uses the same framing with `WireResponse`.
 
+## Run The Harness
+
+```sh
+cargo run --bin blossom-harness -- --nodes 6 --transactions 3
+```
+
+The harness starts local TCP nodes, starts a mock block service, registers
+that service with node 0, submits a signed block, dispatches it, and
+delivers the dispatch to another simulated node.
+
 ## Verify
 
 ```sh
 cargo test
+```
+
+For only the TCP end-to-end suite:
+
+```sh
+cargo test --test e2e_tcp
 ```
 
 ## Notes

@@ -18,7 +18,7 @@ serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.145"
 sha2 = "0.10.9"
 thiserror = "1.0.69"
-tokio = { version = "1.48", features = ["io-util", "macros", "net", "rt-multi-thread", "signal"] }
+tokio = { version = "1.48", features = ["io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
 
 [dev-dependencies]
 env_logger = "0.11.8"

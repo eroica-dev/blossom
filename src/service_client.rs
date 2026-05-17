@@ -1,10 +1,9 @@
-use tokio::net::TcpStream;
-
 use crate::address_book::Service;
 use crate::block::Block;
 use crate::error::{BlossomError, Result};
 use crate::nonce::Nonce;
-use crate::wire::{WireRequest, WireResponse, read_frame, write_frame};
+use crate::tcp::send_wire_request;
+use crate::wire::{WireRequest, WireResponse};
 
 #[derive(Clone, Debug, Default)]
 pub struct TcpServiceClient;
@@ -39,11 +38,9 @@ impl TcpServiceClient {
 }
 
 async fn send(service: &Service, request: WireRequest) -> Result<WireResponse> {
-    let mut stream = TcpStream::connect(service.socket_addr())
+    send_wire_request(service.socket_addr(), request)
         .await
-        .map_err(|err| BlossomError::ExternalService(err.to_string()))?;
-    write_frame(&mut stream, &request).await?;
-    read_frame(&mut stream).await
+        .map_err(|err| BlossomError::ExternalService(err.to_string()))
 }
 
 fn expect_ok(response: WireResponse) -> Result<()> {

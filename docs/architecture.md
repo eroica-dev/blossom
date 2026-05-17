@@ -57,10 +57,14 @@ The current implementation maps that layer to:
   advancement.
 - `src/wire.rs`: length-prefixed Borsh wire protocol for node and
   service requests.
+- `src/tcp.rs`: reusable server/client path used by the node binary,
+  harness, and end-to-end tests.
 - `src/bin/blossom-node.rs`: TCP listener for block intake, message
   intake, dispatch generation, address-book updates, and state.
 - `src/service_client.rs`: TCP helpers for block-service nonce updates
   and block/engine service calls.
+- `src/harness.rs`: simulated cluster and mock block service used to
+  exercise node behavior over real local TCP sockets.
 
 The implemented primary propagation lifecycle is:
 
@@ -127,6 +131,8 @@ validator.
   generation, and protocol message intake.
 - A raw TCP `blossom-node` binary with the initial deployable node
   API.
+- A `blossom-harness` binary and TCP end-to-end test suite for simulated
+  node behavior.
 
 ## Paper-Defined Extensions
 
