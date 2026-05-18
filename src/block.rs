@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::crypto::{PubKey, SecKey, SecretSigner, Signature};
+use crate::encounter::EncounterRecord;
 use crate::error::{BlossomError, Result};
 use crate::hash::{HashType, ProtocolHasher};
 use crate::nonce::Nonce;
@@ -696,6 +697,7 @@ impl Block {
 
     pub fn verify_unsigned_integrity_with_hash(&self, expected_hash: HashType) -> Result<()> {
         self.body.application_state.validate()?;
+        self.body.validate_encounter_records()?;
         self.body.validate_transactions()?;
         let (body_hash, merkle_root) = self.body.hash_and_merkle_root();
         if self.hash != expected_hash || body_hash != expected_hash {
@@ -741,6 +743,7 @@ pub struct BlockBody {
     pub dispatched: u128,
     pub merkle_root: HashType,
     pub application_state: BlockApplicationState,
+    pub encounter_records: Vec<EncounterRecord>,
     pub txs: Vec<Transaction>,
 }
 
@@ -754,6 +757,7 @@ impl Default for BlockBody {
             dispatched: 0,
             merkle_root: HashType::default(),
             application_state: BlockApplicationState::default(),
+            encounter_records: Vec::new(),
             txs: Vec::new(),
         }
     }
@@ -831,6 +835,10 @@ impl BlockBody {
         bytes.extend_from_slice(self.merkle_root.as_ref());
         bytes.extend_from_slice(&(self.application_state.len() as u64).to_le_bytes());
         bytes.extend_from_slice(self.application_state.as_slice());
+        bytes.extend_from_slice(&(self.encounter_records.len() as u64).to_le_bytes());
+        for record in &self.encounter_records {
+            record.append_bytes_to(bytes);
+        }
         for tx in &self.txs {
             bytes.extend_from_slice(tx.hash.as_ref());
             bytes.extend_from_slice(&(tx.canonical_payload_encoded_len() as u64).to_le_bytes());
@@ -846,6 +854,12 @@ impl BlockBody {
             + 32
             + 8
             + self.application_state.len()
+            + 8
+            + self
+                .encounter_records
+                .iter()
+                .map(EncounterRecord::encoded_len)
+                .sum::<usize>()
             + self
                 .txs
                 .iter()
@@ -863,6 +877,10 @@ impl BlockBody {
         hasher.update(self.merkle_root.as_ref());
         hasher.update((self.application_state.len() as u64).to_le_bytes());
         hasher.update(self.application_state.as_slice());
+        hasher.update((self.encounter_records.len() as u64).to_le_bytes());
+        for record in &self.encounter_records {
+            record.update_hash(&mut hasher);
+        }
         for tx in &self.txs {
             hasher.update(tx.hash.as_ref());
             hasher.update((tx.canonical_payload_encoded_len() as u64).to_le_bytes());
@@ -882,6 +900,10 @@ impl BlockBody {
         body_hasher.update(self.merkle_root.as_ref());
         body_hasher.update((self.application_state.len() as u64).to_le_bytes());
         body_hasher.update(self.application_state.as_slice());
+        body_hasher.update((self.encounter_records.len() as u64).to_le_bytes());
+        for record in &self.encounter_records {
+            record.update_hash(&mut body_hasher);
+        }
         for tx in &self.txs {
             body_hasher.update(tx.hash.as_ref());
             body_hasher.update((tx.canonical_payload_encoded_len() as u64).to_le_bytes());
@@ -893,6 +915,16 @@ impl BlockBody {
 
     pub fn compute_merkle_root(&self) -> HashType {
         HashType::hash_slices(self.txs.iter().map(|tx| tx.hash.as_ref()))
+    }
+
+    fn validate_encounter_records(&self) -> Result<()> {
+        for record in &self.encounter_records {
+            if record.body.observer != self.validator {
+                return Err(BlossomError::UnknownSender);
+            }
+            record.verify()?;
+        }
+        Ok(())
     }
 
     fn validate_transactions(&self) -> Result<()> {
@@ -928,6 +960,9 @@ fn now_micros() -> u128 {
 mod tests {
     use super::*;
     use crate::crypto::Keypair;
+    use crate::encounter::{
+        EncounterOutcome, EncounterPhase, EncounterRecord, EncounterRecordBody,
+    };
 
     #[test]
     fn block_signature_round_trip() {
@@ -997,6 +1032,80 @@ mod tests {
             tampered.verify_integrity(),
             Err(BlossomError::InvalidBlockHash)
         );
+    }
+
+    #[test]
+    fn encounter_records_are_signed_and_hash_committed() {
+        let observer = Keypair::generate();
+        let subject = Keypair::generate();
+        let record = EncounterRecord::signed(
+            EncounterRecordBody::new(
+                observer.public,
+                subject.public,
+                HashType([4; 32]),
+                Nonce::new(2),
+                1,
+                EncounterPhase::Verification,
+                EncounterOutcome::MissingSignature,
+            )
+            .with_evidence_hash(HashType::hash(b"dispatch timeout")),
+            &observer.signer(),
+        )
+        .unwrap();
+
+        let mut block = Block::default();
+        block.body.encounter_records.push(record.clone());
+        block.sign(&observer.secret);
+
+        assert!(block.verify_integrity().is_ok());
+        assert!(
+            block
+                .body
+                .to_bytes()
+                .windows(record.signature.0.len())
+                .any(|window| window == record.signature.0.as_slice())
+        );
+
+        let without_record_hash = {
+            let mut empty = block.clone();
+            empty.body.encounter_records.clear();
+            empty.seal();
+            empty.hash
+        };
+        assert_ne!(block.hash, without_record_hash);
+
+        let mut tampered = block.clone();
+        tampered.body.encounter_records[0].body.outcome = EncounterOutcome::InvalidSignature;
+        tampered.set_hash();
+        assert_eq!(
+            tampered.verify_unsigned_integrity(),
+            Err(BlossomError::SignatureError)
+        );
+    }
+
+    #[test]
+    fn encounter_records_must_be_observed_by_block_validator() {
+        let observer = Keypair::generate();
+        let validator = Keypair::generate();
+        let record = EncounterRecord::signed(
+            EncounterRecordBody::new(
+                observer.public,
+                PubKey([8; 32]),
+                HashType::default(),
+                Nonce::new(1),
+                0,
+                EncounterPhase::Verification,
+                EncounterOutcome::MissingSignature,
+            ),
+            &observer.signer(),
+        )
+        .unwrap();
+
+        let mut block = Block::default();
+        block.body.encounter_records.push(record);
+        block.sign(&validator.secret);
+
+        assert_eq!(block.verify_integrity(), Err(BlossomError::UnknownSender));
     }
 
     #[test]

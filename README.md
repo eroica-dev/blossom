@@ -17,6 +17,8 @@ node surface:
   data.
 - Bounded opaque application state in each block header for piggy-backed
   coordination signals.
+- Signed encounter evidence for missing or invalid peer signatures, plus
+  opt-in epoch-boundary verifier removal from supermajority evidence.
 - Address book and service registration for block, engine, consensus, relay, and address-book services.
 - Overlay runtime APIs for address-book-backed fan-out without starting
   the epoch state machine.
@@ -57,6 +59,8 @@ block/engine services together.
   used by dispatch verification.
 - `src/address_book.rs`: service registry copied from the Eden runtime shape.
 - `src/local_block.rs`: local signed block queue and build-block helper.
+- `src/encounter.rs`: signed participation evidence for missing or invalid peer signatures.
+- `src/membership.rs`: opt-in deterministic verifier removal from committed encounter evidence.
 - `src/overlay.rs`: overlay runtime, fan-out strategies, and broadcast reports.
 - `src/runtime.rs`: deployable node runtime over local state, address book, and block intake.
 - `src/wire.rs`: length-prefixed Borsh request/response protocol.
@@ -338,6 +342,35 @@ Under full consensus, committed blocks give every node the same
 application-state snapshots in the same epoch order. Overlay-only mode does
 not commit blocks, so this ordered piggy-backed state channel is a consensus
 runtime feature.
+
+## Encounter Evidence And Node Removal
+
+Consensus nodes can publish signed encounter records in their next block.
+These records are protocol evidence, not membership state: they say that an
+observer expected a peer signature for a consensus phase and either did not see
+one or saw one that failed verification. The observer signs the record, and the
+block hash commits it.
+
+```rust
+use blossom::{ConsensusNodeRemovalPolicy, EncounterPhase, RuntimeConfig};
+
+let mut config = RuntimeConfig::new(self_node);
+config.consensus_node_removal_policy = ConsensusNodeRemovalPolicy::supermajority();
+
+let runtime = blossom::NodeRuntime::new(config);
+runtime.record_missing_signature(peer_key, 0, EncounterPhase::Verification, observed_at_micros)?;
+```
+
+Removal is disabled by default. When enabled, it happens only while advancing
+an epoch and only from committed blocks in that epoch. A subject is removed when
+current verifiers provide supermajority evidence for the same subject. Unknown
+observers, unknown subjects, self-accusations, stale epoch/nonce records,
+duplicate observer records, and invalid encounter signatures are ignored.
+
+`ConsensusNodeRemovalPolicy::supermajority()` removes at most one verifier per
+epoch by default. Operators can raise the evidence threshold, cap removals, or
+set a minimum retained verifier count. The evidence threshold cannot be lowered
+below the current verifier-set supermajority.
 
 ## Run The Harness
 

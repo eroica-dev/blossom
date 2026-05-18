@@ -164,6 +164,30 @@ representation. The default build remains SHA-256, and the verified
 protocol should use the default unless the operator explicitly accepts
 non-cryptographic hash commitments.
 
+### Encounter Evidence And Membership Pruning
+
+Encounter records are the protocol's evidence layer for peer participation
+failures. A validator can include signed records in its next block saying that a
+subject missed an expected consensus-phase signature or produced an invalid
+signature. The record is independently signed by the observer and hash-committed
+inside the block body, so other validators can verify who made the claim and
+which epoch/nonce/round/phase it refers to.
+
+Membership pruning is a deterministic reducer over committed encounter records,
+not a separate reputation state. During epoch advancement, the reducer examines
+the verified blocks that will become the new epoch body. If
+`RuntimeConfig::consensus_node_removal_policy` is enabled, a subject is removed
+from the next epoch's verifier set only when current verifiers provide
+supermajority failure evidence for that subject. Stale records, unknown
+observers, unknown subjects, self-accusations, duplicate observer records, and
+invalid encounter signatures do not count.
+
+The default policy is disabled. `ConsensusNodeRemovalPolicy::supermajority()`
+enables the conservative path: supermajority evidence, at most one removal per
+epoch, and a configurable minimum retained verifier count. Deployments can
+raise the required observer count but cannot lower it below the current
+verifier-set supermajority.
+
 ### Transaction Validation
 
 After block propagation, the paper expects all non-Byzantine validators
@@ -234,6 +258,8 @@ channel is available only in the consensus runtime.
 - Direct point-to-point ping/pong liveness requests.
 - Overlay runtime and runtime broadcast APIs using the quorum topology.
 - Bounded block application-state payloads for piggy-backed coordination.
+- Signed encounter records for missing or invalid consensus-phase signatures.
+- Opt-in epoch-boundary verifier removal from committed supermajority evidence.
 - Primary dispatch, echo, verification, proposal, and commit message
   flow.
 - Local consensus, temporary quorum state, and epoch chain structures.
@@ -262,7 +288,8 @@ architecture, but is not part of this extraction yet:
 
 - Request/response recovery for blocks missing after a failed quorum.
 - Restate/reinitialization after failed global finality.
-- Byzantine pruning policy.
+- Additional Byzantine-pruning policy hooks beyond signed participation
+  evidence, such as richer application-defined slashing rules.
 - Full transaction tagging, derivative epoch hashing, and append-only
   ledger application.
 - Durable node discovery, storage, metrics, and production deployment

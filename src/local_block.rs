@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::block::{Block, BlockApplicationState, Transaction};
 use crate::crypto::{PubKey, SecKey};
+use crate::encounter::EncounterRecord;
 use crate::error::{BlossomError, Result};
 use crate::hash::HashType;
 use crate::nonce::Nonce;
@@ -15,6 +16,7 @@ pub struct LocalBlock {
     pub block_deque: VecDeque<Block>,
     pub block_cap: usize,
     pub application_state: BlockApplicationState,
+    pub encounter_records: Vec<EncounterRecord>,
 }
 
 impl LocalBlock {
@@ -24,6 +26,7 @@ impl LocalBlock {
             block_deque: VecDeque::new(),
             block_cap,
             application_state: BlockApplicationState::default(),
+            encounter_records: Vec::new(),
         }
     }
 
@@ -34,6 +37,21 @@ impl LocalBlock {
 
     pub fn application_state(&self) -> &BlockApplicationState {
         &self.application_state
+    }
+
+    pub fn add_encounter_record(&mut self, record: EncounterRecord) -> Result<HashType> {
+        record.verify()?;
+        let hash = record.hash();
+        self.encounter_records.push(record);
+        Ok(hash)
+    }
+
+    pub fn encounter_records(&self) -> &[EncounterRecord] {
+        &self.encounter_records
+    }
+
+    pub fn take_encounter_records(&mut self) -> Vec<EncounterRecord> {
+        mem::take(&mut self.encounter_records)
     }
 
     pub fn add_transaction(&mut self, tx: Transaction) -> HashType {
@@ -51,12 +69,14 @@ impl LocalBlock {
         self.build_block.body.last_epoch = last_epoch;
         self.build_block.body.nonce = nonce;
         self.build_block.body.application_state = self.application_state.clone();
+        self.build_block.body.encounter_records = self.encounter_records.clone();
         self.build_block.sign(secret_key);
 
         self.ensure_enqueueable(&self.build_block)?;
         let hash = self.build_block.hash;
         let block = mem::take(&mut self.build_block);
         self.block_deque.push_back(block);
+        self.encounter_records.clear();
         Ok(hash)
     }
 

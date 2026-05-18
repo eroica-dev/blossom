@@ -19,10 +19,12 @@ use crate::blossom::{
     EpochStarted, Header, Proposal, SignatureTree, Verification,
 };
 use crate::crypto::{PubKey, SecretSigner, Signature};
+use crate::encounter::{EncounterOutcome, EncounterPhase, EncounterRecord, EncounterRecordBody};
 use crate::error::{BlossomError, Result};
 use crate::group::ConsensusGroupId;
 use crate::hash::{DoHash, HashType};
 use crate::local_block::LocalBlock;
+use crate::membership::ConsensusNodeRemovalPolicy;
 use crate::messages::{MSGKey, Msg};
 use crate::node::NodeIdentity;
 use crate::nonce::Nonce;
@@ -31,7 +33,8 @@ use crate::overlay::{
     select_fanout_targets,
 };
 use crate::state::{
-    Epoch, EpochBody, LocalState, PendingDispatch, configured_max_pending_raw_dispatch_bytes,
+    Epoch, EpochBody, LocalState, PendingDispatch, TempQuorum,
+    configured_max_pending_raw_dispatch_bytes,
     configured_max_pending_raw_dispatch_bytes_per_sender,
 };
 use crate::wire::{HotDispatch, WireRequest};
@@ -45,6 +48,7 @@ pub struct RuntimeConfig {
     pub block_cap: usize,
     pub trust_mode: TrustMode,
     pub mode: RuntimeMode,
+    pub consensus_node_removal_policy: ConsensusNodeRemovalPolicy,
 }
 
 impl RuntimeConfig {
@@ -57,6 +61,7 @@ impl RuntimeConfig {
             block_cap: 100,
             trust_mode: TrustMode::Verified,
             mode: RuntimeMode::Consensus,
+            consensus_node_removal_policy: ConsensusNodeRemovalPolicy::disabled(),
         }
     }
 
@@ -150,6 +155,14 @@ pub struct PeerApplicationState {
     pub application_state: BlockApplicationState,
 }
 
+#[derive(Serialize, Deserialize, BorshSerialize, BorshDeserialize, Debug, Clone, PartialEq, Eq)]
+pub struct ObservedEncounterRecord {
+    pub group_id: ConsensusGroupId,
+    pub block_hash: HashType,
+    pub block_validator: PubKey,
+    pub record: EncounterRecord,
+}
+
 impl NodeRuntime {
     pub fn new(mut config: RuntimeConfig) -> Self {
         let signer = config.self_node.signer().ok();
@@ -168,7 +181,11 @@ impl NodeRuntime {
         Self {
             inner: Arc::new(RuntimeInner {
                 group_id,
-                state: RwLock::new(LocalState::new(config.self_node, genesis)),
+                state: RwLock::new(LocalState::new_with_consensus_node_removal_policy(
+                    config.self_node,
+                    genesis,
+                    config.consensus_node_removal_policy,
+                )),
                 local_blocks: RwLock::new(LocalBlock::new(config.block_cap)),
                 #[cfg(feature = "availability-gossip")]
                 availability: RwLock::new(AvailabilityStore::default()),
@@ -264,6 +281,167 @@ impl NodeRuntime {
             .expect("block lock poisoned")
             .application_state()
             .clone()
+    }
+
+    /// Adds a signed encounter record to the next locally dispatched block.
+    ///
+    /// Encounter records are protocol-owned evidence, not membership state.
+    /// They are hash-committed into the block and independently signed by the
+    /// observing node.
+    pub fn add_encounter_record(&self, record: EncounterRecord) -> Result<HashType> {
+        self.ensure_consensus_mode("add encounter record")?;
+        let self_key = self.self_node().public_key();
+        if record.body.observer != self_key {
+            return Err(BlossomError::KeyMismatch);
+        }
+        self.inner
+            .local_blocks
+            .write()
+            .expect("block lock poisoned")
+            .add_encounter_record(record)
+    }
+
+    pub fn sign_encounter_record(
+        &self,
+        subject: PubKey,
+        round: u8,
+        phase: EncounterPhase,
+        outcome: EncounterOutcome,
+        evidence_hash: Option<HashType>,
+        observed_at_micros: u128,
+    ) -> Result<EncounterRecord> {
+        self.ensure_consensus_mode("sign encounter record")?;
+        let self_node = self.self_node();
+        let target = self.next_epoch_target()?;
+        let mut body = EncounterRecordBody::new(
+            self_node.public_key(),
+            subject,
+            target.last_epoch,
+            target.nonce,
+            round,
+            phase,
+            outcome,
+        )
+        .observed_at_micros(observed_at_micros);
+        body.evidence_hash = evidence_hash;
+
+        match self.inner.signer.as_ref() {
+            Some(signer) => EncounterRecord::signed(body, signer),
+            None => {
+                let secret_key = self_node.secret_key.ok_or(BlossomError::MissingSecretKey)?;
+                EncounterRecord::signed(body, &SecretSigner::new(secret_key))
+            }
+        }
+    }
+
+    pub fn record_encounter(
+        &self,
+        subject: PubKey,
+        round: u8,
+        phase: EncounterPhase,
+        outcome: EncounterOutcome,
+        evidence_hash: Option<HashType>,
+        observed_at_micros: u128,
+    ) -> Result<HashType> {
+        let record = self.sign_encounter_record(
+            subject,
+            round,
+            phase,
+            outcome,
+            evidence_hash,
+            observed_at_micros,
+        )?;
+        self.add_encounter_record(record)
+    }
+
+    pub fn record_missing_signature(
+        &self,
+        subject: PubKey,
+        round: u8,
+        phase: EncounterPhase,
+        observed_at_micros: u128,
+    ) -> Result<HashType> {
+        self.record_encounter(
+            subject,
+            round,
+            phase,
+            EncounterOutcome::MissingSignature,
+            None,
+            observed_at_micros,
+        )
+    }
+
+    /// Returns round members that have not produced a signed message for the
+    /// requested consensus phase, from this node's current local view.
+    pub fn missing_signature_subjects(
+        &self,
+        round: u8,
+        phase: EncounterPhase,
+    ) -> Result<Vec<PubKey>> {
+        self.ensure_consensus_mode("inspect missing signatures")?;
+        let target = self.next_epoch_target()?;
+        let mut state = self.inner.state.write().expect("state lock poisoned");
+        let consensus = state.get_mut_consensus(&target.last_epoch, target.nonce);
+        let mut missing = consensus.peers(round);
+        let Some(quorum) = consensus.quorum.get(&round) else {
+            return Ok(missing);
+        };
+
+        missing.retain(|subject| !quorum_has_signature_from(quorum, *subject, phase));
+        Ok(missing)
+    }
+
+    /// Queues signed missing-signature records for every expected peer that has
+    /// not produced a signed message for the requested phase.
+    pub fn record_missing_signatures(
+        &self,
+        round: u8,
+        phase: EncounterPhase,
+        observed_at_micros: u128,
+    ) -> Result<Vec<HashType>> {
+        let subjects = self.missing_signature_subjects(round, phase)?;
+        subjects
+            .into_iter()
+            .map(|subject| self.record_missing_signature(subject, round, phase, observed_at_micros))
+            .collect()
+    }
+
+    pub fn pending_encounter_records(&self) -> Vec<EncounterRecord> {
+        self.inner
+            .local_blocks
+            .read()
+            .expect("block lock poisoned")
+            .encounter_records()
+            .to_vec()
+    }
+
+    /// Returns signed encounter evidence observed in committed or verified
+    /// blocks. This is intentionally just evidence; membership decisions should
+    /// be derived by a deterministic reducer over committed records.
+    pub fn observed_encounter_records(&self) -> Vec<ObservedEncounterRecord> {
+        let state = self.inner.state.read().expect("state lock poisoned");
+        let mut records = Vec::new();
+
+        for epoch in &state.epochchain.epochchain {
+            for (block_hash, block) in &epoch.body.blocks {
+                record_observed_encounters(&mut records, epoch.body.group_id, *block_hash, block);
+            }
+        }
+
+        for consensus in state.consensus.values() {
+            for quorum in consensus.quorum.values() {
+                for (block_hash, block) in &quorum.verified_blocks {
+                    record_observed_encounters(
+                        &mut records,
+                        self.inner.group_id,
+                        *block_hash,
+                        block,
+                    );
+                }
+            }
+        }
+
+        records
     }
 
     /// Returns the latest verified or committed application state observed for
@@ -739,7 +917,7 @@ impl NodeRuntime {
         let self_node = self.self_node();
         let block_service = self.block_service();
 
-        let (maybe_block, application_state) = {
+        let (maybe_block, application_state, encounter_records) = {
             let mut local_blocks = self
                 .inner
                 .local_blocks
@@ -751,12 +929,21 @@ impl NodeRuntime {
                 target.nonce,
                 round,
             )?;
-            (maybe_block, local_blocks.application_state().clone())
+            let encounter_records = if maybe_block.is_none() {
+                local_blocks.take_encounter_records()
+            } else {
+                Vec::new()
+            };
+            (
+                maybe_block,
+                local_blocks.application_state().clone(),
+                encounter_records,
+            )
         };
 
         let block = match maybe_block {
             Some(block) => block,
-            None => self.empty_block(&self_node, &target, application_state)?,
+            None => self.empty_block(&self_node, &target, application_state, encounter_records)?,
         };
         #[cfg(feature = "availability-gossip")]
         self.store_filtered_payloads_from_block(&block)?;
@@ -920,6 +1107,7 @@ impl NodeRuntime {
             message.header.nonce,
             message.header.round,
         );
+        quorum.commit_senders.insert(message.header.sender);
         quorum.commit_sent = quorum.commit_sent || message.body.consensus;
         Ok(MessageReceipt::accepted("commit"))
     }
@@ -930,11 +1118,14 @@ impl NodeRuntime {
         if message.header.verify_header(&mut state) == Some(false) {
             return Err(BlossomError::UnknownSender);
         }
-        state.get_mut_quorum(
-            &message.header.last_epoch,
-            message.header.nonce,
-            message.header.round,
-        );
+        state
+            .get_mut_quorum(
+                &message.header.last_epoch,
+                message.header.nonce,
+                message.header.round,
+            )
+            .epoch_started_senders
+            .insert(message.header.sender);
         Ok(MessageReceipt::accepted("epoch_started"))
     }
 
@@ -988,11 +1179,13 @@ impl NodeRuntime {
         self_node: &NodeIdentity,
         target: &EpochTarget,
         application_state: BlockApplicationState,
+        encounter_records: Vec<EncounterRecord>,
     ) -> Result<Block> {
         let mut block = Block::default();
         block.body.last_epoch = target.last_epoch;
         block.body.nonce = target.nonce;
         block.body.application_state = application_state;
+        block.body.encounter_records = encounter_records;
         if self.inner.trust_mode.is_trusted() {
             block.seal_unsigned(self_node.public_key());
             return Ok(block);
@@ -1188,6 +1381,33 @@ fn record_peer_application_state(
     }
 }
 
+fn record_observed_encounters(
+    records: &mut Vec<ObservedEncounterRecord>,
+    group_id: ConsensusGroupId,
+    block_hash: HashType,
+    block: &Block,
+) {
+    records.extend(block.body.encounter_records.iter().cloned().map(|record| {
+        ObservedEncounterRecord {
+            group_id,
+            block_hash,
+            block_validator: block.body.validator,
+            record,
+        }
+    }));
+}
+
+fn quorum_has_signature_from(quorum: &TempQuorum, subject: PubKey, phase: EncounterPhase) -> bool {
+    match phase {
+        EncounterPhase::Dispatch => quorum.received_dispatches.contains(&subject),
+        EncounterPhase::Verification => quorum.verifications.verifications.contains_key(&subject),
+        EncounterPhase::Proposal => quorum.proposals.proposals.contains_key(&subject),
+        EncounterPhase::Commit => quorum.commit_senders.contains(&subject),
+        EncounterPhase::EpochStarted => quorum.epoch_started_senders.contains(&subject),
+        EncounterPhase::CatchUp => false,
+    }
+}
+
 impl MessageReceipt {
     fn accepted(kind: impl Into<String>) -> Self {
         Self {
@@ -1229,7 +1449,7 @@ mod tests {
 
     #[cfg(feature = "availability-gossip")]
     use crate::FilteredPayloadDeliveryItem;
-    use crate::blossom::DispatchBody;
+    use crate::blossom::{DispatchBody, VerificationBody};
     use crate::crypto::Keypair;
 
     fn runtime() -> (NodeRuntime, Keypair) {
@@ -1841,6 +2061,119 @@ mod tests {
     }
 
     #[test]
+    fn missing_signature_encounter_is_added_to_next_empty_block() {
+        let (runtime, keypairs, target) = runtime_with_peers();
+        let subject = keypairs[1].public;
+
+        let record_hash = runtime
+            .record_missing_signature(subject, 0, EncounterPhase::Verification, 123)
+            .unwrap();
+
+        assert_ne!(record_hash, HashType::default());
+        assert_eq!(runtime.pending_encounter_records().len(), 1);
+
+        let dispatch = runtime.dispatch_local_block(0).unwrap();
+        let block = dispatch.body.blocks.values().next().unwrap();
+        assert_eq!(block.body.last_epoch, target.last_epoch);
+        assert_eq!(block.body.nonce, target.nonce);
+        assert_eq!(block.body.encounter_records.len(), 1);
+        assert_eq!(
+            block.body.encounter_records[0].body.observer,
+            keypairs[0].public
+        );
+        assert_eq!(block.body.encounter_records[0].body.subject, subject);
+        assert_eq!(
+            block.body.encounter_records[0].body.phase,
+            EncounterPhase::Verification
+        );
+        assert_eq!(
+            block.body.encounter_records[0].body.outcome,
+            EncounterOutcome::MissingSignature
+        );
+        assert_eq!(block.body.encounter_records[0].body.evidence_hash, None);
+        assert!(block.body.encounter_records[0].verify().is_ok());
+        assert!(block.verify_integrity().is_ok());
+        assert!(runtime.pending_encounter_records().is_empty());
+    }
+
+    #[test]
+    fn missing_signature_subjects_compare_expected_quorum_to_seen_signatures() {
+        let (runtime, keypairs, target) = runtime_with_peers();
+        let signer = {
+            let mut state = runtime.inner.state.write().expect("state lock poisoned");
+            let sender = state
+                .get_mut_consensus(&target.last_epoch, target.nonce)
+                .peers(0)
+                .into_iter()
+                .next()
+                .expect("round should include a peer");
+            keypairs
+                .iter()
+                .find(|keypair| keypair.public == sender)
+                .unwrap()
+                .clone()
+        };
+        let body = VerificationBody {
+            blocks_hash: HashType([7; 32]),
+            blocks: BTreeMap::new(),
+        };
+        let signature_hash = Header::signature_hash_for_body(
+            &signer.public,
+            &target.last_epoch,
+            target.nonce,
+            0,
+            MSGKey::Verification,
+            &body,
+        );
+        let verification = Verification {
+            header: Header {
+                sender: signer.public,
+                last_epoch: target.last_epoch,
+                nonce: target.nonce,
+                round: 0,
+                signature: signer.signer().sign(signature_hash.as_ref()),
+            },
+            body,
+        };
+
+        runtime
+            .receive_message(Msg::Verification(verification))
+            .unwrap();
+
+        let missing = runtime
+            .missing_signature_subjects(0, EncounterPhase::Verification)
+            .unwrap();
+        assert!(!missing.contains(&signer.public));
+        assert_eq!(missing.len(), 4);
+    }
+
+    #[test]
+    fn record_missing_signatures_queues_evidence_for_absent_signers() {
+        let (runtime, keypairs, target) = runtime_with_peers();
+        let expected_missing = {
+            let mut state = runtime.inner.state.write().expect("state lock poisoned");
+            state
+                .get_mut_consensus(&target.last_epoch, target.nonce)
+                .peers(0)
+        };
+
+        let hashes = runtime
+            .record_missing_signatures(0, EncounterPhase::Dispatch, 456)
+            .unwrap();
+
+        assert_eq!(hashes.len(), expected_missing.len());
+        let records = runtime.pending_encounter_records();
+        assert_eq!(records.len(), expected_missing.len());
+        for record in records {
+            assert_eq!(record.body.observer, keypairs[0].public);
+            assert!(expected_missing.contains(&record.body.subject));
+            assert_eq!(record.body.outcome, EncounterOutcome::MissingSignature);
+            assert_eq!(record.body.phase, EncounterPhase::Dispatch);
+            assert!(record.verify().is_ok());
+        }
+    }
+
+    #[test]
     fn receive_message_rejects_unknown_sender_and_bad_signature() {
         let (runtime, keypairs, target) = runtime_with_peers();
         let unknown = Keypair::generate();
@@ -1978,6 +2311,47 @@ mod tests {
         assert_eq!(state.last_epoch, target.last_epoch);
         assert_eq!(state.nonce, target.nonce);
         assert_eq!(state.application_state.as_slice(), b"v1:cache-pressure=low");
+    }
+
+    #[test]
+    fn observed_encounter_records_reports_verified_peer_blocks() {
+        let (runtime, keypairs, target) = runtime_with_peers();
+        let observer = &keypairs[1];
+        let subject = keypairs[2].public;
+        let record = EncounterRecord::signed(
+            EncounterRecordBody::new(
+                observer.public,
+                subject,
+                target.last_epoch,
+                target.nonce,
+                0,
+                EncounterPhase::Verification,
+                EncounterOutcome::MissingSignature,
+            ),
+            &observer.signer(),
+        )
+        .unwrap();
+        let mut block = Block::default();
+        block.body.last_epoch = target.last_epoch;
+        block.body.nonce = target.nonce;
+        block.body.encounter_records.push(record.clone());
+        block.sign(&observer.secret);
+        assert!(block.verify_integrity().is_ok());
+
+        {
+            let mut state = runtime.inner.state.write().expect("state lock poisoned");
+            state
+                .get_mut_quorum(&target.last_epoch, target.nonce, 0)
+                .verified_blocks
+                .insert(block.hash, block.clone());
+        }
+
+        let records = runtime.observed_encounter_records();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].group_id, target.group_id);
+        assert_eq!(records[0].block_hash, block.hash);
+        assert_eq!(records[0].block_validator, observer.public);
+        assert_eq!(records[0].record, record);
     }
 
     #[test]

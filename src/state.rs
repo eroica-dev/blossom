@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::env;
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
@@ -18,6 +18,7 @@ use crate::crypto::{PubKey, Signature};
 use crate::error::{BlossomError, Result};
 use crate::group::ConsensusGroupId;
 use crate::hash::{DoHash, HashType};
+use crate::membership::{ConsensusNodeRemovalPolicy, apply_epoch_membership_transition};
 use crate::node::{NodeIdentity, NodeType};
 use crate::nonce::Nonce;
 use crate::register::MessageMatrix;
@@ -37,10 +38,23 @@ pub struct LocalState {
     pub epochchain: EpochChain,
     pub consensus: HashMap<EpochNonce, TempConsensus>,
     pub nonce: Nonce,
+    pub consensus_node_removal_policy: ConsensusNodeRemovalPolicy,
 }
 
 impl LocalState {
     pub fn new(self_node: NodeIdentity, genesis: Epoch) -> Self {
+        Self::new_with_consensus_node_removal_policy(
+            self_node,
+            genesis,
+            ConsensusNodeRemovalPolicy::disabled(),
+        )
+    }
+
+    pub fn new_with_consensus_node_removal_policy(
+        self_node: NodeIdentity,
+        genesis: Epoch,
+        consensus_node_removal_policy: ConsensusNodeRemovalPolicy,
+    ) -> Self {
         Self {
             self_node,
             epochchain: EpochChain {
@@ -48,6 +62,7 @@ impl LocalState {
             },
             consensus: HashMap::new(),
             nonce: Nonce::default(),
+            consensus_node_removal_policy,
         }
     }
 
@@ -140,12 +155,21 @@ impl LocalState {
         let mut new_epoch = if consensus {
             let quorum = current_consensus.quorum.get(&current_round).unwrap();
             let blocks = quorum.verified_blocks.clone();
+            // Membership changes are derived only from the block set this
+            // consensus round is committing into the next epoch.
+            let (verifiers, _) = apply_epoch_membership_transition(
+                &last_epoch.body.verifiers,
+                &blocks,
+                *proposed_last_epoch_hash,
+                expected_nonce,
+                self.consensus_node_removal_policy,
+            );
             Epoch {
                 hash: HashType::default(),
                 signatures: BTreeMap::default(),
                 body: EpochBody {
                     group_id: last_epoch.body.group_id,
-                    verifiers: last_epoch.body.verifiers.clone(),
+                    verifiers,
                     last_epoch: *proposed_last_epoch_hash,
                     nonce: expected_nonce,
                     merkle_root: block_merkle_root(&blocks),
@@ -366,7 +390,9 @@ pub struct TempQuorum {
     pub verification_sent: bool,
     pub proposals: PropCount,
     pub proposal_sent: bool,
+    pub commit_senders: BTreeSet<PubKey>,
     pub commit_sent: bool,
+    pub epoch_started_senders: BTreeSet<PubKey>,
     pub round_status: Option<u128>,
     pub timers: Timers,
     pub msg_matrix: MessageMatrix,
@@ -746,7 +772,9 @@ pub fn init_quorum(quorum: u32, peers: &[PubKey], self_key: &PubKey) -> TempQuor
         verification_sent: false,
         proposals: init_proposals(quorum),
         proposal_sent: false,
+        commit_senders: BTreeSet::new(),
         commit_sent: false,
+        epoch_started_senders: BTreeSet::new(),
         round_status: None,
         timers: Default::default(),
         msg_matrix: MessageMatrix::new(peers, self_key),
@@ -817,6 +845,10 @@ mod tests {
         VerificationBody,
     };
     use crate::crypto::{Keypair, Signature};
+    use crate::encounter::{
+        EncounterOutcome, EncounterPhase, EncounterRecord, EncounterRecordBody,
+    };
+    use crate::membership::ConsensusNodeRemovalPolicy;
     use crate::messages::Msg;
     use crate::wire::{EncodedFrame, FRAME_PREFIX_BYTES, WireRequest, WireRequestFrame};
 
@@ -1107,6 +1139,77 @@ mod tests {
         assert_eq!(latest.body.last_epoch, genesis.hash);
         assert_eq!(latest.body.nonce, next_nonce);
         assert!(latest.body.blocks.contains_key(&block_hash));
+    }
+
+    #[test]
+    fn advance_epoch_removes_node_with_supermajority_failure_evidence() {
+        let keypairs = (0..6).map(|_| Keypair::generate()).collect::<Vec<_>>();
+        let mut verifiers = IndexTreeMap::new();
+        for (index, keypair) in keypairs.iter().enumerate() {
+            let node = NodeIdentity::new(
+                keypair.public,
+                None,
+                "tcp",
+                format!("node-{index}"),
+                8000 + index as u16,
+                false,
+            );
+            verifiers.insert(node.public_key(), node);
+        }
+        let mut genesis = Epoch {
+            body: EpochBody {
+                verifiers,
+                nonce: Nonce::new(0),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        genesis.set_hash();
+
+        let mut state = LocalState::new_with_consensus_node_removal_policy(
+            NodeIdentity::new(
+                keypairs[0].public,
+                Some(keypairs[0].secret),
+                "tcp",
+                "node-0",
+                8000,
+                false,
+            ),
+            genesis.clone(),
+            ConsensusNodeRemovalPolicy::supermajority(),
+        );
+        let next_nonce = genesis.body.nonce.new_next();
+        let subject = keypairs[5].public;
+
+        for observer in &keypairs[..4] {
+            let record = EncounterRecord::signed(
+                EncounterRecordBody::new(
+                    observer.public,
+                    subject,
+                    genesis.hash,
+                    next_nonce,
+                    0,
+                    EncounterPhase::Verification,
+                    EncounterOutcome::MissingSignature,
+                ),
+                &observer.signer(),
+            )
+            .unwrap();
+            let mut block = Block::default();
+            block.body.last_epoch = genesis.hash;
+            block.body.nonce = next_nonce;
+            block.body.encounter_records.push(record);
+            block.sign(&observer.secret);
+            state
+                .get_mut_quorum(&genesis.hash, next_nonce, 0)
+                .verified_blocks
+                .insert(block.hash, block);
+        }
+
+        assert!(state.advance_epoch(&genesis.hash, next_nonce, 0, true));
+        let latest = state.epochchain.epochchain.last().unwrap();
+        assert!(!latest.body.verifiers.contains_key(&subject));
+        assert_eq!(latest.body.verifiers.len(), 5);
     }
 
     #[test]

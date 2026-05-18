@@ -35,6 +35,15 @@ impl Keypair {
     pub fn signer(&self) -> SecretSigner {
         SecretSigner::new(self.secret)
     }
+
+    pub fn from_secret(secret: SecKey) -> Self {
+        let signing_key = SigningKey::from_bytes(secret.as_array());
+        let verifying_key = VerifyingKey::from(&signing_key);
+        Self {
+            public: PubKey(verifying_key.to_bytes()),
+            secret,
+        }
+    }
 }
 
 #[derive(

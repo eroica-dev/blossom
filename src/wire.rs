@@ -18,6 +18,10 @@ use crate::block::{Block, BlockApplicationState, BlockBody, Transaction};
 use crate::block::{FilteredDeliveryPolicy, FilteredPayloadView, FilteredTransactionSlot};
 use crate::blossom::{Dispatch, DispatchBody, Header, SignatureTree, SignaturesForHash};
 use crate::crypto::{PubKey, Signature};
+use crate::encounter::{
+    ENCOUNTER_RECORD_ENCODED_LEN, EncounterOutcome, EncounterPhase, EncounterRecord,
+    EncounterRecordBody,
+};
 use crate::error::{BlossomError, Result};
 use crate::group::ConsensusGroupId;
 use crate::hash::HashType;
@@ -920,6 +924,8 @@ fn block_body_wire_len(body: &BlockBody) -> Result<usize> {
         4,
         body.application_state.len(),
         4,
+        checked_mul(body.encounter_records.len(), ENCOUNTER_RECORD_ENCODED_LEN)?,
+        4,
         body.txs.iter().try_fold(0usize, |sum, tx| {
             checked_sum([sum, transaction_wire_len(tx)?])
         })?,
@@ -969,6 +975,10 @@ fn append_block_body(bytes: &mut Vec<u8>, body: &BlockBody) {
     append_hash(bytes, body.merkle_root);
     append_len(bytes, body.application_state.len());
     bytes.extend_from_slice(body.application_state.as_slice());
+    append_len(bytes, body.encounter_records.len());
+    for record in &body.encounter_records {
+        append_encounter_record(bytes, record);
+    }
     append_len(bytes, body.txs.len());
     for tx in &body.txs {
         let payload = tx.payload.bytes.as_slice();
@@ -990,6 +1000,17 @@ fn take_block_body(input: &mut &[u8]) -> Result<BlockBody> {
     let application_state = BlockApplicationState::new(
         take_exact(input, application_state_len, "block application state")?.to_vec(),
     )?;
+    let encounter_count = take_len(input, "encounter record count")?;
+    let max_possible_encounters = input.len() / ENCOUNTER_RECORD_ENCODED_LEN;
+    if encounter_count > max_possible_encounters {
+        return Err(BlossomError::WireProtocol(format!(
+            "encounter record count {encounter_count} exceeds remaining payload capacity {max_possible_encounters}"
+        )));
+    }
+    let mut encounter_records = Vec::with_capacity(encounter_count);
+    for _ in 0..encounter_count {
+        encounter_records.push(take_encounter_record(input)?);
+    }
     let tx_count = take_len(input, "transaction count")?;
     let max_possible_txs = input.len() / (32 + 4);
     if tx_count > max_possible_txs {
@@ -1015,8 +1036,93 @@ fn take_block_body(input: &mut &[u8]) -> Result<BlockBody> {
         dispatched,
         merkle_root,
         application_state,
+        encounter_records,
         txs,
     })
+}
+
+fn append_encounter_record(bytes: &mut Vec<u8>, record: &EncounterRecord) {
+    append_pubkey(bytes, record.body.observer);
+    append_pubkey(bytes, record.body.subject);
+    append_hash(bytes, record.body.last_epoch);
+    append_u64(bytes, record.body.nonce.value());
+    bytes.push(record.body.round);
+    bytes.push(record.body.phase as u8);
+    bytes.push(record.body.outcome as u8);
+    match record.body.evidence_hash {
+        Some(hash) => {
+            bytes.push(1);
+            append_hash(bytes, hash);
+        }
+        None => {
+            bytes.push(0);
+            append_hash(bytes, HashType::default());
+        }
+    }
+    append_u128(bytes, record.body.observed_at_micros);
+    append_signature(bytes, record.signature);
+}
+
+fn take_encounter_record(input: &mut &[u8]) -> Result<EncounterRecord> {
+    let observer = take_pubkey(input)?;
+    let subject = take_pubkey(input)?;
+    let last_epoch = take_hash(input)?;
+    let nonce = Nonce::new(take_u64(input, "encounter nonce")?);
+    let round = take_u8(input, "encounter round")?;
+    let phase = take_encounter_phase(input)?;
+    let outcome = take_encounter_outcome(input)?;
+    let evidence_hash = match take_u8(input, "encounter evidence flag")? {
+        0 => {
+            let _empty = take_hash(input)?;
+            None
+        }
+        1 => Some(take_hash(input)?),
+        flag => {
+            return Err(BlossomError::WireProtocol(format!(
+                "invalid encounter evidence flag {flag}"
+            )));
+        }
+    };
+    let observed_at_micros = take_u128(input, "encounter observed_at_micros")?;
+    let signature = take_signature(input)?;
+    Ok(EncounterRecord {
+        body: EncounterRecordBody {
+            observer,
+            subject,
+            last_epoch,
+            nonce,
+            round,
+            phase,
+            outcome,
+            evidence_hash,
+            observed_at_micros,
+        },
+        signature,
+    })
+}
+
+fn take_encounter_phase(input: &mut &[u8]) -> Result<EncounterPhase> {
+    match take_u8(input, "encounter phase")? {
+        1 => Ok(EncounterPhase::Dispatch),
+        2 => Ok(EncounterPhase::Verification),
+        3 => Ok(EncounterPhase::Proposal),
+        4 => Ok(EncounterPhase::Commit),
+        5 => Ok(EncounterPhase::EpochStarted),
+        6 => Ok(EncounterPhase::CatchUp),
+        phase => Err(BlossomError::WireProtocol(format!(
+            "invalid encounter phase {phase}"
+        ))),
+    }
+}
+
+fn take_encounter_outcome(input: &mut &[u8]) -> Result<EncounterOutcome> {
+    match take_u8(input, "encounter outcome")? {
+        1 => Ok(EncounterOutcome::MissingSignature),
+        2 => Ok(EncounterOutcome::InvalidSignature),
+        outcome => Err(BlossomError::WireProtocol(format!(
+            "invalid encounter outcome {outcome}"
+        ))),
+    }
 }
 
 #[cfg(not(feature = "filtered-transactions"))]
@@ -1556,6 +1662,7 @@ mod tests {
         payload.extend_from_slice(&0u128.to_le_bytes());
         payload.extend_from_slice(&[0; 32]); // merkle root
         payload.extend_from_slice(&0u32.to_le_bytes()); // application state length
+        payload.extend_from_slice(&0u32.to_le_bytes()); // encounter record count
         payload.extend_from_slice(&1u32.to_le_bytes()); // impossible tx count
 
         let err = decode_wire_request_payload(&payload).unwrap_err();

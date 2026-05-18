@@ -13,11 +13,13 @@ pub mod block;
 pub mod block_store;
 pub mod blossom;
 pub mod crypto;
+pub mod encounter;
 pub mod error;
 pub mod group;
 pub mod harness;
 pub mod hash;
 pub mod local_block;
+pub mod membership;
 pub mod messages;
 pub mod node;
 pub mod nonce;
@@ -50,12 +52,21 @@ pub use block::{FilteredDeliveryPolicy, FilteredPayloadView, FilteredTransaction
 pub use block_store::{BlockHandle, BlockIndex, BlockRecord};
 pub use blossom::*;
 pub use crypto::{Keypair, PubKey, SecKey, SecretSigner, Signature, verify_batch};
+pub use encounter::{
+    ENCOUNTER_RECORD_DOMAIN, ENCOUNTER_RECORD_ENCODED_LEN, EncounterOutcome, EncounterPhase,
+    EncounterRecord, EncounterRecordBody,
+};
 pub use error::{BlossomError, Result};
 pub use group::ConsensusGroupId;
 pub use harness::{MockBlockService, SimulatedCluster, SimulatedNode, signed_block};
 pub use hash::{DoHash, HashType};
 pub use indextreemap::{IndexTreeMap, SharedIndexTreeMap};
 pub use local_block::LocalBlock;
+pub use membership::{
+    ConsensusNodeRemovalDecision, ConsensusNodeRemovalPlan, ConsensusNodeRemovalPolicy,
+    apply_consensus_node_removal_plan, apply_epoch_membership_transition,
+    derive_consensus_node_removal_plan,
+};
 pub use messages::{MSGKey, Msg};
 pub use node::{NodeIdentity, NodeType};
 pub use nonce::Nonce;
@@ -63,8 +74,8 @@ pub use overlay::{BroadcastReceipt, BroadcastReport, FanOutStrategy, OverlayRunt
 pub use register::{MessageMatrix, QuorumQueue, Status};
 pub use runtime::{
     AcceptedBlock, EpochTarget, MessageReceipt, MultiGroupRuntime, NodeRuntime, NodeStatus,
-    PeerApplicationState, RuntimeConfig, RuntimeMode, TrustMode, genesis_epoch,
-    genesis_epoch_for_group,
+    ObservedEncounterRecord, PeerApplicationState, RuntimeConfig, RuntimeMode, TrustMode,
+    genesis_epoch, genesis_epoch_for_group,
 };
 pub use service_client::TcpServiceClient;
 pub use state::{

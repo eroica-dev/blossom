@@ -1,0 +1,18 @@
+[package]
+name = "blossom-lab"
+version = "0.1.0"
+edition = "2024"
+description = "Controlled local TCP lab for Blossom benchmarks, chaos, and fault injection."
+license = "UNLICENSED"
+
+[features]
+default = []
+availability-gossip = ["blossom/availability-gossip"]
+external-transaction-hashes = ["blossom/external-transaction-hashes"]
+filtered-transactions = ["blossom/filtered-transactions"]
+insecure-fast-hash = ["blossom/insecure-fast-hash"]
+
+[dependencies]
+blossom = { path = "../.." }
+clap = { version = "4.5", features = ["derive", "env"] }
+tokio = { version = "1.48", features = ["macros", "net", "rt-multi-thread", "time"] }
