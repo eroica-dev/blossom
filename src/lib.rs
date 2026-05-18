@@ -46,8 +46,8 @@ pub use nonce::Nonce;
 pub use overlay::{BroadcastReceipt, BroadcastReport, FanOutStrategy, OverlayRuntime};
 pub use register::{MessageMatrix, QuorumQueue, Status};
 pub use runtime::{
-    AcceptedBlock, EpochTarget, MessageReceipt, NodeRuntime, NodeStatus, RuntimeConfig,
-    RuntimeMode, TrustMode, genesis_epoch,
+    AcceptedBlock, EpochTarget, MessageReceipt, NodeRuntime, NodeStatus, PeerApplicationState,
+    RuntimeConfig, RuntimeMode, TrustMode, genesis_epoch,
 };
 pub use service_client::TcpServiceClient;
 pub use state::{

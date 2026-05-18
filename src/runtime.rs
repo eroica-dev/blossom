@@ -11,7 +11,7 @@ use crate::blossom::{
     BlossomBody, Commit, Dispatch, DispatchBody, EchoReDispatch, EchoRequest, EchoResponse,
     EpochStarted, Header, Proposal, SignatureTree, Verification,
 };
-use crate::crypto::{SecretSigner, Signature};
+use crate::crypto::{PubKey, SecretSigner, Signature};
 use crate::error::{BlossomError, Result};
 use crate::hash::{DoHash, HashType};
 use crate::local_block::LocalBlock;
@@ -86,6 +86,7 @@ struct RuntimeInner {
     address_book: RwLock<AddressBook>,
     signer: Option<SecretSigner>,
     trust_mode: TrustMode,
+    mode: RuntimeMode,
 }
 
 #[derive(Serialize, Deserialize, BorshSerialize, BorshDeserialize, Debug, Clone, PartialEq, Eq)]
@@ -117,6 +118,15 @@ pub struct MessageReceipt {
     pub accepted: bool,
 }
 
+#[derive(Serialize, Deserialize, BorshSerialize, BorshDeserialize, Debug, Clone, PartialEq, Eq)]
+pub struct PeerApplicationState {
+    pub peer: PubKey,
+    pub block_hash: HashType,
+    pub last_epoch: HashType,
+    pub nonce: Nonce,
+    pub application_state: BlockApplicationState,
+}
+
 impl NodeRuntime {
     pub fn new(mut config: RuntimeConfig) -> Self {
         let signer = config.self_node.signer().ok();
@@ -133,6 +143,7 @@ impl NodeRuntime {
                 address_book: RwLock::new(config.address_book),
                 signer,
                 trust_mode: config.trust_mode,
+                mode: config.mode,
             }),
         }
     }
@@ -144,6 +155,10 @@ impl NodeRuntime {
             .expect("state lock poisoned")
             .self_node
             .clone()
+    }
+
+    pub fn mode(&self) -> RuntimeMode {
+        self.inner.mode
     }
 
     pub fn status(&self) -> Result<NodeStatus> {
@@ -191,7 +206,13 @@ impl NodeRuntime {
             .add(service)
     }
 
+    /// Sets the opaque application state that will be piggy-backed onto this
+    /// node's next dispatched block.
+    ///
+    /// Blossom validates only the size budget and commits these bytes into the
+    /// block hash; parsing and versioning stay with the application.
     pub fn set_application_state(&self, bytes: impl Into<Vec<u8>>) -> Result<()> {
+        self.ensure_consensus_mode("set application state")?;
         self.inner
             .local_blocks
             .write()
@@ -206,6 +227,50 @@ impl NodeRuntime {
             .expect("block lock poisoned")
             .application_state()
             .clone()
+    }
+
+    /// Returns the latest verified or committed application state observed for
+    /// each peer.
+    ///
+    /// This is the read side of [`NodeRuntime::set_application_state`]: peer
+    /// bytes arrive in normal consensus blocks rather than through a separate
+    /// application message channel.
+    pub fn peer_application_states(&self) -> BTreeMap<PubKey, PeerApplicationState> {
+        let state = self.inner.state.read().expect("state lock poisoned");
+        let self_key = state.self_node.public_key();
+        let mut peer_states = BTreeMap::new();
+
+        for epoch in &state.epochchain.epochchain {
+            for (block_hash, block) in &epoch.body.blocks {
+                if block.body.validator != self_key {
+                    record_peer_application_state(
+                        &mut peer_states,
+                        *block_hash,
+                        block,
+                        block.body.last_epoch,
+                        block.body.nonce,
+                    );
+                }
+            }
+        }
+
+        for consensus in state.consensus.values() {
+            for quorum in consensus.quorum.values() {
+                for (block_hash, block) in &quorum.verified_blocks {
+                    if block.body.validator != self_key {
+                        record_peer_application_state(
+                            &mut peer_states,
+                            *block_hash,
+                            block,
+                            block.body.last_epoch,
+                            block.body.nonce,
+                        );
+                    }
+                }
+            }
+        }
+
+        peer_states
     }
 
     pub fn fanout_targets(&self, strategy: &FanOutStrategy) -> Vec<Service> {
@@ -233,6 +298,7 @@ impl NodeRuntime {
     }
 
     pub fn next_epoch_target(&self) -> Result<EpochTarget> {
+        self.ensure_consensus_mode("select next epoch target")?;
         let state = self.inner.state.read().expect("state lock poisoned");
         let epoch = state
             .epochchain
@@ -331,6 +397,7 @@ impl NodeRuntime {
     }
 
     pub fn receive_message(&self, message: Msg) -> Result<MessageReceipt> {
+        self.ensure_consensus_mode("receive consensus message")?;
         match message {
             Msg::Dispatch(message) => {
                 self.verify_message_signature(&message.header, MSGKey::Dispatch, &message.body)?;
@@ -354,6 +421,7 @@ impl NodeRuntime {
     }
 
     pub fn receive_hot_dispatch(&self, message: HotDispatch) -> Result<MessageReceipt> {
+        self.ensure_consensus_mode("receive hot dispatch")?;
         if !self.inner.trust_mode.is_trusted() {
             message.verify_signature()?;
         }
@@ -471,6 +539,15 @@ impl NodeRuntime {
         Ok(MessageReceipt::accepted("epoch_started"))
     }
 
+    fn ensure_consensus_mode(&self, action: &str) -> Result<()> {
+        if self.inner.mode == RuntimeMode::Overlay {
+            return Err(BlossomError::WireProtocol(format!(
+                "{action} requires consensus runtime mode"
+            )));
+        }
+        Ok(())
+    }
+
     fn validate_block_service(&self, block: &Block) -> Result<()> {
         if let Some(service) = self.block_service()
             && block.body.validator != service.public_key
@@ -562,6 +639,30 @@ impl NodeRuntime {
     }
 }
 
+fn record_peer_application_state(
+    peer_states: &mut BTreeMap<PubKey, PeerApplicationState>,
+    block_hash: HashType,
+    block: &Block,
+    last_epoch: HashType,
+    nonce: Nonce,
+) {
+    let peer = block.body.validator;
+    let candidate = PeerApplicationState {
+        peer,
+        block_hash,
+        last_epoch,
+        nonce,
+        application_state: block.body.application_state.clone(),
+    };
+
+    match peer_states.get(&peer) {
+        Some(existing) if existing.nonce.value() > nonce.value() => {}
+        _ => {
+            peer_states.insert(peer, candidate);
+        }
+    }
+}
+
 impl MessageReceipt {
     fn accepted(kind: impl Into<String>) -> Self {
         Self {
@@ -592,6 +693,7 @@ pub fn genesis_epoch(nodes: impl IntoIterator<Item = NodeIdentity>) -> Epoch {
 #[cfg(test)]
 mod tests {
     use super::*;
+
     use crate::blossom::DispatchBody;
     use crate::crypto::Keypair;
 
@@ -727,6 +829,34 @@ mod tests {
                 .any(|service| service.kind == ServiceKind::Consensus
                     && service.public_key == keypair.public)
         );
+    }
+
+    #[test]
+    fn overlay_mode_rejects_consensus_entrypoints() {
+        let keypair = Keypair::generate();
+        let node = NodeIdentity::new(
+            keypair.public,
+            Some(keypair.secret),
+            "tcp",
+            "127.0.0.1",
+            8080,
+            false,
+        );
+        let runtime = NodeRuntime::new(RuntimeConfig::overlay(node));
+
+        assert_eq!(runtime.mode(), RuntimeMode::Overlay);
+        assert!(matches!(
+            runtime.next_epoch_target(),
+            Err(BlossomError::WireProtocol(error)) if error.contains("consensus runtime mode")
+        ));
+        assert!(matches!(
+            runtime.set_application_state(b"v1:state"),
+            Err(BlossomError::WireProtocol(error)) if error.contains("consensus runtime mode")
+        ));
+        assert!(matches!(
+            runtime.receive_message(Msg::Ok),
+            Err(BlossomError::WireProtocol(error)) if error.contains("consensus runtime mode")
+        ));
     }
 
     #[test]
@@ -871,6 +1001,43 @@ mod tests {
             runtime.receive_message(Msg::Dispatch(dispatch)),
             Err(BlossomError::UnknownSender)
         );
+    }
+
+    #[test]
+    fn peer_application_states_reports_verified_peer_blocks() {
+        let (runtime, _, target) = runtime_with_peers_mode(TrustMode::Trusted);
+        let known_sender = {
+            let mut state = runtime.inner.state.write().expect("state lock poisoned");
+            state
+                .get_mut_consensus(&target.last_epoch, target.nonce)
+                .peers(0)
+                .into_iter()
+                .next()
+                .expect("round should include a peer")
+        };
+        let mut block = Block::default();
+        block.body.last_epoch = target.last_epoch;
+        block.body.nonce = target.nonce;
+        block
+            .set_application_state(b"v1:cache-pressure=low")
+            .unwrap();
+        block.seal_unsigned(known_sender);
+
+        {
+            let mut state = runtime.inner.state.write().expect("state lock poisoned");
+            state
+                .get_mut_quorum(&target.last_epoch, target.nonce, 0)
+                .verified_blocks
+                .insert(block.hash, block.clone());
+        }
+
+        let states = runtime.peer_application_states();
+        let state = states.get(&known_sender).expect("peer state should exist");
+        assert_eq!(state.peer, known_sender);
+        assert_eq!(state.block_hash, block.hash);
+        assert_eq!(state.last_epoch, target.last_epoch);
+        assert_eq!(state.nonce, target.nonce);
+        assert_eq!(state.application_state.as_slice(), b"v1:cache-pressure=low");
     }
 
     #[test]
