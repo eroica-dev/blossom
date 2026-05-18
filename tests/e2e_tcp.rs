@@ -175,6 +175,8 @@ async fn block_submission_duplicate_rejection_send_block_and_dispatch_are_end_to
     let dispatch = expect_dispatch(cluster.request(0, WireRequest::Dispatch { round: 0 }).await);
     assert_eq!(dispatch.body.blocks.len(), 1);
     assert_eq!(dispatch.header.nonce, Nonce::new(1));
+    let dispatched_tx = &dispatch.body.blocks.values().next().unwrap().body.txs[0];
+    assert_eq!(dispatched_tx.payload(), b"tx-1");
 
     let second = cluster
         .signed_block_for(0, 0, [Transaction::new("tx-2")])

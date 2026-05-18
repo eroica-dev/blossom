@@ -30,7 +30,7 @@ pub use address_book::{AddressBook, Service, ServiceKind};
 pub use algorithm::{QUORUM_SIZE, SUPERMAJORITY};
 pub use block::{
     BLOCK_APPLICATION_STATE_MAX_BYTES, BLOCK_APPLICATION_STATE_SOFT_LIMIT_BYTES, Block,
-    BlockApplicationState, BlockBody, Transaction,
+    BlockApplicationState, BlockBody, Transaction, TransactionPayload,
 };
 pub use block_store::{BlockHandle, BlockIndex, BlockRecord};
 pub use blossom::*;

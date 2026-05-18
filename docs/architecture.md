@@ -23,7 +23,7 @@ Every validator can independently receive transactions, pre-validate
 them against local state, and close a local block. In this crate, that
 surface is represented by:
 
-- `src/block.rs`: signed block and transaction envelope primitives.
+- `src/block.rs`: signed block and opaque transaction payload primitives.
 - `src/block.rs`: bounded opaque application-state payloads carried in
   the block metadata and committed by the block hash/signature.
 - `src/local_block.rs`: queued block intake from the block service and
@@ -35,9 +35,20 @@ surface is represented by:
 - `src/hash.rs` and `src/nonce.rs`: deterministic identifiers used by
   blocks, epochs, and messages.
 
-The extraction intentionally keeps transaction semantics minimal.
-Application transaction schemas, ledger adapters, block size policy, and
-mempool behavior belong above this crate or in a follow-up ledger layer.
+The extraction intentionally keeps transaction semantics application-owned.
+`TransactionPayload` is opaque byte data: callers may provide a raw payload or
+encode a versioned application struct, such as a cache key/value record, before
+submitting it. Blossom computes or accepts the transaction identifier, commits
+both the identifier and payload bytes into the block hash, and leaves schema
+validation, ledger adapters, block size policy, and mempool behavior above this
+crate or in a follow-up ledger layer.
+
+Domain-specific codecs are expected to live above Blossom. A database module,
+blockchain module, or key/value cache module can define its own versioned binary
+layout and pass the encoded bytes to `TransactionPayload`. Deployments that
+already compute stable operation or key hashes can pair those module payloads
+with `Transaction::from_external_hash_u64` under the
+`external-transaction-hashes` feature.
 
 Blocks also expose a generic application-state channel. The payload is
 opaque `Vec<u8>` data with a 4 KiB soft budget and an 8 KiB hard limit.
@@ -153,14 +164,14 @@ registers multiple consensus services, selects fan-out targets with the
 same topology algorithm, and broadcasts `WireRequest` or `Msg` values over
 the TCP wire path.
 
-`NodeRuntime` exposes the same broadcast surface for full consensus nodes.
-This lets applications reuse Blossom's structured fan-out for overlay
-messages, gossip, DHT routing, or private-agent coordination without
-committing a block or advancing an epoch.
+`NodeRuntime` exposes the same broadcast surface for full consensus nodes when
+deployers need to send protocol wire requests through the selected topology.
+Routine application coordination state should use the block-carried
+application-state payload above so it is delivered as part of normal consensus
+rather than as an extra message stream.
 
-Application-state payloads sent through overlay-only traffic are useful
-for best-effort gossip, but they do not have the ordering or common-view
-semantics that come from committed consensus blocks.
+Overlay mode does not commit blocks, so the block-carried application-state
+channel is available only in the consensus runtime.
 
 ## Implemented Now
 

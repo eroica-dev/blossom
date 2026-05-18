@@ -41,8 +41,8 @@ block/engine services together.
 - `src/register.rs`: Blossom message matrix and quorum queue.
 - `src/algorithm.rs`: deterministic quorum/round selection.
 - `src/crypto.rs`: Ed25519 public keys, secret keys, signatures, and key generation.
-- `src/block.rs`: signed block, transaction envelope, and bounded opaque
-  application-state payload used by dispatch verification.
+- `src/block.rs`: signed block, opaque transaction payloads, and bounded
+  opaque application-state payload used by dispatch verification.
 - `src/address_book.rs`: service registry copied from the Eden runtime shape.
 - `src/local_block.rs`: local signed block queue and build-block helper.
 - `src/overlay.rs`: overlay runtime, fan-out strategies, and broadcast reports.
@@ -140,6 +140,44 @@ messages through the selected topology. The address book supports
 multiple services per kind, so each consensus peer can be registered
 independently.
 
+## Opaque Transaction Payloads
+
+Transactions carry application-defined payload bytes. Blossom does not parse
+or validate those bytes; it commits the transaction identifier and payload into
+the block hash, and uses the transaction identifiers for the block Merkle root.
+Applications can use raw bytes or plug in a domain codec above Blossom. For
+example, a database, blockchain, or cache module can define its own versioned
+operation format and pass the encoded bytes to `Transaction::new`.
+
+Generic Borsh helpers are available for lower-volume or schema-heavy
+applications:
+
+```rust
+use borsh::{BorshDeserialize, BorshSerialize};
+use blossom::Transaction;
+
+#[derive(BorshSerialize, BorshDeserialize)]
+struct CachePut {
+    version: u16,
+    key: Vec<u8>,
+    value: Vec<u8>,
+}
+
+let tx = Transaction::from_borsh(&CachePut {
+    version: 1,
+    key: b"session:42".to_vec(),
+    value: b"cached-value".to_vec(),
+})?;
+
+let decoded: CachePut = tx.payload_as_borsh()?;
+```
+
+For high-volume paths, define a purpose-built module codec and store its output
+in `TransactionPayload`. For trusted deployments where the application already
+has a stable key or content hash, the `external-transaction-hashes` feature lets
+callers provide that identifier while still committing the payload bytes into
+the block hash.
+
 ## Piggy-Back Application State
 
 Blocks can carry a bounded opaque application-state payload alongside the
@@ -159,9 +197,9 @@ assert!(block.application_state_len() <= BLOCK_APPLICATION_STATE_MAX_BYTES);
 The soft budget is 4 KiB and the hard consensus-enforced limit is 8 KiB
 per block. Oversized payloads are rejected by block integrity checks.
 Under full consensus, committed blocks give every node the same
-application-state snapshots in the same epoch order. In overlay-only mode,
-the same bytes can be broadcast, but ordering is transport/eventual rather
-than epoch-committed.
+application-state snapshots in the same epoch order. Overlay-only mode does
+not commit blocks, so this ordered piggy-backed state channel is a consensus
+runtime feature.
 
 ## Run The Harness
 

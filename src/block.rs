@@ -10,17 +10,176 @@ use crate::nonce::Nonce;
 pub const BLOCK_APPLICATION_STATE_SOFT_LIMIT_BYTES: usize = 4 * 1024;
 pub const BLOCK_APPLICATION_STATE_MAX_BYTES: usize = 8 * 1024;
 
+/// Opaque application-defined transaction data.
+///
+/// Blossom does not parse this payload. Applications can store any stable
+/// encoding here, including versioned binary structs or key/value records.
+/// The bytes are committed into the block hash through their enclosing
+/// [`Transaction`].
+#[derive(Serialize, Deserialize, BorshSerialize, BorshDeserialize, Debug, Clone, Default)]
+#[serde(transparent)]
+#[repr(transparent)]
+pub struct TransactionPayload {
+    pub(crate) bytes: Vec<u8>,
+}
+
+impl TransactionPayload {
+    #[inline]
+    pub fn new(bytes: impl Into<Vec<u8>>) -> Self {
+        Self {
+            bytes: bytes.into(),
+        }
+    }
+
+    #[inline]
+    pub fn as_slice(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    #[inline]
+    pub fn as_mut_slice(&mut self) -> &mut [u8] {
+        &mut self.bytes
+    }
+
+    #[inline]
+    pub fn into_bytes(self) -> Vec<u8> {
+        self.bytes
+    }
+
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.bytes.len()
+    }
+
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.bytes.is_empty()
+    }
+}
+
+impl AsRef<[u8]> for TransactionPayload {
+    #[inline]
+    fn as_ref(&self) -> &[u8] {
+        self.as_slice()
+    }
+}
+
+impl From<Vec<u8>> for TransactionPayload {
+    #[inline]
+    fn from(value: Vec<u8>) -> Self {
+        Self::new(value)
+    }
+}
+
+impl From<&[u8]> for TransactionPayload {
+    #[inline]
+    fn from(value: &[u8]) -> Self {
+        Self::new(value)
+    }
+}
+
+impl From<&str> for TransactionPayload {
+    #[inline]
+    fn from(value: &str) -> Self {
+        Self::new(value.as_bytes())
+    }
+}
+
+impl From<String> for TransactionPayload {
+    #[inline]
+    fn from(value: String) -> Self {
+        Self::new(value.into_bytes())
+    }
+}
+
+impl From<TransactionPayload> for Vec<u8> {
+    #[inline]
+    fn from(value: TransactionPayload) -> Self {
+        value.bytes
+    }
+}
+
+/// A hash-identified opaque application transaction.
+///
+/// The transaction hash is used by the block Merkle root. The payload bytes are
+/// also included in the block body hash, so peers cannot alter application data
+/// without invalidating block integrity.
 #[derive(Serialize, Deserialize, BorshSerialize, BorshDeserialize, Debug, Clone, Default)]
 pub struct Transaction {
     pub hash: HashType,
-    pub bytes: Vec<u8>,
+    pub payload: TransactionPayload,
 }
 
 impl Transaction {
+    #[inline]
     pub fn new(bytes: impl Into<Vec<u8>>) -> Self {
         let bytes = bytes.into();
         let hash = HashType::hash(&bytes);
-        Self { hash, bytes }
+        Self {
+            hash,
+            payload: TransactionPayload { bytes },
+        }
+    }
+
+    #[inline]
+    pub fn from_payload(payload: impl Into<TransactionPayload>) -> Self {
+        let payload = payload.into();
+        let hash = HashType::hash(&payload.bytes);
+        Self { hash, payload }
+    }
+
+    #[inline]
+    pub(crate) fn from_parts(hash: HashType, payload: impl Into<TransactionPayload>) -> Self {
+        Self {
+            hash,
+            payload: payload.into(),
+        }
+    }
+
+    #[inline]
+    pub fn from_borsh<T>(value: &T) -> Result<Self>
+    where
+        T: BorshSerialize + ?Sized,
+    {
+        let bytes = borsh::to_vec(value).map_err(|err| {
+            BlossomError::WireProtocol(format!("failed to encode transaction payload: {err}"))
+        })?;
+        Ok(Self::new(bytes))
+    }
+
+    #[inline]
+    pub fn payload_as_borsh<T>(&self) -> Result<T>
+    where
+        T: BorshDeserialize,
+    {
+        borsh::from_slice(self.payload.as_slice()).map_err(|err| {
+            BlossomError::WireProtocol(format!("failed to decode transaction payload: {err}"))
+        })
+    }
+
+    #[inline]
+    pub fn payload(&self) -> &[u8] {
+        self.payload.bytes.as_slice()
+    }
+
+    #[inline]
+    pub fn payload_mut(&mut self) -> &mut TransactionPayload {
+        &mut self.payload
+    }
+
+    #[inline]
+    pub fn payload_len(&self) -> usize {
+        self.payload.bytes.len()
+    }
+
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.payload.bytes.is_empty()
+    }
+
+    #[inline]
+    pub fn into_payload(self) -> TransactionPayload {
+        self.payload
     }
 
     /// Builds a transaction with an application-supplied identifier.
@@ -31,11 +190,9 @@ impl Transaction {
     /// transaction Merkle root represents these external identifiers rather than
     /// Blossom-computed payload hashes.
     #[cfg(feature = "external-transaction-hashes")]
-    pub fn from_external_hash(hash: HashType, bytes: impl Into<Vec<u8>>) -> Self {
-        Self {
-            hash,
-            bytes: bytes.into(),
-        }
+    #[inline]
+    pub fn from_external_hash(hash: HashType, payload: impl Into<TransactionPayload>) -> Self {
+        Self::from_parts(hash, payload)
     }
 
     /// Builds a transaction from a 64-bit external key hash, such as
@@ -44,14 +201,16 @@ impl Transaction {
     /// The little-endian `u64` is stored in the first eight bytes of Blossom's
     /// 32-byte transaction identifier and the remaining bytes are zero.
     #[cfg(feature = "external-transaction-hashes")]
-    pub fn from_external_hash_u64(hash: u64, bytes: impl Into<Vec<u8>>) -> Self {
+    #[inline]
+    pub fn from_external_hash_u64(hash: u64, payload: impl Into<TransactionPayload>) -> Self {
         let mut padded = [0; 32];
         padded[..8].copy_from_slice(&hash.to_le_bytes());
-        Self::from_external_hash(HashType(padded), bytes)
+        Self::from_external_hash(HashType(padded), payload)
     }
 
+    #[inline]
     pub fn to_bytes(&self) -> Vec<u8> {
-        [self.hash.as_ref(), self.bytes.as_slice()].concat()
+        [self.hash.as_ref(), self.payload.bytes.as_slice()].concat()
     }
 }
 
@@ -252,9 +411,10 @@ impl BlockBody {
         bytes.extend_from_slice(&(self.application_state.len() as u64).to_le_bytes());
         bytes.extend_from_slice(self.application_state.as_slice());
         for tx in &self.txs {
+            let payload = tx.payload.bytes.as_slice();
             bytes.extend_from_slice(tx.hash.as_ref());
-            bytes.extend_from_slice(&(tx.bytes.len() as u64).to_le_bytes());
-            bytes.extend_from_slice(&tx.bytes);
+            bytes.extend_from_slice(&(payload.len() as u64).to_le_bytes());
+            bytes.extend_from_slice(payload);
         }
     }
 
@@ -269,7 +429,7 @@ impl BlockBody {
             + self
                 .txs
                 .iter()
-                .map(|tx| 32 + 8 + tx.bytes.len())
+                .map(|tx| 32 + 8 + tx.payload.bytes.len())
                 .sum::<usize>()
     }
 
@@ -284,9 +444,10 @@ impl BlockBody {
         hasher.update((self.application_state.len() as u64).to_le_bytes());
         hasher.update(self.application_state.as_slice());
         for tx in &self.txs {
+            let payload = tx.payload.bytes.as_slice();
             hasher.update(tx.hash.as_ref());
-            hasher.update((tx.bytes.len() as u64).to_le_bytes());
-            hasher.update(&tx.bytes);
+            hasher.update((payload.len() as u64).to_le_bytes());
+            hasher.update(payload);
         }
         hasher.finalize()
     }
@@ -303,9 +464,10 @@ impl BlockBody {
         body_hasher.update((self.application_state.len() as u64).to_le_bytes());
         body_hasher.update(self.application_state.as_slice());
         for tx in &self.txs {
+            let payload = tx.payload.bytes.as_slice();
             body_hasher.update(tx.hash.as_ref());
-            body_hasher.update((tx.bytes.len() as u64).to_le_bytes());
-            body_hasher.update(&tx.bytes);
+            body_hasher.update((payload.len() as u64).to_le_bytes());
+            body_hasher.update(payload);
             merkle_hasher.update(tx.hash.as_ref());
         }
         (body_hasher.finalize(), merkle_hasher.finalize())
@@ -458,11 +620,36 @@ mod tests {
     }
 
     #[test]
-    fn transaction_hash_and_bytes_are_stable() {
+    fn transaction_hash_and_payload_are_stable() {
         let tx = Transaction::new("tx-1");
 
         assert_eq!(tx.hash, HashType::hash(b"tx-1"));
+        assert_eq!(tx.payload(), b"tx-1");
+        assert_eq!(tx.payload_len(), 4);
         assert_eq!(tx.to_bytes(), [tx.hash.as_ref(), b"tx-1"].concat());
+    }
+
+    #[derive(BorshSerialize, BorshDeserialize, Debug, PartialEq, Eq)]
+    struct CustomKvPayload {
+        version: u16,
+        key: Vec<u8>,
+        value: Vec<u8>,
+    }
+
+    #[test]
+    fn transaction_payload_accepts_application_defined_data() {
+        let kv = CustomKvPayload {
+            version: 1,
+            key: b"cache:key".to_vec(),
+            value: b"cache-value".to_vec(),
+        };
+
+        let tx = Transaction::from_borsh(&kv).unwrap();
+        let decoded: CustomKvPayload = tx.payload_as_borsh().unwrap();
+
+        assert_eq!(decoded, kv);
+        assert_eq!(tx.hash, HashType::hash(tx.payload()));
+        assert_eq!(tx.to_bytes(), [tx.hash.as_ref(), tx.payload()].concat());
     }
 
     #[cfg(feature = "external-transaction-hashes")]
@@ -473,7 +660,7 @@ mod tests {
 
         assert_eq!(&tx.hash.as_ref()[..8], &external_hash.to_le_bytes());
         assert_eq!(&tx.hash.as_ref()[8..], &[0; 24]);
-        assert_ne!(tx.hash, HashType::hash(&tx.bytes));
+        assert_ne!(tx.hash, HashType::hash(tx.payload()));
 
         let keypair = Keypair::generate();
         let mut block = Block::default();
@@ -485,7 +672,7 @@ mod tests {
         assert!(block.verify_integrity().is_ok());
 
         let mut tampered = block.clone();
-        tampered.body.txs[0].bytes[0] ^= 0xff;
+        tampered.body.txs[0].payload_mut().as_mut_slice()[0] ^= 0xff;
         assert_eq!(
             tampered.verify_integrity(),
             Err(BlossomError::InvalidBlockHash)

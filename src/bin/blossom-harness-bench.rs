@@ -193,7 +193,7 @@ async fn run_iteration(iteration: usize, config: IterationConfig) -> MainResult<
         config.transaction_bytes,
         config.external_transaction_hashes,
     );
-    let tx_payload_bytes = txs.iter().map(|tx| tx.bytes.len()).sum();
+    let tx_payload_bytes = txs.iter().map(Transaction::payload_len).sum();
     let tx_build_us = tx_build_start.elapsed().as_micros();
 
     let block_sign_start = Instant::now();

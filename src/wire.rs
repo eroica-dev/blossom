@@ -831,9 +831,9 @@ fn block_body_wire_len(body: &BlockBody) -> Result<usize> {
         4,
         body.application_state.len(),
         4,
-        body.txs
-            .iter()
-            .try_fold(0usize, |sum, tx| checked_sum([sum, 32, 4, tx.bytes.len()]))?,
+        body.txs.iter().try_fold(0usize, |sum, tx| {
+            checked_sum([sum, 32, 4, tx.payload.bytes.len()])
+        })?,
     ])
 }
 
@@ -862,9 +862,10 @@ fn append_block_body(bytes: &mut Vec<u8>, body: &BlockBody) {
     bytes.extend_from_slice(body.application_state.as_slice());
     append_len(bytes, body.txs.len());
     for tx in &body.txs {
+        let payload = tx.payload.bytes.as_slice();
         append_hash(bytes, tx.hash);
-        append_len(bytes, tx.bytes.len());
-        bytes.extend_from_slice(&tx.bytes);
+        append_len(bytes, payload.len());
+        bytes.extend_from_slice(payload);
     }
 }
 
@@ -892,7 +893,7 @@ fn take_block_body(input: &mut &[u8]) -> Result<BlockBody> {
         let hash = take_hash(input)?;
         let tx_len = take_len(input, "transaction length")?;
         let bytes = take_exact(input, tx_len, "transaction bytes")?.to_vec();
-        txs.push(Transaction { hash, bytes });
+        txs.push(Transaction::from_parts(hash, bytes));
     }
     ensure_empty(input, "block body")?;
 
@@ -1105,6 +1106,7 @@ mod tests {
             WireRequest::SubmitBlock(decoded_block) => {
                 assert_eq!(decoded_block.hash, block.hash);
                 assert_eq!(decoded_block.body.txs.len(), 1);
+                assert_eq!(decoded_block.body.txs[0].payload(), b"tx-1");
                 assert!(decoded_block.verify_integrity().is_ok());
             }
             response => panic!("expected hot submit block, got {response:?}"),
