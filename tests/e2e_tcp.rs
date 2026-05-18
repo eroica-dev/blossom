@@ -1,11 +1,17 @@
 use std::collections::BTreeMap;
 
+#[cfg(feature = "availability-gossip")]
 use blossom::{
-    Block, BlossomBody, Commit, CommitBody, Dispatch, EchoReDispatch, EchoRequest, EchoResponse,
-    EchoResponseBody, EpochStarted, EpochStartedBody, EpochTarget, FanOutStrategy, HashType,
-    Header, MSGKey, MockBlockService, Msg, Nonce, OverlayRuntime, Proposal, ProposalBody,
-    ServiceKind, Signature, SimulatedCluster, TcpServiceClient, Transaction, TrustMode,
-    Verification, VerificationBody, WireRequest, WireResponse,
+    AvailabilityEntry, AvailabilityGossip, AvailabilityGossipBody, FilteredDeliveryPolicy,
+    FilteredPayloadFetch, FilteredPayloadFetchBody,
+};
+use blossom::{
+    Block, BlossomBody, Commit, CommitBody, ConsensusGroupId, Dispatch, EchoReDispatch,
+    EchoRequest, EchoResponse, EchoResponseBody, EpochStarted, EpochStartedBody, EpochTarget,
+    FanOutStrategy, HashType, Header, MSGKey, MockBlockService, Msg, NodePing, Nonce,
+    OverlayRuntime, Proposal, ProposalBody, ServiceKind, Signature, SimulatedCluster,
+    TcpServiceClient, Transaction, TrustMode, Verification, VerificationBody, WireRequest,
+    WireResponse,
 };
 use blossom::{DoHash, EncodedFrame, NodeIdentity};
 
@@ -21,6 +27,23 @@ async fn cluster_exposes_health_state_address_book_and_nonce() {
                 assert_eq!(health.public_key, node.identity.public_key());
             }
             response => panic!("expected health, got {}", response.kind()),
+        }
+
+        match node
+            .request(WireRequest::Ping(NodePing::with_payload(
+                index as u64,
+                b"direct-ping",
+            )))
+            .await
+            .unwrap()
+        {
+            WireResponse::Pong(pong) => {
+                assert_eq!(pong.group_id, ConsensusGroupId::root());
+                assert_eq!(pong.public_key, node.identity.public_key());
+                assert_eq!(pong.nonce, index as u64);
+                assert_eq!(pong.payload, b"direct-ping");
+            }
+            response => panic!("expected pong, got {}", response.kind()),
         }
 
         match node.request(WireRequest::State).await.unwrap() {
@@ -157,6 +180,7 @@ async fn block_submission_duplicate_rejection_send_block_and_dispatch_are_end_to
     let target = cluster.next_target(0).await.unwrap();
     let wrong_nonce = blossom::signed_block(
         EpochTarget {
+            group_id: target.group_id,
             last_epoch: target.last_epoch,
             nonce: target.nonce.new_next(),
         },
@@ -256,6 +280,7 @@ async fn service_client_exercises_mock_block_service_wire_requests() {
     let block_service = MockBlockService::spawn().await.unwrap();
     let client = TcpServiceClient::new();
     let target = EpochTarget {
+        group_id: ConsensusGroupId::root(),
         last_epoch: HashType::default(),
         nonce: Nonce::new(7),
     };
@@ -270,6 +295,16 @@ async fn service_client_exercises_mock_block_service_wire_requests() {
         .block_nonce(&block_service.service, Nonce::new(7))
         .await
         .unwrap();
+    let pong = client
+        .ping(
+            &block_service.service,
+            NodePing::with_payload(77, b"block-service"),
+        )
+        .await
+        .unwrap();
+    assert_eq!(pong.group_id, ConsensusGroupId::root());
+    assert_eq!(pong.nonce, 77);
+    assert_eq!(pong.payload, b"block-service");
     assert_eq!(
         client
             .get_block(&block_service.service, Nonce::new(7))
@@ -286,6 +321,110 @@ async fn service_client_exercises_mock_block_service_wire_requests() {
     assert_eq!(block_service.received_nonces(), vec![Nonce::new(7)]);
     assert_eq!(block_service.blocked_nonces(), vec![Nonce::new(7)]);
     assert_eq!(block_service.received_blocks()[0].hash, block.hash);
+}
+
+#[cfg(feature = "availability-gossip")]
+#[tokio::test]
+async fn filtered_payload_availability_gossip_and_fetch_are_end_to_end() {
+    let cluster = SimulatedCluster::spawn(3).await.unwrap();
+    let holder = cluster.node(0);
+    let target = cluster.node(1);
+    let outsider = cluster.node(2);
+    let payload = b"stable-kvcache-value".to_vec();
+    let tx = Transaction::filtered_full(
+        HashType::hash(b"stable-cache-key"),
+        1,
+        vec![target.identity.public_key()],
+        payload.clone(),
+        FilteredDeliveryPolicy::Gossip,
+    )
+    .unwrap();
+    let slot = tx.filtered_slot().unwrap().clone();
+    let entry = AvailabilityEntry::new(slot.clone()).unwrap();
+    let block = cluster.signed_block_for(0, 0, [tx]).await.unwrap();
+
+    match cluster
+        .request(0, WireRequest::SubmitBlock(block))
+        .await
+        .unwrap()
+    {
+        WireResponse::BlockAccepted(accepted) => {
+            assert_eq!(accepted.group_id, ConsensusGroupId::root());
+        }
+        response => panic!("expected block accepted, got {}", response.kind()),
+    }
+
+    let gossip = AvailabilityGossip::signed(
+        AvailabilityGossipBody {
+            scope: ConsensusGroupId::root(),
+            holder: holder.identity.public_key(),
+            entries: vec![entry.clone()],
+        },
+        &holder.keypair.signer(),
+    )
+    .unwrap();
+    match cluster
+        .request(1, WireRequest::AvailabilityGossip(gossip))
+        .await
+        .unwrap()
+    {
+        WireResponse::AvailabilityReceipt(receipt) => {
+            assert_eq!(receipt.entries_accepted, 1);
+            assert_eq!(receipt.holder, holder.identity.public_key());
+        }
+        response => panic!("expected availability receipt, got {}", response.kind()),
+    }
+
+    let fetch = FilteredPayloadFetch::signed(
+        FilteredPayloadFetchBody {
+            scope: ConsensusGroupId::root(),
+            requester: target.identity.public_key(),
+            slot_hash: entry.slot_hash,
+            payload_commitment: slot.payload_commitment,
+        },
+        &target.keypair.signer(),
+    );
+    let delivery = match cluster
+        .request(0, WireRequest::GetFilteredPayload(fetch))
+        .await
+        .unwrap()
+    {
+        WireResponse::FilteredPayload(delivery) => {
+            assert_eq!(delivery.body.payload, payload);
+            delivery
+        }
+        response => panic!("expected filtered payload, got {}", response.kind()),
+    };
+
+    match cluster
+        .request(1, WireRequest::StoreFilteredPayload(delivery))
+        .await
+        .unwrap()
+    {
+        WireResponse::AvailabilityReceipt(receipt) => {
+            assert_eq!(receipt.entries_accepted, 1);
+            assert_eq!(receipt.holder, holder.identity.public_key());
+        }
+        response => panic!("expected availability receipt, got {}", response.kind()),
+    }
+
+    let outsider_fetch = FilteredPayloadFetch::signed(
+        FilteredPayloadFetchBody {
+            scope: ConsensusGroupId::root(),
+            requester: outsider.identity.public_key(),
+            slot_hash: entry.slot_hash,
+            payload_commitment: slot.payload_commitment,
+        },
+        &outsider.keypair.signer(),
+    );
+    match cluster
+        .request(0, WireRequest::GetFilteredPayload(outsider_fetch))
+        .await
+        .unwrap()
+    {
+        WireResponse::Error(message) => assert!(message.contains("not authorized")),
+        response => panic!("expected authorization error, got {}", response.kind()),
+    }
 }
 
 #[tokio::test]

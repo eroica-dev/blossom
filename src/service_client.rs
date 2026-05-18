@@ -1,9 +1,14 @@
 use crate::address_book::Service;
+#[cfg(feature = "availability-gossip")]
+use crate::availability::{
+    AvailabilityGossip, AvailabilityReceipt, FilteredPayloadBatchDelivery,
+    FilteredPayloadBatchFetch, FilteredPayloadDelivery, FilteredPayloadFetch,
+};
 use crate::block::Block;
 use crate::error::{BlossomError, Result};
 use crate::nonce::Nonce;
 use crate::tcp::send_wire_request;
-use crate::wire::{WireRequest, WireResponse};
+use crate::wire::{NodePing, NodePong, WireRequest, WireResponse};
 
 #[derive(Clone, Debug, Default)]
 pub struct TcpServiceClient;
@@ -15,6 +20,98 @@ impl TcpServiceClient {
 
     pub async fn send_nonce(&self, service: &Service, nonce: Nonce) -> Result<()> {
         expect_ok(send(service, WireRequest::SendNonce(nonce)).await?)
+    }
+
+    pub async fn ping(&self, service: &Service, ping: NodePing) -> Result<NodePong> {
+        match send(service, WireRequest::Ping(ping)).await? {
+            WireResponse::Pong(pong) => Ok(pong),
+            WireResponse::Error(message) => Err(BlossomError::ExternalService(message)),
+            response => Err(BlossomError::WireProtocol(format!(
+                "expected pong response, got {}",
+                response.kind()
+            ))),
+        }
+    }
+
+    #[cfg(feature = "availability-gossip")]
+    pub async fn send_availability_gossip(
+        &self,
+        service: &Service,
+        gossip: AvailabilityGossip,
+    ) -> Result<AvailabilityReceipt> {
+        match send(service, WireRequest::AvailabilityGossip(gossip)).await? {
+            WireResponse::AvailabilityReceipt(receipt) => Ok(receipt),
+            WireResponse::Error(message) => Err(BlossomError::ExternalService(message)),
+            response => Err(BlossomError::WireProtocol(format!(
+                "expected availability receipt response, got {}",
+                response.kind()
+            ))),
+        }
+    }
+
+    #[cfg(feature = "availability-gossip")]
+    pub async fn fetch_filtered_payload(
+        &self,
+        service: &Service,
+        fetch: FilteredPayloadFetch,
+    ) -> Result<Option<FilteredPayloadDelivery>> {
+        match send(service, WireRequest::GetFilteredPayload(fetch)).await? {
+            WireResponse::FilteredPayload(delivery) => Ok(Some(delivery)),
+            WireResponse::FilteredPayloadMissing(_) => Ok(None),
+            WireResponse::Error(message) => Err(BlossomError::ExternalService(message)),
+            response => Err(BlossomError::WireProtocol(format!(
+                "expected filtered payload response, got {}",
+                response.kind()
+            ))),
+        }
+    }
+
+    #[cfg(feature = "availability-gossip")]
+    pub async fn fetch_filtered_payload_batch(
+        &self,
+        service: &Service,
+        fetch: FilteredPayloadBatchFetch,
+    ) -> Result<FilteredPayloadBatchDelivery> {
+        match send(service, WireRequest::GetFilteredPayloadBatch(fetch)).await? {
+            WireResponse::FilteredPayloadBatch(delivery) => Ok(delivery),
+            WireResponse::Error(message) => Err(BlossomError::ExternalService(message)),
+            response => Err(BlossomError::WireProtocol(format!(
+                "expected filtered payload batch response, got {}",
+                response.kind()
+            ))),
+        }
+    }
+
+    #[cfg(feature = "availability-gossip")]
+    pub async fn store_filtered_payload(
+        &self,
+        service: &Service,
+        delivery: FilteredPayloadDelivery,
+    ) -> Result<AvailabilityReceipt> {
+        match send(service, WireRequest::StoreFilteredPayload(delivery)).await? {
+            WireResponse::AvailabilityReceipt(receipt) => Ok(receipt),
+            WireResponse::Error(message) => Err(BlossomError::ExternalService(message)),
+            response => Err(BlossomError::WireProtocol(format!(
+                "expected availability receipt response, got {}",
+                response.kind()
+            ))),
+        }
+    }
+
+    #[cfg(feature = "availability-gossip")]
+    pub async fn store_filtered_payload_batch(
+        &self,
+        service: &Service,
+        delivery: FilteredPayloadBatchDelivery,
+    ) -> Result<AvailabilityReceipt> {
+        match send(service, WireRequest::StoreFilteredPayloadBatch(delivery)).await? {
+            WireResponse::AvailabilityReceipt(receipt) => Ok(receipt),
+            WireResponse::Error(message) => Err(BlossomError::ExternalService(message)),
+            response => Err(BlossomError::WireProtocol(format!(
+                "expected availability receipt response, got {}",
+                response.kind()
+            ))),
+        }
     }
 
     pub async fn block_nonce(&self, service: &Service, nonce: Nonce) -> Result<()> {

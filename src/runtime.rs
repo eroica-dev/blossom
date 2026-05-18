@@ -6,6 +6,13 @@ use indextreemap::IndexTreeMap;
 use serde::{Deserialize, Serialize};
 
 use crate::address_book::{AddressBook, Service, ServiceKind};
+#[cfg(feature = "availability-gossip")]
+use crate::availability::{
+    AvailabilityEntry, AvailabilityGossip, AvailabilityGossipBody, AvailabilityReceipt,
+    AvailabilityStore, FilteredPayloadBatchDelivery, FilteredPayloadBatchDeliveryBody,
+    FilteredPayloadBatchFetch, FilteredPayloadBatchFetchBody, FilteredPayloadDelivery,
+    FilteredPayloadFetch, FilteredPayloadRequest,
+};
 use crate::block::{Block, BlockApplicationState};
 use crate::blossom::{
     BlossomBody, Commit, Dispatch, DispatchBody, EchoReDispatch, EchoRequest, EchoResponse,
@@ -13,6 +20,7 @@ use crate::blossom::{
 };
 use crate::crypto::{PubKey, SecretSigner, Signature};
 use crate::error::{BlossomError, Result};
+use crate::group::ConsensusGroupId;
 use crate::hash::{DoHash, HashType};
 use crate::local_block::LocalBlock;
 use crate::messages::{MSGKey, Msg};
@@ -30,6 +38,7 @@ use crate::wire::{HotDispatch, WireRequest};
 
 #[derive(Debug, Clone)]
 pub struct RuntimeConfig {
+    pub group_id: ConsensusGroupId,
     pub self_node: NodeIdentity,
     pub genesis: Option<Epoch>,
     pub address_book: AddressBook,
@@ -41,6 +50,7 @@ pub struct RuntimeConfig {
 impl RuntimeConfig {
     pub fn new(self_node: NodeIdentity) -> Self {
         Self {
+            group_id: ConsensusGroupId::root(),
             self_node,
             genesis: None,
             address_book: AddressBook::new(),
@@ -53,6 +63,12 @@ impl RuntimeConfig {
     pub fn overlay(self_node: NodeIdentity) -> Self {
         let mut config = Self::new(self_node);
         config.mode = RuntimeMode::Overlay;
+        config
+    }
+
+    pub fn for_group(self_node: NodeIdentity, group_id: ConsensusGroupId) -> Self {
+        let mut config = Self::new(self_node);
+        config.group_id = group_id;
         config
     }
 }
@@ -81,8 +97,11 @@ pub struct NodeRuntime {
 }
 
 struct RuntimeInner {
+    group_id: ConsensusGroupId,
     state: RwLock<LocalState>,
     local_blocks: RwLock<LocalBlock>,
+    #[cfg(feature = "availability-gossip")]
+    availability: RwLock<AvailabilityStore>,
     address_book: RwLock<AddressBook>,
     signer: Option<SecretSigner>,
     trust_mode: TrustMode,
@@ -91,12 +110,14 @@ struct RuntimeInner {
 
 #[derive(Serialize, Deserialize, BorshSerialize, BorshDeserialize, Debug, Clone, PartialEq, Eq)]
 pub struct EpochTarget {
+    pub group_id: ConsensusGroupId,
     pub last_epoch: HashType,
     pub nonce: Nonce,
 }
 
 #[derive(Serialize, Deserialize, BorshSerialize, BorshDeserialize, Debug, Clone)]
 pub struct NodeStatus {
+    pub group_id: ConsensusGroupId,
     pub node: NodeIdentity,
     pub last_epoch: HashType,
     pub last_epoch_nonce: Nonce,
@@ -107,6 +128,7 @@ pub struct NodeStatus {
 
 #[derive(Serialize, Deserialize, BorshSerialize, BorshDeserialize, Debug, Clone, PartialEq, Eq)]
 pub struct AcceptedBlock {
+    pub group_id: ConsensusGroupId,
     pub hash: HashType,
     pub nonce: Nonce,
     pub application_state_bytes: usize,
@@ -120,6 +142,7 @@ pub struct MessageReceipt {
 
 #[derive(Serialize, Deserialize, BorshSerialize, BorshDeserialize, Debug, Clone, PartialEq, Eq)]
 pub struct PeerApplicationState {
+    pub group_id: ConsensusGroupId,
     pub peer: PubKey,
     pub block_hash: HashType,
     pub last_epoch: HashType,
@@ -130,16 +153,25 @@ pub struct PeerApplicationState {
 impl NodeRuntime {
     pub fn new(mut config: RuntimeConfig) -> Self {
         let signer = config.self_node.signer().ok();
-        let genesis = config
-            .genesis
-            .take()
-            .unwrap_or_else(|| genesis_epoch([config.self_node.clone()]));
+        let requested_group_id = config.group_id;
+        let genesis = config.genesis.take().unwrap_or_else(|| {
+            genesis_epoch_for_group(config.group_id, [config.self_node.clone()])
+        });
+        assert!(
+            requested_group_id == ConsensusGroupId::root()
+                || requested_group_id == genesis.body.group_id,
+            "runtime config group id does not match genesis group id"
+        );
+        let group_id = genesis.body.group_id;
         add_self_consensus_service(&mut config.address_book, &config.self_node);
 
         Self {
             inner: Arc::new(RuntimeInner {
+                group_id,
                 state: RwLock::new(LocalState::new(config.self_node, genesis)),
                 local_blocks: RwLock::new(LocalBlock::new(config.block_cap)),
+                #[cfg(feature = "availability-gossip")]
+                availability: RwLock::new(AvailabilityStore::default()),
                 address_book: RwLock::new(config.address_book),
                 signer,
                 trust_mode: config.trust_mode,
@@ -161,6 +193,10 @@ impl NodeRuntime {
         self.inner.mode
     }
 
+    pub fn group_id(&self) -> ConsensusGroupId {
+        self.inner.group_id
+    }
+
     pub fn status(&self) -> Result<NodeStatus> {
         let state = self.inner.state.read().expect("state lock poisoned");
         let epoch = state
@@ -180,6 +216,7 @@ impl NodeRuntime {
         node.secret_key = None;
 
         Ok(NodeStatus {
+            group_id: self.inner.group_id,
             node,
             last_epoch: epoch.hash,
             last_epoch_nonce: epoch.body.nonce,
@@ -245,6 +282,7 @@ impl NodeRuntime {
                 if block.body.validator != self_key {
                     record_peer_application_state(
                         &mut peer_states,
+                        epoch.body.group_id,
                         *block_hash,
                         block,
                         block.body.last_epoch,
@@ -260,6 +298,7 @@ impl NodeRuntime {
                     if block.body.validator != self_key {
                         record_peer_application_state(
                             &mut peer_states,
+                            self.inner.group_id,
                             *block_hash,
                             block,
                             block.body.last_epoch,
@@ -271,6 +310,336 @@ impl NodeRuntime {
         }
 
         peer_states
+    }
+
+    #[cfg(feature = "availability-gossip")]
+    pub fn store_filtered_payload_from_transaction(
+        &self,
+        tx: &crate::block::Transaction,
+    ) -> Result<Option<AvailabilityEntry>> {
+        let holder = self.self_node().public_key();
+        self.inner
+            .availability
+            .write()
+            .expect("availability lock poisoned")
+            .store_transaction(self.inner.group_id, holder, tx)
+    }
+
+    #[cfg(feature = "availability-gossip")]
+    pub fn local_availability_entries(&self) -> Vec<AvailabilityEntry> {
+        self.inner
+            .availability
+            .read()
+            .expect("availability lock poisoned")
+            .local_entries(self.inner.group_id)
+    }
+
+    #[cfg(feature = "availability-gossip")]
+    pub fn peer_availability_entries(&self) -> Vec<(PubKey, AvailabilityEntry)> {
+        self.inner
+            .availability
+            .read()
+            .expect("availability lock poisoned")
+            .peer_entries()
+    }
+
+    #[cfg(feature = "availability-gossip")]
+    pub fn availability_gossip(&self) -> Result<AvailabilityGossip> {
+        let self_node = self.self_node();
+        let body = AvailabilityGossipBody {
+            scope: self.inner.group_id,
+            holder: self_node.public_key(),
+            entries: self.local_availability_entries(),
+        };
+        if self.inner.trust_mode.is_trusted() {
+            return AvailabilityGossip::trusted(body);
+        }
+        match self.inner.signer.as_ref() {
+            Some(signer) => AvailabilityGossip::signed(body, signer),
+            None => {
+                let secret_key = self_node.secret_key.ok_or(BlossomError::MissingSecretKey)?;
+                AvailabilityGossip::signed(body, &SecretSigner::new(secret_key))
+            }
+        }
+    }
+
+    #[cfg(feature = "availability-gossip")]
+    pub fn receive_availability_gossip(
+        &self,
+        gossip: AvailabilityGossip,
+    ) -> Result<AvailabilityReceipt> {
+        if gossip.body.scope != self.inner.group_id {
+            return Err(BlossomError::WireProtocol(format!(
+                "availability gossip scope {} does not match runtime group {}",
+                gossip.body.scope, self.inner.group_id
+            )));
+        }
+        if !self.is_known_member(&gossip.body.holder) {
+            return Err(BlossomError::UnknownSender);
+        }
+        if !self.inner.trust_mode.is_trusted() {
+            gossip.verify()?;
+        } else {
+            gossip.body.validate()?;
+        }
+        let accepted = self
+            .inner
+            .availability
+            .write()
+            .expect("availability lock poisoned")
+            .record_gossip(&gossip)?;
+        Ok(AvailabilityReceipt {
+            scope: self.inner.group_id,
+            holder: gossip.body.holder,
+            entries_accepted: accepted,
+        })
+    }
+
+    #[cfg(feature = "availability-gossip")]
+    pub fn filtered_payload_fetch(
+        &self,
+        slot_hash: HashType,
+        payload_commitment: HashType,
+    ) -> Result<FilteredPayloadFetch> {
+        let self_node = self.self_node();
+        let body = crate::availability::FilteredPayloadFetchBody {
+            scope: self.inner.group_id,
+            requester: self_node.public_key(),
+            slot_hash,
+            payload_commitment,
+        };
+        if self.inner.trust_mode.is_trusted() {
+            return Ok(FilteredPayloadFetch::trusted(body));
+        }
+        match self.inner.signer.as_ref() {
+            Some(signer) => Ok(FilteredPayloadFetch::signed(body, signer)),
+            None => {
+                let secret_key = self_node.secret_key.ok_or(BlossomError::MissingSecretKey)?;
+                Ok(FilteredPayloadFetch::signed(
+                    body,
+                    &SecretSigner::new(secret_key),
+                ))
+            }
+        }
+    }
+
+    #[cfg(feature = "availability-gossip")]
+    pub fn filtered_payload_batch_fetch(
+        &self,
+        requests: Vec<FilteredPayloadRequest>,
+    ) -> Result<FilteredPayloadBatchFetch> {
+        let self_node = self.self_node();
+        let body = FilteredPayloadBatchFetchBody {
+            scope: self.inner.group_id,
+            requester: self_node.public_key(),
+            requests,
+        };
+        if self.inner.trust_mode.is_trusted() {
+            return FilteredPayloadBatchFetch::trusted(body);
+        }
+        match self.inner.signer.as_ref() {
+            Some(signer) => FilteredPayloadBatchFetch::signed(body, signer),
+            None => {
+                let secret_key = self_node.secret_key.ok_or(BlossomError::MissingSecretKey)?;
+                FilteredPayloadBatchFetch::signed(body, &SecretSigner::new(secret_key))
+            }
+        }
+    }
+
+    #[cfg(feature = "availability-gossip")]
+    pub fn serve_filtered_payload_fetch(
+        &self,
+        fetch: FilteredPayloadFetch,
+    ) -> Result<Option<FilteredPayloadDelivery>> {
+        if fetch.body.scope != self.inner.group_id {
+            return Err(BlossomError::WireProtocol(format!(
+                "filtered payload fetch scope {} does not match runtime group {}",
+                fetch.body.scope, self.inner.group_id
+            )));
+        }
+        if !self.is_known_member(&fetch.body.requester) {
+            return Err(BlossomError::UnknownSender);
+        }
+        if !self.inner.trust_mode.is_trusted() {
+            fetch.verify()?;
+        }
+        let Some(payload) = self
+            .inner
+            .availability
+            .read()
+            .expect("availability lock poisoned")
+            .get_local_payload(
+                self.inner.group_id,
+                &fetch.body.slot_hash,
+                &fetch.body.payload_commitment,
+                &fetch.body.requester,
+            )?
+        else {
+            return Ok(None);
+        };
+        let body = payload.delivery_body();
+        if self.inner.trust_mode.is_trusted() {
+            return FilteredPayloadDelivery::trusted(body).map(Some);
+        }
+        match self.inner.signer.as_ref() {
+            Some(signer) => FilteredPayloadDelivery::signed(body, signer).map(Some),
+            None => {
+                let self_node = self.self_node();
+                let secret_key = self_node.secret_key.ok_or(BlossomError::MissingSecretKey)?;
+                FilteredPayloadDelivery::signed(body, &SecretSigner::new(secret_key)).map(Some)
+            }
+        }
+    }
+
+    #[cfg(feature = "availability-gossip")]
+    pub fn serve_filtered_payload_batch_fetch(
+        &self,
+        fetch: FilteredPayloadBatchFetch,
+    ) -> Result<FilteredPayloadBatchDelivery> {
+        if fetch.body.scope != self.inner.group_id {
+            return Err(BlossomError::WireProtocol(format!(
+                "filtered payload batch fetch scope {} does not match runtime group {}",
+                fetch.body.scope, self.inner.group_id
+            )));
+        }
+        if !self.is_known_member(&fetch.body.requester) {
+            return Err(BlossomError::UnknownSender);
+        }
+        if !self.inner.trust_mode.is_trusted() {
+            fetch.verify()?;
+        } else {
+            fetch.body.validate()?;
+        }
+
+        let mut items = Vec::new();
+        {
+            let availability = self
+                .inner
+                .availability
+                .read()
+                .expect("availability lock poisoned");
+            for request in &fetch.body.requests {
+                if let Some(payload) = availability.get_local_payload(
+                    self.inner.group_id,
+                    &request.slot_hash,
+                    &request.payload_commitment,
+                    &fetch.body.requester,
+                )? {
+                    items.push(payload.delivery_item());
+                }
+            }
+        }
+
+        let body = FilteredPayloadBatchDeliveryBody {
+            scope: self.inner.group_id,
+            holder: self.self_node().public_key(),
+            items,
+        };
+        if self.inner.trust_mode.is_trusted() {
+            return FilteredPayloadBatchDelivery::trusted(body);
+        }
+        match self.inner.signer.as_ref() {
+            Some(signer) => FilteredPayloadBatchDelivery::signed(body, signer),
+            None => {
+                let self_node = self.self_node();
+                let secret_key = self_node.secret_key.ok_or(BlossomError::MissingSecretKey)?;
+                FilteredPayloadBatchDelivery::signed(body, &SecretSigner::new(secret_key))
+            }
+        }
+    }
+
+    #[cfg(feature = "availability-gossip")]
+    pub fn receive_filtered_payload(
+        &self,
+        delivery: FilteredPayloadDelivery,
+    ) -> Result<AvailabilityReceipt> {
+        if delivery.body.scope != self.inner.group_id {
+            return Err(BlossomError::WireProtocol(format!(
+                "filtered payload scope {} does not match runtime group {}",
+                delivery.body.scope, self.inner.group_id
+            )));
+        }
+        if !self.is_known_member(&delivery.body.holder) {
+            return Err(BlossomError::UnknownSender);
+        }
+        if !delivery.body.slot.is_target(&self.self_node().public_key()) {
+            return Err(BlossomError::WireProtocol(format!(
+                "this node is not a target for filtered payload {}",
+                delivery.body.slot_hash
+            )));
+        }
+        if !self.inner.trust_mode.is_trusted() {
+            delivery.verify()?;
+        } else {
+            delivery.body.validate()?;
+        }
+        let holder = self.self_node().public_key();
+        self.inner
+            .availability
+            .write()
+            .expect("availability lock poisoned")
+            .store_local(
+                self.inner.group_id,
+                holder,
+                delivery.body.slot.clone(),
+                delivery.body.payload.clone(),
+            )?;
+        Ok(AvailabilityReceipt {
+            scope: self.inner.group_id,
+            holder: delivery.body.holder,
+            entries_accepted: 1,
+        })
+    }
+
+    #[cfg(feature = "availability-gossip")]
+    pub fn receive_filtered_payload_batch(
+        &self,
+        delivery: FilteredPayloadBatchDelivery,
+    ) -> Result<AvailabilityReceipt> {
+        if delivery.body.scope != self.inner.group_id {
+            return Err(BlossomError::WireProtocol(format!(
+                "filtered payload batch scope {} does not match runtime group {}",
+                delivery.body.scope, self.inner.group_id
+            )));
+        }
+        if !self.is_known_member(&delivery.body.holder) {
+            return Err(BlossomError::UnknownSender);
+        }
+        let self_key = self.self_node().public_key();
+        for item in &delivery.body.items {
+            if !item.slot.is_target(&self_key) {
+                return Err(BlossomError::WireProtocol(format!(
+                    "this node is not a target for filtered payload {}",
+                    item.slot_hash
+                )));
+            }
+        }
+        if !self.inner.trust_mode.is_trusted() {
+            delivery.verify()?;
+        } else {
+            delivery.body.validate()?;
+        }
+
+        let mut accepted = 0usize;
+        let mut availability = self
+            .inner
+            .availability
+            .write()
+            .expect("availability lock poisoned");
+        for item in &delivery.body.items {
+            availability.store_local(
+                self.inner.group_id,
+                self_key,
+                item.slot.clone(),
+                item.payload.clone(),
+            )?;
+            accepted += 1;
+        }
+        Ok(AvailabilityReceipt {
+            scope: self.inner.group_id,
+            holder: delivery.body.holder,
+            entries_accepted: accepted,
+        })
     }
 
     pub fn fanout_targets(&self, strategy: &FanOutStrategy) -> Vec<Service> {
@@ -297,6 +666,18 @@ impl NodeRuntime {
         broadcast_wire_request(request, targets).await
     }
 
+    #[cfg(feature = "availability-gossip")]
+    pub async fn broadcast_availability_gossip(
+        &self,
+        strategy: FanOutStrategy,
+    ) -> Result<BroadcastReport> {
+        self.broadcast_request(
+            WireRequest::AvailabilityGossip(self.availability_gossip()?),
+            strategy,
+        )
+        .await
+    }
+
     pub fn next_epoch_target(&self) -> Result<EpochTarget> {
         self.ensure_consensus_mode("select next epoch target")?;
         let state = self.inner.state.read().expect("state lock poisoned");
@@ -306,9 +687,19 @@ impl NodeRuntime {
             .last()
             .ok_or(BlossomError::EmptyEpochChain)?;
         Ok(EpochTarget {
+            group_id: self.inner.group_id,
             last_epoch: epoch.hash,
             nonce: epoch.body.nonce.new_next(),
         })
+    }
+
+    pub fn contains_epoch_hash(&self, epoch_hash: &HashType) -> bool {
+        let state = self.inner.state.read().expect("state lock poisoned");
+        state
+            .epochchain
+            .epochchain
+            .iter()
+            .any(|epoch| epoch.hash == *epoch_hash)
     }
 
     pub fn submit_block(&self, block: Block) -> Result<AcceptedBlock> {
@@ -325,6 +716,8 @@ impl NodeRuntime {
 
         self.verify_block_integrity(&block)?;
         self.validate_block_service(&block)?;
+        #[cfg(feature = "availability-gossip")]
+        self.store_filtered_payloads_from_block(&block)?;
 
         let application_state_bytes = block.application_state_len();
         let hash = self
@@ -334,6 +727,7 @@ impl NodeRuntime {
             .expect("block lock poisoned")
             .enqueue_preverified_block(block)?;
         Ok(AcceptedBlock {
+            group_id: self.inner.group_id,
             hash,
             nonce: target.nonce,
             application_state_bytes,
@@ -364,6 +758,8 @@ impl NodeRuntime {
             Some(block) => block,
             None => self.empty_block(&self_node, &target, application_state)?,
         };
+        #[cfg(feature = "availability-gossip")]
+        self.store_filtered_payloads_from_block(&block)?;
 
         let mut blocks = BTreeMap::new();
         blocks.insert(block.hash, block);
@@ -422,6 +818,7 @@ impl NodeRuntime {
 
     pub fn receive_hot_dispatch(&self, message: HotDispatch) -> Result<MessageReceipt> {
         self.ensure_consensus_mode("receive hot dispatch")?;
+        self.ensure_known_header_epoch(&message.header)?;
         if !self.inner.trust_mode.is_trusted() {
             message.verify_signature()?;
         }
@@ -450,6 +847,7 @@ impl NodeRuntime {
     }
 
     fn receive_echo_request(&self, message: EchoRequest) -> Result<MessageReceipt> {
+        self.ensure_known_header_epoch(&message.header)?;
         let mut state = self.inner.state.write().expect("state lock poisoned");
         if message.header.verify_header(&mut state) == Some(false) {
             return Err(BlossomError::UnknownSender);
@@ -458,6 +856,7 @@ impl NodeRuntime {
     }
 
     fn receive_echo_redispatch(&self, message: EchoReDispatch) -> Result<MessageReceipt> {
+        self.ensure_known_header_epoch(&message.header)?;
         let mut state = self.inner.state.write().expect("state lock poisoned");
         if message.header.verify_header(&mut state) == Some(false) {
             return Err(BlossomError::UnknownSender);
@@ -557,6 +956,14 @@ impl NodeRuntime {
         Ok(())
     }
 
+    #[cfg(feature = "availability-gossip")]
+    fn store_filtered_payloads_from_block(&self, block: &Block) -> Result<()> {
+        for tx in &block.body.txs {
+            self.store_filtered_payload_from_transaction(tx)?;
+        }
+        Ok(())
+    }
+
     fn block_service(&self) -> Option<Service> {
         self.inner
             .address_book
@@ -564,6 +971,16 @@ impl NodeRuntime {
             .expect("address book lock poisoned")
             .service(ServiceKind::Block)
             .cloned()
+    }
+
+    #[cfg(feature = "availability-gossip")]
+    fn is_known_member(&self, public_key: &PubKey) -> bool {
+        let state = self.inner.state.read().expect("state lock poisoned");
+        state
+            .epochchain
+            .epochchain
+            .last()
+            .is_some_and(|epoch| epoch.body.verifiers.keys().any(|key| key == public_key))
     }
 
     fn empty_block(
@@ -604,6 +1021,7 @@ impl NodeRuntime {
         kind: MSGKey,
         body: &T,
     ) -> Result<()> {
+        self.ensure_known_header_epoch(header)?;
         if self.inner.trust_mode.is_trusted() {
             Ok(())
         } else {
@@ -637,10 +1055,116 @@ impl NodeRuntime {
             None => self_node.sign(message_hash.as_ref()),
         }
     }
+
+    fn ensure_known_header_epoch(&self, header: &Header) -> Result<()> {
+        if !self.contains_epoch_hash(&header.last_epoch) {
+            return Err(BlossomError::WireProtocol(format!(
+                "unknown consensus epoch {} for group {}",
+                header.last_epoch, self.inner.group_id
+            )));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone)]
+pub struct MultiGroupRuntime {
+    inner: Arc<MultiGroupRuntimeInner>,
+}
+
+struct MultiGroupRuntimeInner {
+    root_group: ConsensusGroupId,
+    groups: RwLock<BTreeMap<ConsensusGroupId, NodeRuntime>>,
+}
+
+impl MultiGroupRuntime {
+    pub fn new(root_runtime: NodeRuntime) -> Self {
+        let root_group = root_runtime.group_id();
+        let mut groups = BTreeMap::new();
+        groups.insert(root_group, root_runtime);
+
+        Self {
+            inner: Arc::new(MultiGroupRuntimeInner {
+                root_group,
+                groups: RwLock::new(groups),
+            }),
+        }
+    }
+
+    pub fn with_groups(
+        root_runtime: NodeRuntime,
+        groups: impl IntoIterator<Item = NodeRuntime>,
+    ) -> Self {
+        let runtime = Self::new(root_runtime);
+        for group in groups {
+            runtime.insert_group(group);
+        }
+        runtime
+    }
+
+    pub fn root_group(&self) -> ConsensusGroupId {
+        self.inner.root_group
+    }
+
+    pub fn root_runtime(&self) -> NodeRuntime {
+        self.group(&self.inner.root_group)
+            .expect("root runtime should always be present")
+    }
+
+    pub fn insert_group(&self, runtime: NodeRuntime) -> Option<NodeRuntime> {
+        let group_id = runtime.group_id();
+        self.inner
+            .groups
+            .write()
+            .expect("group runtime lock poisoned")
+            .insert(group_id, runtime)
+    }
+
+    pub fn group(&self, group_id: &ConsensusGroupId) -> Option<NodeRuntime> {
+        self.inner
+            .groups
+            .read()
+            .expect("group runtime lock poisoned")
+            .get(group_id)
+            .cloned()
+    }
+
+    pub fn group_for_epoch(&self, epoch_hash: &HashType) -> Option<NodeRuntime> {
+        self.inner
+            .groups
+            .read()
+            .expect("group runtime lock poisoned")
+            .values()
+            .find(|runtime| runtime.contains_epoch_hash(epoch_hash))
+            .cloned()
+    }
+
+    pub fn group_ids(&self) -> Vec<ConsensusGroupId> {
+        self.inner
+            .groups
+            .read()
+            .expect("group runtime lock poisoned")
+            .keys()
+            .copied()
+            .collect()
+    }
+
+    pub fn len(&self) -> usize {
+        self.inner
+            .groups
+            .read()
+            .expect("group runtime lock poisoned")
+            .len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
 }
 
 fn record_peer_application_state(
     peer_states: &mut BTreeMap<PubKey, PeerApplicationState>,
+    group_id: ConsensusGroupId,
     block_hash: HashType,
     block: &Block,
     last_epoch: HashType,
@@ -648,6 +1172,7 @@ fn record_peer_application_state(
 ) {
     let peer = block.body.validator;
     let candidate = PeerApplicationState {
+        group_id,
         peer,
         block_hash,
         last_epoch,
@@ -673,6 +1198,13 @@ impl MessageReceipt {
 }
 
 pub fn genesis_epoch(nodes: impl IntoIterator<Item = NodeIdentity>) -> Epoch {
+    genesis_epoch_for_group(ConsensusGroupId::root(), nodes)
+}
+
+pub fn genesis_epoch_for_group(
+    group_id: ConsensusGroupId,
+    nodes: impl IntoIterator<Item = NodeIdentity>,
+) -> Epoch {
     let mut verifiers = IndexTreeMap::new();
     for node in nodes {
         verifiers.insert(node.public_key(), node);
@@ -680,6 +1212,7 @@ pub fn genesis_epoch(nodes: impl IntoIterator<Item = NodeIdentity>) -> Epoch {
 
     let mut epoch = Epoch {
         body: EpochBody {
+            group_id,
             verifiers,
             nonce: Nonce::new(0),
             ..Default::default()
@@ -694,6 +1227,8 @@ pub fn genesis_epoch(nodes: impl IntoIterator<Item = NodeIdentity>) -> Epoch {
 mod tests {
     use super::*;
 
+    #[cfg(feature = "availability-gossip")]
+    use crate::FilteredPayloadDeliveryItem;
     use crate::blossom::DispatchBody;
     use crate::crypto::Keypair;
 
@@ -736,10 +1271,415 @@ mod tests {
         config.trust_mode = trust_mode;
         let runtime = NodeRuntime::new(config);
         let target = EpochTarget {
+            group_id: genesis.body.group_id,
             last_epoch: genesis.hash,
             nonce: genesis.body.nonce.new_next(),
         };
         (runtime, keypairs, target)
+    }
+
+    #[test]
+    fn genesis_epoch_group_id_is_hash_committed() {
+        let keypairs = (0..6).map(|_| Keypair::generate()).collect::<Vec<_>>();
+        let nodes = keypairs
+            .iter()
+            .enumerate()
+            .map(|(index, keypair)| {
+                NodeIdentity::new(
+                    keypair.public,
+                    None,
+                    "tcp",
+                    "127.0.0.1",
+                    8000 + index as u16,
+                    false,
+                )
+            })
+            .collect::<Vec<_>>();
+        let root = genesis_epoch(nodes.clone());
+        let subnet = genesis_epoch_for_group(ConsensusGroupId::named("cache-hotset-a"), nodes);
+
+        assert_eq!(root.body.group_id, ConsensusGroupId::root());
+        assert_eq!(
+            subnet.body.group_id,
+            ConsensusGroupId::named("cache-hotset-a")
+        );
+        assert_ne!(root.hash, subnet.hash);
+    }
+
+    #[test]
+    fn parallel_groups_keep_targets_and_application_state_separate() {
+        let keypairs = (0..6).map(|_| Keypair::generate()).collect::<Vec<_>>();
+        let nodes = keypairs
+            .iter()
+            .enumerate()
+            .map(|(index, keypair)| {
+                NodeIdentity::new(
+                    keypair.public,
+                    (index == 0).then_some(keypair.secret),
+                    "tcp",
+                    "127.0.0.1",
+                    8000 + index as u16,
+                    false,
+                )
+            })
+            .collect::<Vec<_>>();
+
+        let root_genesis = genesis_epoch(nodes.clone());
+        let subnet_id = ConsensusGroupId::named("cache-hotset-a");
+        let subnet_genesis = genesis_epoch_for_group(subnet_id, nodes[..3].to_vec());
+        assert_ne!(root_genesis.hash, subnet_genesis.hash);
+
+        let mut root_config = RuntimeConfig::new(nodes[0].clone());
+        root_config.genesis = Some(root_genesis.clone());
+        let root_runtime = NodeRuntime::new(root_config);
+
+        let mut subnet_config = RuntimeConfig::new(nodes[0].clone());
+        subnet_config.group_id = subnet_id;
+        subnet_config.genesis = Some(subnet_genesis.clone());
+        let subnet_runtime = NodeRuntime::new(subnet_config);
+
+        root_runtime.set_application_state(b"root-visible").unwrap();
+        subnet_runtime
+            .set_application_state(b"subnet-visible")
+            .unwrap();
+
+        let root_target = root_runtime.next_epoch_target().unwrap();
+        let subnet_target = subnet_runtime.next_epoch_target().unwrap();
+        assert_ne!(root_target.last_epoch, subnet_target.last_epoch);
+
+        let root_dispatch = root_runtime.dispatch_local_block(0).unwrap();
+        let subnet_dispatch = subnet_runtime.dispatch_local_block(0).unwrap();
+        let root_block = root_dispatch.body.blocks.values().next().unwrap();
+        let subnet_block = subnet_dispatch.body.blocks.values().next().unwrap();
+
+        assert_eq!(root_block.application_state(), b"root-visible");
+        assert_eq!(subnet_block.application_state(), b"subnet-visible");
+        assert_eq!(root_dispatch.header.last_epoch, root_target.last_epoch);
+        assert_eq!(subnet_dispatch.header.last_epoch, subnet_target.last_epoch);
+        assert!(matches!(
+            subnet_runtime.receive_message(Msg::Dispatch(root_dispatch.clone())),
+            Err(BlossomError::WireProtocol(message))
+                if message.contains("unknown consensus epoch")
+        ));
+
+        let multi = MultiGroupRuntime::with_groups(root_runtime.clone(), [subnet_runtime.clone()]);
+        assert_eq!(multi.root_group(), ConsensusGroupId::root());
+        assert_eq!(multi.len(), 2);
+        assert_eq!(multi.group(&subnet_id).unwrap().group_id(), subnet_id);
+        assert_eq!(
+            multi
+                .group_for_epoch(&subnet_target.last_epoch)
+                .unwrap()
+                .group_id(),
+            subnet_id
+        );
+    }
+
+    #[cfg(feature = "availability-gossip")]
+    #[test]
+    fn availability_gossip_fetches_filtered_payload_for_targets() {
+        let keypairs = (0..6).map(|_| Keypair::generate()).collect::<Vec<_>>();
+        let genesis_nodes = keypairs
+            .iter()
+            .enumerate()
+            .map(|(index, keypair)| {
+                NodeIdentity::new(
+                    keypair.public,
+                    None,
+                    "tcp",
+                    "127.0.0.1",
+                    8000 + index as u16,
+                    false,
+                )
+            })
+            .collect::<Vec<_>>();
+        let genesis = genesis_epoch(genesis_nodes);
+
+        let runtime_for = |index: usize| {
+            let node = NodeIdentity::new(
+                keypairs[index].public,
+                Some(keypairs[index].secret),
+                "tcp",
+                "127.0.0.1",
+                8000 + index as u16,
+                false,
+            );
+            let mut config = RuntimeConfig::new(node);
+            config.genesis = Some(genesis.clone());
+            NodeRuntime::new(config)
+        };
+        let holder = runtime_for(0);
+        let target = runtime_for(1);
+        let outsider = runtime_for(2);
+
+        let payload = b"stable-kvcache-value".to_vec();
+        let tx = crate::Transaction::filtered_full(
+            HashType::hash(b"stable-cache-key"),
+            1,
+            vec![target.self_node().public_key()],
+            payload.clone(),
+            crate::FilteredDeliveryPolicy::Gossip,
+        )
+        .unwrap();
+        let slot = tx.filtered_slot().unwrap().clone();
+        let entry = holder
+            .store_filtered_payload_from_transaction(&tx)
+            .unwrap()
+            .unwrap();
+
+        let gossip = holder.availability_gossip().unwrap();
+        let receipt = target.receive_availability_gossip(gossip).unwrap();
+        assert_eq!(receipt.entries_accepted, 1);
+        assert_eq!(target.peer_availability_entries().len(), 1);
+
+        let fetch = target
+            .filtered_payload_fetch(entry.slot_hash, slot.payload_commitment)
+            .unwrap();
+        let delivery = holder
+            .serve_filtered_payload_fetch(fetch)
+            .unwrap()
+            .expect("holder should return filtered payload");
+        assert_eq!(delivery.body.payload, payload);
+        target.receive_filtered_payload(delivery).unwrap();
+        assert_eq!(target.local_availability_entries().len(), 1);
+
+        let outsider_fetch = outsider
+            .filtered_payload_fetch(entry.slot_hash, slot.payload_commitment)
+            .unwrap();
+        assert!(matches!(
+            holder.serve_filtered_payload_fetch(outsider_fetch),
+            Err(BlossomError::WireProtocol(message)) if message.contains("not authorized")
+        ));
+    }
+
+    #[cfg(feature = "availability-gossip")]
+    #[test]
+    fn trusted_batch_gossip_still_rejects_unknown_fetch_requesters() {
+        let (holder, _, _) = runtime_with_peers_mode(TrustMode::Trusted);
+        let unknown = Keypair::generate();
+
+        let payload = b"private-cache-value".to_vec();
+        let tx = crate::Transaction::filtered_full(
+            HashType::hash(b"private-cache-key"),
+            1,
+            vec![holder.self_node().public_key()],
+            payload,
+            crate::FilteredDeliveryPolicy::Gossip,
+        )
+        .unwrap();
+        let slot = tx.filtered_slot().unwrap().clone();
+        let entry = holder
+            .store_filtered_payload_from_transaction(&tx)
+            .unwrap()
+            .unwrap();
+        let fetch = FilteredPayloadBatchFetch::trusted(FilteredPayloadBatchFetchBody {
+            scope: holder.group_id(),
+            requester: unknown.public,
+            requests: vec![FilteredPayloadRequest::new(
+                entry.slot_hash,
+                slot.payload_commitment,
+            )],
+        })
+        .unwrap();
+
+        assert!(matches!(
+            holder.serve_filtered_payload_batch_fetch(fetch),
+            Err(BlossomError::UnknownSender)
+        ));
+    }
+
+    #[cfg(feature = "availability-gossip")]
+    #[test]
+    fn trusted_batch_delivery_still_rejects_unauthorized_targets_and_tampering() {
+        let (target, keypairs, _) = runtime_with_peers_mode(TrustMode::Trusted);
+        let authorized_peer = keypairs[1].public;
+        let holder_peer = keypairs[2].public;
+
+        let payload = b"authorized-only-value".to_vec();
+        let tx = crate::Transaction::filtered_full(
+            HashType::hash(b"authorized-only-key"),
+            1,
+            vec![authorized_peer],
+            payload.clone(),
+            crate::FilteredDeliveryPolicy::Gossip,
+        )
+        .unwrap();
+        let slot = tx.filtered_slot().unwrap().clone();
+        let delivery = FilteredPayloadBatchDelivery::trusted(FilteredPayloadBatchDeliveryBody {
+            scope: target.group_id(),
+            holder: holder_peer,
+            items: vec![FilteredPayloadDeliveryItem {
+                slot_hash: slot.hash(),
+                slot: slot.clone(),
+                payload: payload.clone(),
+            }],
+        })
+        .unwrap();
+
+        assert!(matches!(
+            target.receive_filtered_payload_batch(delivery),
+            Err(BlossomError::WireProtocol(message)) if message.contains("not a target")
+        ));
+
+        let tx = crate::Transaction::filtered_full(
+            HashType::hash(b"tamper-key"),
+            1,
+            vec![target.self_node().public_key()],
+            b"original-value".to_vec(),
+            crate::FilteredDeliveryPolicy::Gossip,
+        )
+        .unwrap();
+        let slot = tx.filtered_slot().unwrap().clone();
+        let mut delivery =
+            FilteredPayloadBatchDelivery::trusted(FilteredPayloadBatchDeliveryBody {
+                scope: target.group_id(),
+                holder: holder_peer,
+                items: vec![FilteredPayloadDeliveryItem {
+                    slot_hash: slot.hash(),
+                    slot,
+                    payload: b"original-value".to_vec(),
+                }],
+            })
+            .unwrap();
+        delivery.body.items[0].payload = b"tampered-value".to_vec();
+
+        assert!(matches!(
+            target.receive_filtered_payload_batch(delivery),
+            Err(BlossomError::InvalidBlockHash)
+        ));
+    }
+
+    #[cfg(feature = "availability-gossip")]
+    #[test]
+    fn duplicate_gossip_is_idempotent_for_peer_availability() {
+        let keypairs = (0..3).map(|_| Keypair::generate()).collect::<Vec<_>>();
+        let genesis_nodes = keypairs
+            .iter()
+            .enumerate()
+            .map(|(index, keypair)| {
+                NodeIdentity::new(
+                    keypair.public,
+                    None,
+                    "tcp",
+                    "127.0.0.1",
+                    8100 + index as u16,
+                    false,
+                )
+            })
+            .collect::<Vec<_>>();
+        let genesis = genesis_epoch(genesis_nodes);
+        let runtime_for = |index: usize| {
+            let node = NodeIdentity::new(
+                keypairs[index].public,
+                Some(keypairs[index].secret),
+                "tcp",
+                "127.0.0.1",
+                8100 + index as u16,
+                false,
+            );
+            let mut config = RuntimeConfig::new(node);
+            config.genesis = Some(genesis.clone());
+            NodeRuntime::new(config)
+        };
+        let holder = runtime_for(0);
+        let target = runtime_for(1);
+
+        let tx = crate::Transaction::filtered_full(
+            HashType::hash(b"duplicate-gossip-key"),
+            1,
+            vec![target.self_node().public_key()],
+            b"duplicate-gossip-value".to_vec(),
+            crate::FilteredDeliveryPolicy::Gossip,
+        )
+        .unwrap();
+        holder
+            .store_filtered_payload_from_transaction(&tx)
+            .unwrap()
+            .unwrap();
+        let gossip = holder.availability_gossip().unwrap();
+
+        assert_eq!(
+            target
+                .receive_availability_gossip(gossip.clone())
+                .unwrap()
+                .entries_accepted,
+            1
+        );
+        assert_eq!(
+            target
+                .receive_availability_gossip(gossip)
+                .unwrap()
+                .entries_accepted,
+            1
+        );
+        assert_eq!(target.peer_availability_entries().len(), 1);
+    }
+
+    #[cfg(feature = "availability-gossip")]
+    #[test]
+    fn stale_availability_metadata_returns_empty_batch_delivery() {
+        let keypairs = (0..3).map(|_| Keypair::generate()).collect::<Vec<_>>();
+        let genesis_nodes = keypairs
+            .iter()
+            .enumerate()
+            .map(|(index, keypair)| {
+                NodeIdentity::new(
+                    keypair.public,
+                    None,
+                    "tcp",
+                    "127.0.0.1",
+                    8200 + index as u16,
+                    false,
+                )
+            })
+            .collect::<Vec<_>>();
+        let genesis = genesis_epoch(genesis_nodes);
+        let runtime_for = |index: usize| {
+            let node = NodeIdentity::new(
+                keypairs[index].public,
+                Some(keypairs[index].secret),
+                "tcp",
+                "127.0.0.1",
+                8200 + index as u16,
+                false,
+            );
+            let mut config = RuntimeConfig::new(node);
+            config.genesis = Some(genesis.clone());
+            NodeRuntime::new(config)
+        };
+        let holder = runtime_for(0);
+        let target = runtime_for(1);
+
+        let tx = crate::Transaction::filtered_full(
+            HashType::hash(b"stale-gossip-key"),
+            1,
+            vec![target.self_node().public_key()],
+            b"stale-gossip-value".to_vec(),
+            crate::FilteredDeliveryPolicy::Gossip,
+        )
+        .unwrap();
+        let slot = tx.filtered_slot().unwrap().clone();
+        let entry = AvailabilityEntry::new(slot.clone()).unwrap();
+        let gossip = AvailabilityGossip::signed(
+            AvailabilityGossipBody {
+                scope: holder.group_id(),
+                holder: holder.self_node().public_key(),
+                entries: vec![entry.clone()],
+            },
+            &keypairs[0].signer(),
+        )
+        .unwrap();
+
+        target.receive_availability_gossip(gossip).unwrap();
+        let fetch = target
+            .filtered_payload_batch_fetch(vec![FilteredPayloadRequest::new(
+                entry.slot_hash,
+                slot.payload_commitment,
+            )])
+            .unwrap();
+        let delivery = holder.serve_filtered_payload_batch_fetch(fetch).unwrap();
+
+        assert!(delivery.body.items.is_empty());
     }
 
     #[test]

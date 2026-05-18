@@ -358,6 +358,12 @@ fn handle_mock_block_request(
             status: "ok".to_string(),
             public_key: crate::PubKey::default(),
         }),
+        WireRequest::Ping(ping) => WireResponse::Pong(crate::wire::NodePong {
+            group_id: crate::ConsensusGroupId::root(),
+            public_key: crate::PubKey::default(),
+            nonce: ping.nonce,
+            payload: ping.payload,
+        }),
         request => WireResponse::Error(format!(
             "unsupported mock block request {}",
             request_kind(&request)
@@ -368,9 +374,21 @@ fn handle_mock_block_request(
 fn request_kind(request: &WireRequest) -> &'static str {
     match request {
         WireRequest::Health => "health",
+        WireRequest::Ping(_) => "ping",
+        #[cfg(feature = "availability-gossip")]
+        WireRequest::AvailabilityGossip(_) => "availability_gossip",
+        #[cfg(feature = "availability-gossip")]
+        WireRequest::GetFilteredPayload(_) => "get_filtered_payload",
+        #[cfg(feature = "availability-gossip")]
+        WireRequest::GetFilteredPayloadBatch(_) => "get_filtered_payload_batch",
+        #[cfg(feature = "availability-gossip")]
+        WireRequest::StoreFilteredPayload(_) => "store_filtered_payload",
+        #[cfg(feature = "availability-gossip")]
+        WireRequest::StoreFilteredPayloadBatch(_) => "store_filtered_payload_batch",
         WireRequest::State => "state",
         WireRequest::AddressBook => "address_book",
         WireRequest::RegisterService(_) => "register_service",
+        WireRequest::Group { .. } => "group",
         WireRequest::NextNonce => "next_nonce",
         WireRequest::SubmitBlock(_) => "submit_block",
         WireRequest::Dispatch { .. } => "dispatch",
@@ -390,6 +408,7 @@ mod tests {
     fn signed_block_sets_target_and_verifies() {
         let keypair = Keypair::generate();
         let target = EpochTarget {
+            group_id: crate::group::ConsensusGroupId::root(),
             last_epoch: crate::HashType([5; 32]),
             nonce: Nonce::new(3),
         };

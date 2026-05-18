@@ -1,13 +1,17 @@
 use tokio::net::{TcpListener, TcpStream};
 
 use crate::address_book::ServiceKind;
+#[cfg(feature = "availability-gossip")]
+use crate::availability::FilteredPayloadMissing;
 use crate::error::{BlossomError, Result};
-use crate::runtime::NodeRuntime;
+use crate::group::ConsensusGroupId;
+use crate::hash::HashType;
+use crate::runtime::{MultiGroupRuntime, NodeRuntime};
 use crate::service_client::TcpServiceClient;
 use crate::wire::{
-    AddressBookUpdate, EncodedFrame, NodeHealth, WireRequest, WireRequestFrame, WireResponse,
-    read_encoded_frame, read_wire_request_frame_optional, read_wire_response, write_encoded_frame,
-    write_wire_request, write_wire_response,
+    AddressBookUpdate, EncodedFrame, NodeHealth, NodePong, WireRequest, WireRequestFrame,
+    WireResponse, read_encoded_frame, read_wire_request_frame_optional, read_wire_response,
+    write_encoded_frame, write_wire_request, write_wire_response,
 };
 
 #[derive(Clone)]
@@ -65,49 +69,185 @@ impl TcpNode {
 
     pub async fn handle_request(&self, request: WireRequest) -> Result<WireResponse> {
         match request {
-            WireRequest::Health => Ok(WireResponse::Health(NodeHealth {
-                status: "ok".to_string(),
-                public_key: self.runtime.self_node().public_key(),
-            })),
-            WireRequest::State => Ok(WireResponse::State(self.runtime.status()?)),
-            WireRequest::AddressBook => Ok(WireResponse::AddressBook(self.runtime.address_book())),
-            WireRequest::RegisterService(service) => {
-                let previous = self.runtime.register_service(service.clone());
-                let nonce_announced = if service.kind == ServiceKind::Block {
-                    let target = self.runtime.next_epoch_target()?;
-                    self.services.send_nonce(&service, target.nonce).await?;
-                    Some(target.nonce)
-                } else {
-                    None
-                };
-                Ok(WireResponse::AddressBookUpdated(AddressBookUpdate {
-                    service,
-                    previous,
-                    nonce_announced,
-                }))
+            WireRequest::Group { group_id, request } => {
+                if group_id != self.runtime.group_id() {
+                    return Err(unknown_group(group_id));
+                }
+                handle_runtime_request(&self.runtime, &self.services, *request).await
             }
-            WireRequest::NextNonce => {
-                Ok(WireResponse::NextNonce(self.runtime.next_epoch_target()?))
-            }
-            WireRequest::SubmitBlock(block) => Ok(WireResponse::BlockAccepted(
-                self.runtime.submit_block(block)?,
-            )),
-            WireRequest::Dispatch { round } => Ok(WireResponse::Dispatch(
-                self.runtime.dispatch_local_block(round)?,
-            )),
-            WireRequest::Message(message) => Ok(WireResponse::MessageReceipt(
-                self.runtime.receive_message(message)?,
-            )),
-            WireRequest::SendNonce(_) | WireRequest::BlockNonce(_) => Ok(WireResponse::Ok),
-            WireRequest::GetBlock(_) => Err(BlossomError::WireProtocol(
-                "this node does not serve block-service block retrieval".to_string(),
-            )),
-            WireRequest::SendBlock(block) => {
-                self.runtime.submit_block(block)?;
-                Ok(WireResponse::Ok)
+            request => handle_runtime_request(&self.runtime, &self.services, request).await,
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct TcpMultiGroupNode {
+    pub runtime: MultiGroupRuntime,
+    pub services: TcpServiceClient,
+}
+
+impl TcpMultiGroupNode {
+    pub fn new(runtime: MultiGroupRuntime) -> Self {
+        Self {
+            runtime,
+            services: TcpServiceClient::new(),
+        }
+    }
+
+    pub fn with_services(runtime: MultiGroupRuntime, services: TcpServiceClient) -> Self {
+        Self { runtime, services }
+    }
+
+    pub async fn serve(self, listener: TcpListener) -> Result<()> {
+        loop {
+            let (stream, _) = listener
+                .accept()
+                .await
+                .map_err(|err| BlossomError::Io(err.to_string()))?;
+            let node = self.clone();
+            tokio::spawn(async move {
+                if let Err(err) = node.handle_connection(stream).await {
+                    log::error!("connection failed: {err}");
+                }
+            });
+        }
+    }
+
+    pub async fn handle_connection(&self, mut stream: TcpStream) -> Result<()> {
+        while let Some(request) = read_wire_request_frame_optional(&mut stream).await? {
+            let response = match self.handle_request_frame(request).await {
+                Ok(response) => response,
+                Err(err) => WireResponse::Error(err.to_string()),
+            };
+            write_wire_response(&mut stream, &response).await?;
+        }
+        Ok(())
+    }
+
+    pub async fn handle_request_frame(&self, request: WireRequestFrame) -> Result<WireResponse> {
+        match request {
+            WireRequestFrame::Request(request) => self.handle_request(request).await,
+            WireRequestFrame::HotDispatch(dispatch) => {
+                let runtime = self
+                    .runtime
+                    .group_for_epoch(&dispatch.header.last_epoch)
+                    .ok_or_else(|| unknown_epoch_group(dispatch.header.last_epoch))?;
+                Ok(WireResponse::MessageReceipt(
+                    runtime.receive_hot_dispatch(dispatch)?,
+                ))
             }
         }
     }
+
+    pub async fn handle_request(&self, request: WireRequest) -> Result<WireResponse> {
+        match request {
+            WireRequest::Group { group_id, request } => {
+                let runtime = self
+                    .runtime
+                    .group(&group_id)
+                    .ok_or_else(|| unknown_group(group_id))?;
+                handle_runtime_request(&runtime, &self.services, *request).await
+            }
+            request => {
+                let runtime = self.runtime.root_runtime();
+                handle_runtime_request(&runtime, &self.services, request).await
+            }
+        }
+    }
+}
+
+async fn handle_runtime_request(
+    runtime: &NodeRuntime,
+    services: &TcpServiceClient,
+    request: WireRequest,
+) -> Result<WireResponse> {
+    match request {
+        WireRequest::Health => Ok(WireResponse::Health(NodeHealth {
+            status: "ok".to_string(),
+            public_key: runtime.self_node().public_key(),
+        })),
+        WireRequest::Ping(ping) => Ok(WireResponse::Pong(NodePong {
+            group_id: runtime.group_id(),
+            public_key: runtime.self_node().public_key(),
+            nonce: ping.nonce,
+            payload: ping.payload,
+        })),
+        #[cfg(feature = "availability-gossip")]
+        WireRequest::AvailabilityGossip(gossip) => Ok(WireResponse::AvailabilityReceipt(
+            runtime.receive_availability_gossip(gossip)?,
+        )),
+        #[cfg(feature = "availability-gossip")]
+        WireRequest::GetFilteredPayload(fetch) => {
+            let missing = FilteredPayloadMissing {
+                scope: fetch.body.scope,
+                holder: runtime.self_node().public_key(),
+                slot_hash: fetch.body.slot_hash,
+                payload_commitment: fetch.body.payload_commitment,
+            };
+            match runtime.serve_filtered_payload_fetch(fetch)? {
+                Some(delivery) => Ok(WireResponse::FilteredPayload(delivery)),
+                None => Ok(WireResponse::FilteredPayloadMissing(missing)),
+            }
+        }
+        #[cfg(feature = "availability-gossip")]
+        WireRequest::GetFilteredPayloadBatch(fetch) => Ok(WireResponse::FilteredPayloadBatch(
+            runtime.serve_filtered_payload_batch_fetch(fetch)?,
+        )),
+        #[cfg(feature = "availability-gossip")]
+        WireRequest::StoreFilteredPayload(delivery) => Ok(WireResponse::AvailabilityReceipt(
+            runtime.receive_filtered_payload(delivery)?,
+        )),
+        #[cfg(feature = "availability-gossip")]
+        WireRequest::StoreFilteredPayloadBatch(delivery) => Ok(WireResponse::AvailabilityReceipt(
+            runtime.receive_filtered_payload_batch(delivery)?,
+        )),
+        WireRequest::State => Ok(WireResponse::State(runtime.status()?)),
+        WireRequest::AddressBook => Ok(WireResponse::AddressBook(runtime.address_book())),
+        WireRequest::RegisterService(service) => {
+            let previous = runtime.register_service(service.clone());
+            let nonce_announced = if service.kind == ServiceKind::Block {
+                let target = runtime.next_epoch_target()?;
+                services.send_nonce(&service, target.nonce).await?;
+                Some(target.nonce)
+            } else {
+                None
+            };
+            Ok(WireResponse::AddressBookUpdated(AddressBookUpdate {
+                service,
+                previous,
+                nonce_announced,
+            }))
+        }
+        WireRequest::NextNonce => Ok(WireResponse::NextNonce(runtime.next_epoch_target()?)),
+        WireRequest::SubmitBlock(block) => {
+            Ok(WireResponse::BlockAccepted(runtime.submit_block(block)?))
+        }
+        WireRequest::Dispatch { round } => {
+            Ok(WireResponse::Dispatch(runtime.dispatch_local_block(round)?))
+        }
+        WireRequest::Message(message) => Ok(WireResponse::MessageReceipt(
+            runtime.receive_message(message)?,
+        )),
+        WireRequest::SendNonce(_) | WireRequest::BlockNonce(_) => Ok(WireResponse::Ok),
+        WireRequest::GetBlock(_) => Err(BlossomError::WireProtocol(
+            "this node does not serve block-service block retrieval".to_string(),
+        )),
+        WireRequest::SendBlock(block) => {
+            runtime.submit_block(block)?;
+            Ok(WireResponse::Ok)
+        }
+        WireRequest::Group { group_id, .. } => Err(BlossomError::WireProtocol(format!(
+            "nested grouped request for group {group_id} is not allowed"
+        ))),
+    }
+}
+
+fn unknown_group(group_id: ConsensusGroupId) -> BlossomError {
+    BlossomError::WireProtocol(format!("unknown consensus group {group_id}"))
+}
+
+fn unknown_epoch_group(last_epoch: HashType) -> BlossomError {
+    BlossomError::WireProtocol(format!("no consensus group is tracking epoch {last_epoch}"))
 }
 
 pub struct TcpConnection {
@@ -163,8 +303,11 @@ pub async fn send_wire_request_raw_response(
 mod tests {
     use super::*;
     use crate::crypto::Keypair;
+    use crate::group::ConsensusGroupId;
     use crate::node::NodeIdentity;
-    use crate::runtime::RuntimeConfig;
+    use crate::runtime::{
+        MultiGroupRuntime, RuntimeConfig, genesis_epoch, genesis_epoch_for_group,
+    };
 
     fn tcp_node() -> (TcpNode, Keypair) {
         let keypair = Keypair::generate();
@@ -199,5 +342,118 @@ mod tests {
             BlossomError::WireProtocol(message) => assert!(message.contains("does not serve")),
             error => panic!("unexpected error: {error}"),
         }
+    }
+
+    #[tokio::test]
+    async fn handle_request_returns_direct_pong_without_consensus() {
+        let (node, keypair) = tcp_node();
+        let ping = crate::NodePing::with_payload(42, b"hello-peer");
+
+        match node.handle_request(WireRequest::Ping(ping)).await.unwrap() {
+            WireResponse::Pong(pong) => {
+                assert_eq!(pong.group_id, ConsensusGroupId::root());
+                assert_eq!(pong.public_key, keypair.public);
+                assert_eq!(pong.nonce, 42);
+                assert_eq!(pong.payload, b"hello-peer");
+            }
+            response => panic!("expected pong, got {}", response.kind()),
+        }
+    }
+
+    #[tokio::test]
+    async fn multi_group_node_routes_grouped_requests_to_subnets() {
+        let keypairs = (0..6).map(|_| Keypair::generate()).collect::<Vec<_>>();
+        let identities = keypairs
+            .iter()
+            .enumerate()
+            .map(|(index, keypair)| {
+                NodeIdentity::new(
+                    keypair.public,
+                    (index == 0).then_some(keypair.secret),
+                    "tcp",
+                    "127.0.0.1",
+                    8000 + index as u16,
+                    false,
+                )
+            })
+            .collect::<Vec<_>>();
+
+        let root_genesis = genesis_epoch(identities.clone());
+        let subnet_id = ConsensusGroupId::named("cache-hotset-a");
+        let subnet_genesis = genesis_epoch_for_group(subnet_id, identities[..3].to_vec());
+
+        let mut root_config = RuntimeConfig::new(identities[0].clone());
+        root_config.genesis = Some(root_genesis.clone());
+        let root_runtime = NodeRuntime::new(root_config);
+
+        let mut subnet_config = RuntimeConfig::new(identities[0].clone());
+        subnet_config.group_id = subnet_id;
+        subnet_config.genesis = Some(subnet_genesis.clone());
+        let subnet_runtime = NodeRuntime::new(subnet_config);
+        subnet_runtime
+            .set_application_state(b"subnet-only")
+            .unwrap();
+
+        let root_target = root_runtime.next_epoch_target().unwrap();
+        let subnet_target = subnet_runtime.next_epoch_target().unwrap();
+        let node = TcpMultiGroupNode::new(MultiGroupRuntime::with_groups(
+            root_runtime,
+            [subnet_runtime],
+        ));
+
+        match node.handle_request(WireRequest::NextNonce).await.unwrap() {
+            WireResponse::NextNonce(target) => {
+                assert_eq!(target.last_epoch, root_target.last_epoch)
+            }
+            response => panic!("expected root next nonce, got {}", response.kind()),
+        }
+
+        let grouped_next = WireRequest::Group {
+            group_id: subnet_id,
+            request: Box::new(WireRequest::NextNonce),
+        };
+        match node.handle_request(grouped_next).await.unwrap() {
+            WireResponse::NextNonce(target) => {
+                assert_eq!(target.last_epoch, subnet_target.last_epoch);
+                assert_eq!(target.nonce, subnet_target.nonce);
+            }
+            response => panic!("expected subnet next nonce, got {}", response.kind()),
+        }
+
+        let grouped_ping = WireRequest::Group {
+            group_id: subnet_id,
+            request: Box::new(WireRequest::Ping(crate::NodePing::new(7))),
+        };
+        match node.handle_request(grouped_ping).await.unwrap() {
+            WireResponse::Pong(pong) => {
+                assert_eq!(pong.group_id, subnet_id);
+                assert_eq!(pong.public_key, keypairs[0].public);
+                assert_eq!(pong.nonce, 7);
+                assert!(pong.payload.is_empty());
+            }
+            response => panic!("expected subnet pong, got {}", response.kind()),
+        }
+
+        let grouped_dispatch = WireRequest::Group {
+            group_id: subnet_id,
+            request: Box::new(WireRequest::Dispatch { round: 0 }),
+        };
+        match node.handle_request(grouped_dispatch).await.unwrap() {
+            WireResponse::Dispatch(dispatch) => {
+                assert_eq!(dispatch.header.last_epoch, subnet_target.last_epoch);
+                let block = dispatch.body.blocks.values().next().unwrap();
+                assert_eq!(block.application_state(), b"subnet-only");
+            }
+            response => panic!("expected subnet dispatch, got {}", response.kind()),
+        }
+
+        let unknown_group = WireRequest::Group {
+            group_id: ConsensusGroupId::named("not-hosted"),
+            request: Box::new(WireRequest::NextNonce),
+        };
+        assert!(matches!(
+            node.handle_request(unknown_group).await,
+            Err(BlossomError::WireProtocol(message)) if message.contains("unknown consensus group")
+        ));
     }
 }

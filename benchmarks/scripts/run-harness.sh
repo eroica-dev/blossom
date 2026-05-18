@@ -50,8 +50,8 @@ pinned_exec "${cmd[@]}" \
   --iterations "${ITERATIONS:-10}" \
   --warmup "${WARMUP:-1}" \
   --delivery-mode "${DELIVERY_MODE:-all-peers}" \
-  "${trusted_arg[@]}" \
-  "${external_hash_arg[@]}" \
+  ${trusted_arg[@]+"${trusted_arg[@]}"} \
+  ${external_hash_arg[@]+"${external_hash_arg[@]}"} \
   --csv "$out"
 
 echo "wrote $out"

@@ -342,6 +342,177 @@ fn bench_block_scaling(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_filtered_transactions(c: &mut Criterion) {
+    #[cfg(feature = "filtered-transactions")]
+    {
+        let mut group = c.benchmark_group("filtered_transactions");
+        group.sample_size(10);
+
+        let target = Keypair::generate();
+        let non_target = Keypair::generate();
+        let payload = vec![7; 4096];
+        let slot = blossom::FilteredTransactionSlot::for_payload(
+            HashType::hash(b"bench-key"),
+            1,
+            vec![target.public],
+            &payload,
+            blossom::FilteredDeliveryPolicy::Gossip,
+        )
+        .unwrap();
+
+        group.throughput(Throughput::Bytes(payload.len() as u64));
+        group.bench_function("filtered_full_4kb", |b| {
+            b.iter(|| {
+                black_box(
+                    Transaction::filtered_full(
+                        HashType::hash(b"bench-key"),
+                        1,
+                        vec![target.public],
+                        black_box(payload.clone()),
+                        blossom::FilteredDeliveryPolicy::Gossip,
+                    )
+                    .unwrap(),
+                )
+            });
+        });
+
+        group.bench_function("filtered_tombstone_from_slot", |b| {
+            b.iter(|| black_box(Transaction::filtered_tombstone(black_box(slot.clone())).unwrap()));
+        });
+
+        let full = Transaction::filtered_full(
+            HashType::hash(b"bench-key"),
+            1,
+            vec![target.public],
+            payload.clone(),
+            blossom::FilteredDeliveryPolicy::Gossip,
+        )
+        .unwrap();
+        group.bench_function("materialize_target_full_view", |b| {
+            b.iter(|| black_box(black_box(&full).materialize_for(&target.public)));
+        });
+        group.bench_function("materialize_non_target_tombstone", |b| {
+            b.iter(|| black_box(black_box(&full).materialize_for(&non_target.public)));
+        });
+
+        let mut block = Block::default();
+        for index in 0..1_000usize {
+            let mut tx_payload = vec![0; 128];
+            tx_payload[..8].copy_from_slice(&(index as u64).to_le_bytes());
+            block.body.txs.push(
+                Transaction::filtered_full(
+                    HashType::hash(&tx_payload[..8]),
+                    1,
+                    vec![target.public],
+                    tx_payload,
+                    blossom::FilteredDeliveryPolicy::Gossip,
+                )
+                .unwrap(),
+            );
+        }
+        group.throughput(Throughput::Elements(block.body.txs.len() as u64));
+        group.bench_function("materialize_block_1000_non_target", |b| {
+            b.iter(|| black_box(black_box(&block).materialize_for(&non_target.public)));
+        });
+
+        group.finish();
+    }
+}
+
+fn bench_availability_gossip(c: &mut Criterion) {
+    #[cfg(feature = "availability-gossip")]
+    {
+        let mut group = c.benchmark_group("availability_gossip");
+        group.sample_size(10);
+
+        let holder = Keypair::generate();
+        let target = Keypair::generate();
+        let entries = (0..128usize)
+            .map(|index| {
+                let mut payload = vec![0; 256];
+                payload[..8].copy_from_slice(&(index as u64).to_le_bytes());
+                let slot = blossom::FilteredTransactionSlot::for_payload(
+                    HashType::hash(&payload[..8]),
+                    1,
+                    vec![target.public],
+                    &payload,
+                    blossom::FilteredDeliveryPolicy::Gossip,
+                )
+                .unwrap();
+                blossom::AvailabilityEntry::new(slot).unwrap()
+            })
+            .collect::<Vec<_>>();
+
+        let body = blossom::AvailabilityGossipBody {
+            scope: blossom::ConsensusGroupId::root(),
+            holder: holder.public,
+            entries,
+        };
+        group.throughput(Throughput::Elements(body.entries.len() as u64));
+        group.bench_function("sign_gossip_128_entries", |b| {
+            let signer = holder.signer();
+            b.iter(|| {
+                black_box(
+                    blossom::AvailabilityGossip::signed(black_box(body.clone()), &signer).unwrap(),
+                )
+            });
+        });
+
+        let gossip = blossom::AvailabilityGossip::signed(body.clone(), &holder.signer()).unwrap();
+        group.bench_function("verify_gossip_128_entries", |b| {
+            b.iter(|| {
+                black_box(&gossip).verify().unwrap();
+                black_box(())
+            });
+        });
+
+        let payload = vec![9; 4096];
+        let slot = blossom::FilteredTransactionSlot::for_payload(
+            HashType::hash(b"delivery-key"),
+            1,
+            vec![target.public],
+            &payload,
+            blossom::FilteredDeliveryPolicy::Gossip,
+        )
+        .unwrap();
+        let delivery_body = blossom::FilteredPayloadDeliveryBody {
+            scope: blossom::ConsensusGroupId::root(),
+            holder: holder.public,
+            slot_hash: slot.hash(),
+            slot,
+            payload,
+        };
+        group.throughput(Throughput::Bytes(delivery_body.payload.len() as u64));
+        group.bench_function("sign_delivery_4kb", |b| {
+            let signer = holder.signer();
+            b.iter(|| {
+                black_box(
+                    blossom::FilteredPayloadDelivery::signed(
+                        black_box(delivery_body.clone()),
+                        &signer,
+                    )
+                    .unwrap(),
+                )
+            });
+        });
+
+        let delivery =
+            blossom::FilteredPayloadDelivery::signed(delivery_body, &holder.signer()).unwrap();
+        group.bench_function("verify_delivery_4kb", |b| {
+            b.iter(|| {
+                black_box(&delivery).verify().unwrap();
+                black_box(())
+            });
+        });
+
+        group.bench_function("ideal_rounds_36_fanout_6", |b| {
+            b.iter(|| black_box(blossom::ideal_push_gossip_rounds(36, 6).unwrap()));
+        });
+
+        group.finish();
+    }
+}
+
 fn block_with_txs(count: usize) -> Block {
     let mut block = Block::default();
     block.body.last_epoch = HashType([1; 32]);
@@ -464,6 +635,8 @@ criterion_group!(
     bench_protocol_messages,
     bench_runtime,
     bench_block_index,
-    bench_block_scaling
+    bench_block_scaling,
+    bench_filtered_transactions,
+    bench_availability_gossip
 );
 criterion_main!(benches);

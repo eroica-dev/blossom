@@ -16,6 +16,7 @@ use crate::blossom::{
 };
 use crate::crypto::{PubKey, Signature};
 use crate::error::{BlossomError, Result};
+use crate::group::ConsensusGroupId;
 use crate::hash::{DoHash, HashType};
 use crate::node::{NodeIdentity, NodeType};
 use crate::nonce::Nonce;
@@ -143,6 +144,7 @@ impl LocalState {
                 hash: HashType::default(),
                 signatures: BTreeMap::default(),
                 body: EpochBody {
+                    group_id: last_epoch.body.group_id,
                     verifiers: last_epoch.body.verifiers.clone(),
                     last_epoch: *proposed_last_epoch_hash,
                     nonce: expected_nonce,
@@ -155,6 +157,7 @@ impl LocalState {
                 hash: HashType::default(),
                 signatures: BTreeMap::default(),
                 body: EpochBody {
+                    group_id: last_epoch.body.group_id,
                     verifiers: last_epoch.body.verifiers.clone(),
                     last_epoch: last_epoch.hash,
                     nonce: expected_nonce,
@@ -235,6 +238,7 @@ impl Epoch {
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
 pub struct EpochBody {
+    pub group_id: ConsensusGroupId,
     pub verifiers: IndexTreeMap<PubKey, NodeIdentity>,
     pub last_epoch: HashType,
     pub nonce: Nonce,
@@ -255,6 +259,7 @@ impl EpochBody {
 
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut bytes = Vec::new();
+        bytes.extend_from_slice(self.group_id.as_ref());
         bytes.extend_from_slice(self.last_epoch.as_ref());
         bytes.extend_from_slice(&self.nonce.to_le_bytes());
         bytes.extend_from_slice(self.merkle_root.as_ref());

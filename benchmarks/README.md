@@ -12,6 +12,7 @@ test suite.
 | `harness` | Local TCP simulation | How expensive is a full node scenario: spawn cluster, register block service, submit block, dispatch, deliver? |
 | `harness-matrix` | Shell matrix over harness parameters | How does the full scenario change with node count and transaction count? |
 | `load` | Large local TCP simulation | What happens when a block carries hundreds of thousands or millions of transactions, and how many framed bytes move? |
+| `gossip` | Local TCP availability-gossip simulation | How many rounds, messages, bytes, and microseconds does filtered-payload gossip plus fetch take? |
 | `epoch-depth` | In-memory protocol simulation | How do paper-aligned quorum rounds behave across consecutive epochs? |
 
 ## Commands
@@ -40,6 +41,32 @@ Run a million-transaction load benchmark:
 ```bash
 TRANSACTIONS=1000000 TX_BYTES=32 NODES=6 ITERATIONS=1 \
   ./benchmarks/scripts/run-load.sh
+```
+
+Run a filtered-payload availability-gossip benchmark:
+
+```bash
+NODES=36 ENTRIES=128 PAYLOAD_BYTES=4096 FANOUT=6 TARGETS_PER_ENTRY=6 \
+  ./benchmarks/scripts/run-gossip.sh
+```
+
+Run a gossip validation matrix across odd/even node counts, sparse/all-target
+delivery, verified/trusted mode, and a small single-fetch equivalence case:
+
+```bash
+ITERATIONS=2 WARMUP=0 ./benchmarks/scripts/run-gossip-matrix.sh
+```
+
+Run deterministic failure-mode probes:
+
+```bash
+./benchmarks/scripts/run-gossip-failures.sh
+```
+
+Run a longer gossip soak. The default duration is 30 minutes:
+
+```bash
+DURATION_SECONDS=1800 ./benchmarks/scripts/run-gossip-soak.sh
 ```
 
 Run the same TCP harness in known-member trusted mode:
@@ -135,13 +162,12 @@ test a lower or higher ceiling. Frame and raw-dispatch limits are read once at
 process startup, so set these environment variables before launching the
 benchmark or node process.
 
-`BLOSSOM_HOT_WIRE_CODEC=1` opts outgoing TCP dispatch frames into the
-experimental BLSM v1 codec. Decoders accept both Borsh and BLSM frames so mixed
-read-side tests stay compatible, and explicit hot helpers still exist for
-block-frame microbenchmarks. Runtime writers keep submit/send-block on Borsh
-because those paths must materialize owned blocks today; BLSM is selected for
-dispatch where receivers can authenticate the header and keep the block payload
-raw until consensus verification actually needs it.
+`BLOSSOM_HOT_WIRE_CODEC=1` opts outgoing TCP submit-block, send-block, and
+dispatch frames into the experimental BLSM v1 codec. Decoders accept both Borsh
+and BLSM frames so mixed read-side tests stay compatible. Dispatch receivers can
+authenticate the header and keep the block payload raw until consensus
+verification actually needs it; submit/send-block still materialize owned blocks
+after parsing, but avoid Borsh's generic collection overhead on large payloads.
 
 The hot encoder preallocates exact frame sizes with checked length calculators
 before writing payload bytes. That avoids large buffer growth copies during
@@ -160,6 +186,23 @@ trusted load tests.
 cluster. `DELIVERY_MODE=first-accepted` stops after the first accepting peer,
 which is the default for `run-load.sh` so million-transaction runs profile one
 successful peer hop without multiplying loopback traffic across the quorum.
+
+`run-gossip.sh` uses the real TCP harness to model filtered-payload
+availability gossip. Node 0 submits filtered payloads, one signed metadata
+gossip message is pushed through deterministic fanout rounds until the cluster
+is informed, and each authorized target fetches and stores its payload unless
+`SKIP_FETCH=1` is set. Fetches are batched per target by default; set
+`SINGLE_FETCH=1` to measure the older one-payload-per-request flow. The CSV
+separates metadata wire bytes from payload-fetch wire bytes so the gossip
+control plane and data plane can be analyzed independently.
+
+Set `EXPECT_COMPLETE=1` to fail a gossip benchmark if metadata does not reach
+all nodes or any target-authorized payload fetch is not delivered. Set
+`DROP_GOSSIP_EVERY=N` to deterministically drop every Nth gossip send before
+the TCP request is opened; this is intended for validation and failure probes,
+not throughput reporting. `run-gossip-matrix.sh` always enables the completion
+assertion, while `run-gossip-failures.sh` intentionally checks an incomplete
+blackout scenario.
 
 `run-epoch-depth.sh` is intentionally in-memory. It models the paper's epoch
 shape before transport costs are introduced: every node creates one capped

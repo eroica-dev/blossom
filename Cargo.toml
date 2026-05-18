@@ -7,7 +7,9 @@ license = "UNLICENSED"
 
 [features]
 default = []
+availability-gossip = ["filtered-transactions"]
 external-transaction-hashes = []
+filtered-transactions = []
 insecure-fast-hash = ["dep:xxhash-rust"]
 
 [dependencies]

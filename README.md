@@ -12,6 +12,9 @@ node surface:
 - Quorum and round selection.
 - Consensus state, temporary quorum state, proposal/verification counting, and epoch advancement.
 - Indexed verifier membership, epoch approval checks, and Merkle-rooted epoch block sets.
+- Parallel consensus groups for a root network plus narrower-purpose
+  subnets with separate membership, epoch chains, and block/application
+  data.
 - Bounded opaque application state in each block header for piggy-backed
   coordination signals.
 - Address book and service registration for block, engine, consensus, relay, and address-book services.
@@ -21,6 +24,11 @@ node surface:
 - Optional trusted-cluster mode for private known-member deployments that
   skip block/message signatures while retaining membership and hash/merkle
   integrity checks.
+- Optional `filtered-transactions` build feature for committing a canonical
+  transaction slot to every validator while allowing non-target nodes to keep
+  only a tombstone and payload commitment.
+- Optional `availability-gossip` build feature for disseminating filtered
+  payload availability and serving target-authorized payload fetches.
 - Optional `insecure-fast-hash` build feature for trusted/performance
   experiments that swaps protocol SHA-256 commitments for XXH3.
 - A raw TCP `blossom-node` binary with a length-prefixed Borsh wire protocol for health, state, address book, block intake, dispatch, and message handling.
@@ -40,9 +48,13 @@ block/engine services together.
 - `src/state.rs`: local state, epoch chain, indexed verifier membership, epoch approval, temporary consensus/quorum state, proposal and verification counts.
 - `src/register.rs`: Blossom message matrix and quorum queue.
 - `src/algorithm.rs`: deterministic quorum/round selection.
+- `src/group.rs`: stable root/subnet consensus group identifiers.
+- `src/availability.rs`: filtered payload availability gossip, fetch, and
+  dissemination estimates.
 - `src/crypto.rs`: Ed25519 public keys, secret keys, signatures, and key generation.
-- `src/block.rs`: signed block, opaque transaction payloads, and bounded
-  opaque application-state payload used by dispatch verification.
+- `src/block.rs`: signed block, opaque transaction payloads, optional
+  filtered transaction slots, and bounded opaque application-state payload
+  used by dispatch verification.
 - `src/address_book.rs`: service registry copied from the Eden runtime shape.
 - `src/local_block.rs`: local signed block queue and build-block helper.
 - `src/overlay.rs`: overlay runtime, fan-out strategies, and broadcast reports.
@@ -95,9 +107,11 @@ accepts non-cryptographic commitments.
 Wire requests:
 
 - `Health`
+- `Ping(NodePing)`
 - `State`
 - `AddressBook`
 - `RegisterService(Service)`
+- `Group { group_id, request }`
 - `NextNonce`
 - `SubmitBlock(Block)`
 - `Dispatch { round }`
@@ -115,6 +129,26 @@ Borsh-encoded WireRequest
 ```
 
 The response uses the same framing with `WireResponse`.
+
+## Ping A Peer Directly
+
+For point-to-point liveness, send `WireRequest::Ping(NodePing)` directly to
+the peer's consensus service. This returns `WireResponse::Pong(NodePong)`
+without entering consensus, advancing an epoch, dispatching a block, or
+broadcasting to a quorum. The nonce and payload are echoed so callers can
+verify the round trip.
+
+```rust
+use blossom::{NodePing, TcpServiceClient};
+
+let client = TcpServiceClient::new();
+let pong = client
+    .ping(&peer_consensus_service, NodePing::with_payload(42, b"hello"))
+    .await?;
+
+assert_eq!(pong.nonce, 42);
+assert_eq!(pong.payload, b"hello");
+```
 
 ## Use As An Overlay
 
@@ -139,6 +173,45 @@ for deployers that want consensus nodes to send application-level
 messages through the selected topology. The address book supports
 multiple services per kind, so each consensus peer can be registered
 independently.
+
+## Use Consensus Subnets
+
+Blossom can host a root consensus group for the full network and one or
+more narrower subnets for purpose-specific data sharing. A subnet has its
+own `ConsensusGroupId`, verifier membership, epoch chain, local block
+queue, and block-carried application state. The group id is committed into
+the genesis epoch hash, so blocks and signed protocol messages from one
+group cannot be replayed into another group with a different id.
+
+```rust
+use blossom::{
+    ConsensusGroupId, MultiGroupRuntime, NodeRuntime, RuntimeConfig,
+    WireRequest, genesis_epoch, genesis_epoch_for_group,
+};
+
+let root_genesis = genesis_epoch(all_nodes.clone());
+let subnet_id = ConsensusGroupId::named("cache-hotset-a");
+let subnet_genesis = genesis_epoch_for_group(subnet_id, cache_nodes.clone());
+
+let mut root_config = RuntimeConfig::new(self_node.clone());
+root_config.genesis = Some(root_genesis);
+let root = NodeRuntime::new(root_config);
+
+let mut subnet_config = RuntimeConfig::for_group(self_node, subnet_id);
+subnet_config.genesis = Some(subnet_genesis);
+let subnet = NodeRuntime::new(subnet_config);
+
+let multi = MultiGroupRuntime::with_groups(root, [subnet]);
+let subnet_request = WireRequest::Group {
+    group_id: subnet_id,
+    request: Box::new(WireRequest::NextNonce),
+};
+```
+
+Ungrouped TCP requests are routed to the root group. Grouped requests are
+routed to the matching subnet, which lets a single node process participate
+in multiple parallel consensus planes while keeping each plane's block data
+and application-state payloads separate.
 
 ## Opaque Transaction Payloads
 
@@ -177,6 +250,71 @@ in `TransactionPayload`. For trusted deployments where the application already
 has a stable key or content hash, the `external-transaction-hashes` feature lets
 callers provide that identifier while still committing the payload bytes into
 the block hash.
+
+## Filtered Transactions
+
+The optional `filtered-transactions` feature supports selective payload
+materialization without changing the consensus shape. Every validator commits
+the same filtered transaction slot: key hash, application kind, sorted target
+set, payload commitment, payload length, and delivery policy. Target nodes can
+store the full payload locally; non-target nodes store a tombstone. Both views
+produce the same transaction id, Merkle root, and block hash.
+
+```rust
+use blossom::{FilteredDeliveryPolicy, HashType, Transaction};
+
+let full = Transaction::filtered_full(
+    HashType::hash(b"session:42"),
+    1,
+    vec![target_node],
+    b"cached-value".to_vec(),
+    FilteredDeliveryPolicy::Gossip,
+)?;
+
+let slot = full.filtered_slot().unwrap().clone();
+let tombstone = Transaction::filtered_tombstone(slot)?;
+
+assert_eq!(full.hash, tombstone.hash);
+assert_eq!(full.to_bytes(), tombstone.to_bytes());
+```
+
+This is intentionally named filtered rather than private. The first layer
+commits routing metadata and payload hashes; it does not hide metadata or
+provide encryption by itself. The `availability-gossip` feature flag is reserved
+for the follow-on data-availability layer that can advertise and fetch payload
+bytes without forcing all nodes to receive every payload.
+
+With `availability-gossip` enabled, nodes can gossip signed availability
+entries for filtered payloads they hold. Targets then fetch payload bytes from a
+holder and verify the bytes against the committed payload hash. This keeps the
+large data movement out of consensus while avoiding all-to-all payload
+broadcast.
+
+For KVCache-style deployments, keys and payload commitments are usually stable
+for many epochs. That makes gossip a good fit: availability metadata can be
+cached, re-gossiped at a low interval, and refreshed only when holders or
+commitments change.
+
+Dissemination time is measured in gossip rounds:
+
+```text
+ideal_rounds = ceil(log_(fanout + 1)(node_count))
+ideal_delay  = ideal_rounds * gossip_interval
+```
+
+The helper `ideal_push_gossip_rounds(node_count, fanout)` exposes this planning
+estimate. It assumes each informed node reaches `fanout` new peers per round,
+so real deployments should budget at least one extra round for overlap,
+scheduler jitter, and packet loss. For 36 nodes with fanout 6, the ideal is 2
+rounds. At a 100 ms gossip interval, that is about 200 ms ideal dissemination,
+or roughly 300 ms with one safety round.
+
+That estimate is for availability metadata. Time until a target has usable
+payload bytes is:
+
+```text
+metadata_gossip_delay + fetch_rtt + payload_transfer_time + verification_time
+```
 
 ## Piggy-Back Application State
 

@@ -99,6 +99,195 @@ impl From<TransactionPayload> for Vec<u8> {
     }
 }
 
+#[cfg(feature = "filtered-transactions")]
+const FILTERED_TRANSACTION_SLOT_DOMAIN: &[u8] = b"blossom-filtered-transaction-slot:v1";
+
+/// Delivery hint for a filtered transaction payload.
+///
+/// The consensus block commits this policy as metadata only. Applications and
+/// future availability-gossip machinery decide how payload bytes move.
+#[cfg(feature = "filtered-transactions")]
+#[derive(
+    Serialize, Deserialize, BorshSerialize, BorshDeserialize, Debug, Clone, Copy, PartialEq, Eq,
+)]
+#[borsh(use_discriminant = true)]
+#[repr(u8)]
+pub enum FilteredDeliveryPolicy {
+    Direct = 1,
+    Gossip = 2,
+}
+
+#[cfg(feature = "filtered-transactions")]
+impl Default for FilteredDeliveryPolicy {
+    fn default() -> Self {
+        Self::Gossip
+    }
+}
+
+/// Local materialization state for a filtered transaction.
+#[cfg(feature = "filtered-transactions")]
+#[derive(
+    Serialize, Deserialize, BorshSerialize, BorshDeserialize, Debug, Clone, Copy, PartialEq, Eq,
+)]
+#[borsh(use_discriminant = true)]
+#[repr(u8)]
+pub enum FilteredPayloadView {
+    Transparent = 0,
+    Full = 1,
+    Tombstone = 2,
+}
+
+#[cfg(feature = "filtered-transactions")]
+impl Default for FilteredPayloadView {
+    fn default() -> Self {
+        Self::Transparent
+    }
+}
+
+/// Canonical metadata for a filtered transaction slot.
+///
+/// Every node commits the same slot into the block hash. Target nodes may also
+/// carry the full payload locally, while non-target nodes carry a tombstone and
+/// verify only the slot commitment.
+#[cfg(feature = "filtered-transactions")]
+#[derive(Serialize, Deserialize, BorshSerialize, BorshDeserialize, Debug, Clone, PartialEq, Eq)]
+pub struct FilteredTransactionSlot {
+    pub key_hash: HashType,
+    pub kind: u16,
+    pub targets: Vec<PubKey>,
+    pub payload_commitment: HashType,
+    pub payload_len: u64,
+    pub delivery_policy: FilteredDeliveryPolicy,
+}
+
+#[cfg(feature = "filtered-transactions")]
+impl FilteredTransactionSlot {
+    pub fn new(
+        key_hash: HashType,
+        kind: u16,
+        targets: impl Into<Vec<PubKey>>,
+        payload_commitment: HashType,
+        payload_len: u64,
+        delivery_policy: FilteredDeliveryPolicy,
+    ) -> Result<Self> {
+        let mut slot = Self {
+            key_hash,
+            kind,
+            targets: targets.into(),
+            payload_commitment,
+            payload_len,
+            delivery_policy,
+        };
+        slot.normalize_targets();
+        slot.validate()?;
+        Ok(slot)
+    }
+
+    pub fn for_payload(
+        key_hash: HashType,
+        kind: u16,
+        targets: impl Into<Vec<PubKey>>,
+        payload: &[u8],
+        delivery_policy: FilteredDeliveryPolicy,
+    ) -> Result<Self> {
+        Self::new(
+            key_hash,
+            kind,
+            targets,
+            HashType::hash(payload),
+            payload.len() as u64,
+            delivery_policy,
+        )
+    }
+
+    pub fn hash(&self) -> HashType {
+        let mut hasher = ProtocolHasher::new();
+        self.update_hash(&mut hasher);
+        hasher.finalize()
+    }
+
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(self.encoded_len());
+        self.append_bytes_to(&mut bytes);
+        bytes
+    }
+
+    pub fn encoded_len(&self) -> usize {
+        FILTERED_TRANSACTION_SLOT_DOMAIN.len()
+            + 32
+            + 2
+            + 4
+            + (self.canonical_targets().len() * 32)
+            + 32
+            + 8
+            + 1
+    }
+
+    pub fn append_bytes_to(&self, bytes: &mut Vec<u8>) {
+        bytes.extend_from_slice(FILTERED_TRANSACTION_SLOT_DOMAIN);
+        bytes.extend_from_slice(self.key_hash.as_ref());
+        bytes.extend_from_slice(&self.kind.to_le_bytes());
+        let targets = self.canonical_targets();
+        bytes.extend_from_slice(&(targets.len() as u32).to_le_bytes());
+        for target in targets {
+            bytes.extend_from_slice(target.as_ref());
+        }
+        bytes.extend_from_slice(self.payload_commitment.as_ref());
+        bytes.extend_from_slice(&self.payload_len.to_le_bytes());
+        bytes.push(self.delivery_policy as u8);
+    }
+
+    pub fn update_hash(&self, hasher: &mut ProtocolHasher) {
+        hasher.update(FILTERED_TRANSACTION_SLOT_DOMAIN);
+        hasher.update(self.key_hash.as_ref());
+        hasher.update(self.kind.to_le_bytes());
+        let targets = self.canonical_targets();
+        hasher.update((targets.len() as u32).to_le_bytes());
+        for target in targets {
+            hasher.update(target.as_ref());
+        }
+        hasher.update(self.payload_commitment.as_ref());
+        hasher.update(self.payload_len.to_le_bytes());
+        hasher.update([self.delivery_policy as u8]);
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        if self.targets.is_empty() {
+            return Err(BlossomError::WireProtocol(
+                "filtered transaction target set cannot be empty".to_string(),
+            ));
+        }
+        let canonical = self.canonical_targets();
+        if canonical.len() != self.targets.len() {
+            return Err(BlossomError::WireProtocol(
+                "filtered transaction targets must be unique".to_string(),
+            ));
+        }
+        if canonical != self.targets {
+            return Err(BlossomError::WireProtocol(
+                "filtered transaction targets must be sorted".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn is_target(&self, public_key: &PubKey) -> bool {
+        self.targets.binary_search(public_key).is_ok()
+    }
+
+    fn normalize_targets(&mut self) {
+        self.targets.sort();
+        self.targets.dedup();
+    }
+
+    fn canonical_targets(&self) -> Vec<PubKey> {
+        let mut targets = self.targets.clone();
+        targets.sort();
+        targets.dedup();
+        targets
+    }
+}
+
 /// A hash-identified opaque application transaction.
 ///
 /// The transaction hash is used by the block Merkle root. The payload bytes are
@@ -108,6 +297,10 @@ impl From<TransactionPayload> for Vec<u8> {
 pub struct Transaction {
     pub hash: HashType,
     pub payload: TransactionPayload,
+    #[cfg(feature = "filtered-transactions")]
+    pub filtered_slot: Option<FilteredTransactionSlot>,
+    #[cfg(feature = "filtered-transactions")]
+    pub filtered_view: FilteredPayloadView,
 }
 
 impl Transaction {
@@ -118,6 +311,10 @@ impl Transaction {
         Self {
             hash,
             payload: TransactionPayload { bytes },
+            #[cfg(feature = "filtered-transactions")]
+            filtered_slot: None,
+            #[cfg(feature = "filtered-transactions")]
+            filtered_view: FilteredPayloadView::Transparent,
         }
     }
 
@@ -125,7 +322,14 @@ impl Transaction {
     pub fn from_payload(payload: impl Into<TransactionPayload>) -> Self {
         let payload = payload.into();
         let hash = HashType::hash(&payload.bytes);
-        Self { hash, payload }
+        Self {
+            hash,
+            payload,
+            #[cfg(feature = "filtered-transactions")]
+            filtered_slot: None,
+            #[cfg(feature = "filtered-transactions")]
+            filtered_view: FilteredPayloadView::Transparent,
+        }
     }
 
     #[inline]
@@ -133,6 +337,75 @@ impl Transaction {
         Self {
             hash,
             payload: payload.into(),
+            #[cfg(feature = "filtered-transactions")]
+            filtered_slot: None,
+            #[cfg(feature = "filtered-transactions")]
+            filtered_view: FilteredPayloadView::Transparent,
+        }
+    }
+
+    /// Builds a filtered transaction for a target set that receives the full
+    /// local payload.
+    ///
+    /// The transaction identifier is the canonical slot hash. Non-target peers
+    /// can materialize the same slot with [`Transaction::filtered_tombstone`]
+    /// and still verify the same block hash.
+    #[cfg(feature = "filtered-transactions")]
+    #[inline]
+    pub fn filtered_full(
+        key_hash: HashType,
+        kind: u16,
+        targets: impl Into<Vec<PubKey>>,
+        payload: impl Into<TransactionPayload>,
+        delivery_policy: FilteredDeliveryPolicy,
+    ) -> Result<Self> {
+        let payload = payload.into();
+        let slot = FilteredTransactionSlot::for_payload(
+            key_hash,
+            kind,
+            targets,
+            payload.as_slice(),
+            delivery_policy,
+        )?;
+        Ok(Self::from_filtered_parts(
+            slot.hash(),
+            slot,
+            payload,
+            FilteredPayloadView::Full,
+        ))
+    }
+
+    /// Builds a filtered tombstone from canonical slot metadata.
+    ///
+    /// Tombstones carry no local payload, but their block hash contribution is
+    /// identical to the matching full transaction.
+    #[cfg(feature = "filtered-transactions")]
+    #[inline]
+    pub fn filtered_tombstone(slot: FilteredTransactionSlot) -> Result<Self> {
+        let mut slot = slot;
+        slot.normalize_targets();
+        slot.validate()?;
+        Ok(Self::from_filtered_parts(
+            slot.hash(),
+            slot,
+            TransactionPayload::default(),
+            FilteredPayloadView::Tombstone,
+        ))
+    }
+
+    #[cfg(feature = "filtered-transactions")]
+    #[inline]
+    pub(crate) fn from_filtered_parts(
+        hash: HashType,
+        slot: FilteredTransactionSlot,
+        payload: impl Into<TransactionPayload>,
+        filtered_view: FilteredPayloadView,
+    ) -> Self {
+        Self {
+            hash,
+            payload: payload.into(),
+            filtered_slot: Some(slot),
+            filtered_view,
         }
     }
 
@@ -172,9 +445,57 @@ impl Transaction {
         self.payload.bytes.len()
     }
 
+    #[cfg(feature = "filtered-transactions")]
+    #[inline]
+    pub fn committed_payload_len(&self) -> u64 {
+        self.filtered_slot
+            .as_ref()
+            .map(|slot| slot.payload_len)
+            .unwrap_or(self.payload.bytes.len() as u64)
+    }
+
     #[inline]
     pub fn is_empty(&self) -> bool {
         self.payload.bytes.is_empty()
+    }
+
+    /// Returns a local view of this transaction for `viewer`.
+    ///
+    /// Transparent transactions are unchanged. Filtered full transactions are
+    /// converted to tombstones when the viewer is not in the target set. The
+    /// canonical transaction hash is preserved.
+    #[cfg(feature = "filtered-transactions")]
+    pub fn materialize_for(&self, viewer: &PubKey) -> Self {
+        let Some(slot) = &self.filtered_slot else {
+            return self.clone();
+        };
+        if self.filtered_view == FilteredPayloadView::Full && !slot.is_target(viewer) {
+            return Self::from_filtered_parts(
+                self.hash,
+                slot.clone(),
+                TransactionPayload::default(),
+                FilteredPayloadView::Tombstone,
+            );
+        }
+        self.clone()
+    }
+
+    #[cfg(feature = "filtered-transactions")]
+    #[inline]
+    pub fn is_filtered(&self) -> bool {
+        self.filtered_slot.is_some()
+    }
+
+    #[cfg(feature = "filtered-transactions")]
+    #[inline]
+    pub fn is_filtered_tombstone(&self) -> bool {
+        self.filtered_slot.is_some() && self.filtered_view == FilteredPayloadView::Tombstone
+    }
+
+    #[cfg(feature = "filtered-transactions")]
+    #[inline]
+    pub fn filtered_slot(&self) -> Option<&FilteredTransactionSlot> {
+        self.filtered_slot.as_ref()
     }
 
     #[inline]
@@ -210,7 +531,90 @@ impl Transaction {
 
     #[inline]
     pub fn to_bytes(&self) -> Vec<u8> {
-        [self.hash.as_ref(), self.payload.bytes.as_slice()].concat()
+        let mut bytes = Vec::with_capacity(self.canonical_encoded_len());
+        self.append_canonical_bytes_to(&mut bytes);
+        bytes
+    }
+
+    #[inline]
+    fn canonical_encoded_len(&self) -> usize {
+        32 + self.canonical_payload_encoded_len()
+    }
+
+    #[inline]
+    fn canonical_payload_encoded_len(&self) -> usize {
+        #[cfg(feature = "filtered-transactions")]
+        if let Some(slot) = &self.filtered_slot {
+            return slot.encoded_len();
+        }
+
+        self.payload.bytes.len()
+    }
+
+    fn append_canonical_bytes_to(&self, bytes: &mut Vec<u8>) {
+        bytes.extend_from_slice(self.hash.as_ref());
+        self.append_canonical_payload_to(bytes);
+    }
+
+    fn append_canonical_payload_to(&self, bytes: &mut Vec<u8>) {
+        #[cfg(feature = "filtered-transactions")]
+        if let Some(slot) = &self.filtered_slot {
+            slot.append_bytes_to(bytes);
+            return;
+        }
+
+        bytes.extend_from_slice(self.payload.bytes.as_slice());
+    }
+
+    fn update_canonical_payload_hash(&self, hasher: &mut ProtocolHasher) {
+        #[cfg(feature = "filtered-transactions")]
+        if let Some(slot) = &self.filtered_slot {
+            slot.update_hash(hasher);
+            return;
+        }
+
+        hasher.update(self.payload.bytes.as_slice());
+    }
+
+    #[cfg(feature = "filtered-transactions")]
+    fn validate_filtered_integrity(&self) -> Result<()> {
+        match (&self.filtered_slot, self.filtered_view) {
+            (None, FilteredPayloadView::Transparent) => Ok(()),
+            (None, _) => Err(BlossomError::WireProtocol(
+                "filtered transaction view set without a slot".to_string(),
+            )),
+            (Some(slot), FilteredPayloadView::Transparent) => {
+                slot.validate()?;
+                Err(BlossomError::WireProtocol(
+                    "filtered transaction slot cannot use transparent view".to_string(),
+                ))
+            }
+            (Some(slot), FilteredPayloadView::Tombstone) => {
+                slot.validate()?;
+                if self.hash != slot.hash() {
+                    return Err(BlossomError::InvalidBlockHash);
+                }
+                if !self.payload.bytes.is_empty() {
+                    return Err(BlossomError::WireProtocol(
+                        "filtered tombstone cannot carry payload bytes".to_string(),
+                    ));
+                }
+                Ok(())
+            }
+            (Some(slot), FilteredPayloadView::Full) => {
+                slot.validate()?;
+                if self.hash != slot.hash() {
+                    return Err(BlossomError::InvalidBlockHash);
+                }
+                if self.payload.bytes.len() as u64 != slot.payload_len {
+                    return Err(BlossomError::InvalidBlockHash);
+                }
+                if HashType::hash(self.payload.bytes.as_slice()) != slot.payload_commitment {
+                    return Err(BlossomError::InvalidBlockHash);
+                }
+                Ok(())
+            }
+        }
     }
 }
 
@@ -292,6 +696,7 @@ impl Block {
 
     pub fn verify_unsigned_integrity_with_hash(&self, expected_hash: HashType) -> Result<()> {
         self.body.application_state.validate()?;
+        self.body.validate_transactions()?;
         let (body_hash, merkle_root) = self.body.hash_and_merkle_root();
         if self.hash != expected_hash || body_hash != expected_hash {
             return Err(BlossomError::InvalidBlockHash);
@@ -308,6 +713,22 @@ impl Block {
 
     pub fn is_empty(&self) -> bool {
         self.body.txs.is_empty()
+    }
+
+    /// Returns a local filtered view of this block for `viewer`.
+    ///
+    /// The block hash, Merkle root, and signature are not changed. Only
+    /// non-target full filtered payloads are replaced by tombstones.
+    #[cfg(feature = "filtered-transactions")]
+    pub fn materialize_for(&self, viewer: &PubKey) -> Self {
+        let mut block = self.clone();
+        block.body.txs = block
+            .body
+            .txs
+            .iter()
+            .map(|tx| tx.materialize_for(viewer))
+            .collect();
+        block
     }
 }
 
@@ -411,10 +832,9 @@ impl BlockBody {
         bytes.extend_from_slice(&(self.application_state.len() as u64).to_le_bytes());
         bytes.extend_from_slice(self.application_state.as_slice());
         for tx in &self.txs {
-            let payload = tx.payload.bytes.as_slice();
             bytes.extend_from_slice(tx.hash.as_ref());
-            bytes.extend_from_slice(&(payload.len() as u64).to_le_bytes());
-            bytes.extend_from_slice(payload);
+            bytes.extend_from_slice(&(tx.canonical_payload_encoded_len() as u64).to_le_bytes());
+            tx.append_canonical_payload_to(bytes);
         }
     }
 
@@ -429,7 +849,7 @@ impl BlockBody {
             + self
                 .txs
                 .iter()
-                .map(|tx| 32 + 8 + tx.payload.bytes.len())
+                .map(|tx| 32 + 8 + tx.canonical_payload_encoded_len())
                 .sum::<usize>()
     }
 
@@ -444,10 +864,9 @@ impl BlockBody {
         hasher.update((self.application_state.len() as u64).to_le_bytes());
         hasher.update(self.application_state.as_slice());
         for tx in &self.txs {
-            let payload = tx.payload.bytes.as_slice();
             hasher.update(tx.hash.as_ref());
-            hasher.update((payload.len() as u64).to_le_bytes());
-            hasher.update(payload);
+            hasher.update((tx.canonical_payload_encoded_len() as u64).to_le_bytes());
+            tx.update_canonical_payload_hash(&mut hasher);
         }
         hasher.finalize()
     }
@@ -464,10 +883,9 @@ impl BlockBody {
         body_hasher.update((self.application_state.len() as u64).to_le_bytes());
         body_hasher.update(self.application_state.as_slice());
         for tx in &self.txs {
-            let payload = tx.payload.bytes.as_slice();
             body_hasher.update(tx.hash.as_ref());
-            body_hasher.update((payload.len() as u64).to_le_bytes());
-            body_hasher.update(payload);
+            body_hasher.update((tx.canonical_payload_encoded_len() as u64).to_le_bytes());
+            tx.update_canonical_payload_hash(&mut body_hasher);
             merkle_hasher.update(tx.hash.as_ref());
         }
         (body_hasher.finalize(), merkle_hasher.finalize())
@@ -475,6 +893,17 @@ impl BlockBody {
 
     pub fn compute_merkle_root(&self) -> HashType {
         HashType::hash_slices(self.txs.iter().map(|tx| tx.hash.as_ref()))
+    }
+
+    fn validate_transactions(&self) -> Result<()> {
+        #[cfg(feature = "filtered-transactions")]
+        {
+            for tx in &self.txs {
+                tx.validate_filtered_integrity()?;
+            }
+        }
+
+        Ok(())
     }
 }
 
@@ -650,6 +1079,83 @@ mod tests {
         assert_eq!(decoded, kv);
         assert_eq!(tx.hash, HashType::hash(tx.payload()));
         assert_eq!(tx.to_bytes(), [tx.hash.as_ref(), tx.payload()].concat());
+    }
+
+    #[cfg(feature = "filtered-transactions")]
+    #[test]
+    fn filtered_transactions_share_canonical_hash_across_full_and_tombstone_views() {
+        let signer = Keypair::generate();
+        let target_a = Keypair::generate();
+        let target_b = Keypair::generate();
+        let non_target = Keypair::generate();
+        let payload = b"cached-value-for-targets".to_vec();
+        let full = Transaction::filtered_full(
+            HashType::hash(b"cache-key"),
+            7,
+            vec![target_b.public, target_a.public],
+            payload.clone(),
+            FilteredDeliveryPolicy::Gossip,
+        )
+        .unwrap();
+        let slot = full.filtered_slot().unwrap().clone();
+        let tombstone = Transaction::filtered_tombstone(slot.clone()).unwrap();
+
+        let mut expected_targets = vec![target_a.public, target_b.public];
+        expected_targets.sort();
+        assert_eq!(slot.targets, expected_targets);
+        assert!(slot.is_target(&target_a.public));
+        assert!(full.is_filtered());
+        assert!(!full.is_filtered_tombstone());
+        assert!(tombstone.is_filtered_tombstone());
+        assert_eq!(full.hash, tombstone.hash);
+        assert_eq!(full.to_bytes(), tombstone.to_bytes());
+        assert_eq!(full.committed_payload_len(), payload.len() as u64);
+        assert_eq!(tombstone.committed_payload_len(), payload.len() as u64);
+
+        let mut full_block = Block::default();
+        full_block.body.last_epoch = HashType([1; 32]);
+        full_block.body.nonce = Nonce::new(1);
+        full_block.body.created = 42;
+        full_block.body.txs.push(full);
+        full_block.sign(&signer.secret);
+
+        let mut tombstone_block = Block::default();
+        tombstone_block.body.last_epoch = HashType([1; 32]);
+        tombstone_block.body.nonce = Nonce::new(1);
+        tombstone_block.body.created = 42;
+        tombstone_block.body.txs.push(tombstone);
+        tombstone_block.sign(&signer.secret);
+
+        assert_eq!(full_block.hash, tombstone_block.hash);
+        assert_eq!(
+            full_block.body.merkle_root,
+            tombstone_block.body.merkle_root
+        );
+        assert!(full_block.verify_integrity().is_ok());
+        assert!(tombstone_block.verify_integrity().is_ok());
+
+        let target_view = full_block.materialize_for(&target_a.public);
+        assert!(!target_view.body.txs[0].is_filtered_tombstone());
+        let non_target_view = full_block.materialize_for(&non_target.public);
+        assert!(non_target_view.body.txs[0].is_filtered_tombstone());
+        assert_eq!(non_target_view.hash, full_block.hash);
+        assert!(non_target_view.verify_integrity().is_ok());
+
+        let mut tampered = full_block;
+        tampered.body.txs[0].payload_mut().as_mut_slice()[0] ^= 0xff;
+        assert_eq!(
+            tampered.verify_integrity(),
+            Err(BlossomError::InvalidBlockHash)
+        );
+
+        let mut invalid_tombstone = tombstone_block;
+        invalid_tombstone.body.txs[0].payload_mut().bytes = b"not-a-tombstone".to_vec();
+        assert_eq!(
+            invalid_tombstone.verify_integrity(),
+            Err(BlossomError::WireProtocol(
+                "filtered tombstone cannot carry payload bytes".to_string()
+            ))
+        );
     }
 
     #[cfg(feature = "external-transaction-hashes")]

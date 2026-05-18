@@ -7,10 +7,19 @@ use std::sync::OnceLock;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use crate::address_book::Service;
+#[cfg(feature = "availability-gossip")]
+use crate::availability::{
+    AvailabilityGossip, AvailabilityReceipt, FilteredPayloadBatchDelivery,
+    FilteredPayloadBatchFetch, FilteredPayloadDelivery, FilteredPayloadFetch,
+    FilteredPayloadMissing,
+};
 use crate::block::{Block, BlockApplicationState, BlockBody, Transaction};
+#[cfg(feature = "filtered-transactions")]
+use crate::block::{FilteredDeliveryPolicy, FilteredPayloadView, FilteredTransactionSlot};
 use crate::blossom::{Dispatch, DispatchBody, Header, SignatureTree, SignaturesForHash};
 use crate::crypto::{PubKey, Signature};
 use crate::error::{BlossomError, Result};
+use crate::group::ConsensusGroupId;
 use crate::hash::HashType;
 use crate::messages::{MSGKey, Msg};
 use crate::nonce::Nonce;
@@ -28,18 +37,45 @@ const HOT_REQUEST_MESSAGE_DISPATCH: u8 = 2;
 const HOT_REQUEST_SEND_BLOCK: u8 = 3;
 const HOT_RESPONSE_DISPATCH: u8 = 64;
 const HOT_RESPONSE_BLOCK: u8 = 65;
+#[cfg(feature = "filtered-transactions")]
+const HOT_FILTERED_TX_TRANSPARENT: u8 = 0;
+#[cfg(feature = "filtered-transactions")]
+const HOT_FILTERED_TX_FULL: u8 = 1;
+#[cfg(feature = "filtered-transactions")]
+const HOT_FILTERED_TX_TOMBSTONE: u8 = 2;
+#[cfg(feature = "filtered-transactions")]
+const HOT_FILTERED_DELIVERY_DIRECT: u8 = 1;
+#[cfg(feature = "filtered-transactions")]
+const HOT_FILTERED_DELIVERY_GOSSIP: u8 = 2;
 static CONFIGURED_MAX_FRAME_SIZE: OnceLock<usize> = OnceLock::new();
 static CONFIGURED_HOT_WIRE_CODEC_ENABLED: OnceLock<bool> = OnceLock::new();
 
 #[derive(Serialize, Deserialize, BorshSerialize, BorshDeserialize, Debug, Clone)]
 pub enum WireRequest {
     Health,
+    Ping(NodePing),
+    #[cfg(feature = "availability-gossip")]
+    AvailabilityGossip(AvailabilityGossip),
+    #[cfg(feature = "availability-gossip")]
+    GetFilteredPayload(FilteredPayloadFetch),
+    #[cfg(feature = "availability-gossip")]
+    GetFilteredPayloadBatch(FilteredPayloadBatchFetch),
+    #[cfg(feature = "availability-gossip")]
+    StoreFilteredPayload(FilteredPayloadDelivery),
+    #[cfg(feature = "availability-gossip")]
+    StoreFilteredPayloadBatch(FilteredPayloadBatchDelivery),
     State,
     AddressBook,
     RegisterService(Service),
+    Group {
+        group_id: ConsensusGroupId,
+        request: Box<WireRequest>,
+    },
     NextNonce,
     SubmitBlock(Block),
-    Dispatch { round: u8 },
+    Dispatch {
+        round: u8,
+    },
     Message(Msg),
     SendNonce(Nonce),
     BlockNonce(Nonce),
@@ -50,6 +86,15 @@ pub enum WireRequest {
 #[derive(Serialize, Deserialize, BorshSerialize, BorshDeserialize, Debug, Clone)]
 pub enum WireResponse {
     Health(NodeHealth),
+    Pong(NodePong),
+    #[cfg(feature = "availability-gossip")]
+    AvailabilityReceipt(AvailabilityReceipt),
+    #[cfg(feature = "availability-gossip")]
+    FilteredPayload(FilteredPayloadDelivery),
+    #[cfg(feature = "availability-gossip")]
+    FilteredPayloadBatch(FilteredPayloadBatchDelivery),
+    #[cfg(feature = "availability-gossip")]
+    FilteredPayloadMissing(FilteredPayloadMissing),
     State(NodeStatus),
     AddressBook(Vec<Service>),
     AddressBookUpdated(AddressBookUpdate),
@@ -66,6 +111,15 @@ impl WireResponse {
     pub fn kind(&self) -> &'static str {
         match self {
             Self::Health(_) => "health",
+            Self::Pong(_) => "pong",
+            #[cfg(feature = "availability-gossip")]
+            Self::AvailabilityReceipt(_) => "availability_receipt",
+            #[cfg(feature = "availability-gossip")]
+            Self::FilteredPayload(_) => "filtered_payload",
+            #[cfg(feature = "availability-gossip")]
+            Self::FilteredPayloadBatch(_) => "filtered_payload_batch",
+            #[cfg(feature = "availability-gossip")]
+            Self::FilteredPayloadMissing(_) => "filtered_payload_missing",
             Self::State(_) => "state",
             Self::AddressBook(_) => "address_book",
             Self::AddressBookUpdated(_) => "address_book_updated",
@@ -84,6 +138,36 @@ impl WireResponse {
 pub struct NodeHealth {
     pub status: String,
     pub public_key: crate::crypto::PubKey,
+}
+
+#[derive(Serialize, Deserialize, BorshSerialize, BorshDeserialize, Debug, Clone, PartialEq, Eq)]
+pub struct NodePing {
+    pub nonce: u64,
+    pub payload: Vec<u8>,
+}
+
+impl NodePing {
+    pub fn new(nonce: u64) -> Self {
+        Self {
+            nonce,
+            payload: Vec::new(),
+        }
+    }
+
+    pub fn with_payload(nonce: u64, payload: impl Into<Vec<u8>>) -> Self {
+        Self {
+            nonce,
+            payload: payload.into(),
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize, BorshSerialize, BorshDeserialize, Debug, Clone, PartialEq, Eq)]
+pub struct NodePong {
+    pub group_id: ConsensusGroupId,
+    pub public_key: crate::crypto::PubKey,
+    pub nonce: u64,
+    pub payload: Vec<u8>,
 }
 
 #[derive(Serialize, Deserialize, BorshSerialize, BorshDeserialize, Debug, Clone)]
@@ -479,7 +563,12 @@ pub fn hot_wire_response_framed_len(value: &WireResponse) -> Result<Option<usize
 }
 
 fn hot_wire_request_is_selected_for_io(value: &WireRequest) -> bool {
-    matches!(value, WireRequest::Message(Msg::Dispatch(_)))
+    matches!(
+        value,
+        WireRequest::SubmitBlock(_)
+            | WireRequest::Message(Msg::Dispatch(_))
+            | WireRequest::SendBlock(_)
+    )
 }
 
 fn hot_wire_response_is_selected_for_io(value: &WireResponse) -> bool {
@@ -832,9 +921,29 @@ fn block_body_wire_len(body: &BlockBody) -> Result<usize> {
         body.application_state.len(),
         4,
         body.txs.iter().try_fold(0usize, |sum, tx| {
-            checked_sum([sum, 32, 4, tx.payload.bytes.len()])
+            checked_sum([sum, transaction_wire_len(tx)?])
         })?,
     ])
+}
+
+fn transaction_wire_len(tx: &Transaction) -> Result<usize> {
+    let base = checked_sum([32, 4, tx.payload.bytes.len()])?;
+
+    #[cfg(feature = "filtered-transactions")]
+    {
+        let slot_len = tx
+            .filtered_slot
+            .as_ref()
+            .map(filtered_slot_wire_len)
+            .transpose()?
+            .unwrap_or(0);
+        checked_sum([base, 1, slot_len])
+    }
+
+    #[cfg(not(feature = "filtered-transactions"))]
+    {
+        Ok(base)
+    }
 }
 
 fn append_block(bytes: &mut Vec<u8>, block: &Block) {
@@ -866,6 +975,7 @@ fn append_block_body(bytes: &mut Vec<u8>, body: &BlockBody) {
         append_hash(bytes, tx.hash);
         append_len(bytes, payload.len());
         bytes.extend_from_slice(payload);
+        append_filtered_tx_metadata(bytes, tx);
     }
 }
 
@@ -893,7 +1003,7 @@ fn take_block_body(input: &mut &[u8]) -> Result<BlockBody> {
         let hash = take_hash(input)?;
         let tx_len = take_len(input, "transaction length")?;
         let bytes = take_exact(input, tx_len, "transaction bytes")?.to_vec();
-        txs.push(Transaction::from_parts(hash, bytes));
+        txs.push(take_transaction_with_metadata(input, hash, bytes)?);
     }
     ensure_empty(input, "block body")?;
 
@@ -907,6 +1017,113 @@ fn take_block_body(input: &mut &[u8]) -> Result<BlockBody> {
         application_state,
         txs,
     })
+}
+
+#[cfg(not(feature = "filtered-transactions"))]
+fn append_filtered_tx_metadata(_bytes: &mut Vec<u8>, _tx: &Transaction) {}
+
+#[cfg(feature = "filtered-transactions")]
+fn append_filtered_tx_metadata(bytes: &mut Vec<u8>, tx: &Transaction) {
+    match (&tx.filtered_slot, tx.filtered_view) {
+        (Some(slot), FilteredPayloadView::Full) => {
+            bytes.push(HOT_FILTERED_TX_FULL);
+            append_filtered_slot(bytes, slot);
+        }
+        (Some(slot), FilteredPayloadView::Tombstone) => {
+            bytes.push(HOT_FILTERED_TX_TOMBSTONE);
+            append_filtered_slot(bytes, slot);
+        }
+        _ => bytes.push(HOT_FILTERED_TX_TRANSPARENT),
+    }
+}
+
+#[cfg(not(feature = "filtered-transactions"))]
+fn take_transaction_with_metadata(
+    _input: &mut &[u8],
+    hash: HashType,
+    bytes: Vec<u8>,
+) -> Result<Transaction> {
+    Ok(Transaction::from_parts(hash, bytes))
+}
+
+#[cfg(feature = "filtered-transactions")]
+fn take_transaction_with_metadata(
+    input: &mut &[u8],
+    hash: HashType,
+    bytes: Vec<u8>,
+) -> Result<Transaction> {
+    let view = match take_u8(input, "filtered transaction view")? {
+        HOT_FILTERED_TX_TRANSPARENT => return Ok(Transaction::from_parts(hash, bytes)),
+        HOT_FILTERED_TX_FULL => FilteredPayloadView::Full,
+        HOT_FILTERED_TX_TOMBSTONE => FilteredPayloadView::Tombstone,
+        other => {
+            return Err(BlossomError::WireProtocol(format!(
+                "unknown filtered transaction view {other}"
+            )));
+        }
+    };
+    let slot = take_filtered_slot(input)?;
+    Ok(Transaction::from_filtered_parts(hash, slot, bytes, view))
+}
+
+#[cfg(feature = "filtered-transactions")]
+fn filtered_slot_wire_len(slot: &FilteredTransactionSlot) -> Result<usize> {
+    checked_sum([32, 2, 4, checked_mul(slot.targets.len(), 32)?, 32, 8, 1])
+}
+
+#[cfg(feature = "filtered-transactions")]
+fn append_filtered_slot(bytes: &mut Vec<u8>, slot: &FilteredTransactionSlot) {
+    append_hash(bytes, slot.key_hash);
+    append_u16(bytes, slot.kind);
+    append_len(bytes, slot.targets.len());
+    for target in &slot.targets {
+        append_pubkey(bytes, *target);
+    }
+    append_hash(bytes, slot.payload_commitment);
+    append_u64(bytes, slot.payload_len);
+    bytes.push(match slot.delivery_policy {
+        FilteredDeliveryPolicy::Direct => HOT_FILTERED_DELIVERY_DIRECT,
+        FilteredDeliveryPolicy::Gossip => HOT_FILTERED_DELIVERY_GOSSIP,
+    });
+}
+
+#[cfg(feature = "filtered-transactions")]
+fn take_filtered_slot(input: &mut &[u8]) -> Result<FilteredTransactionSlot> {
+    let key_hash = take_hash(input)?;
+    let kind = take_u16(input, "filtered transaction kind")?;
+    let target_count = take_len(input, "filtered transaction target count")?;
+    let max_possible_targets = input.len() / 32;
+    if target_count > max_possible_targets {
+        return Err(BlossomError::WireProtocol(format!(
+            "filtered transaction target count {target_count} exceeds remaining payload capacity {max_possible_targets}"
+        )));
+    }
+    let mut targets = Vec::with_capacity(target_count);
+    for _ in 0..target_count {
+        targets.push(take_pubkey(input)?);
+    }
+    let payload_commitment = take_hash(input)?;
+    let payload_len = take_u64(input, "filtered transaction payload length")?;
+    let delivery_policy = match take_u8(input, "filtered transaction delivery policy")? {
+        HOT_FILTERED_DELIVERY_DIRECT => FilteredDeliveryPolicy::Direct,
+        HOT_FILTERED_DELIVERY_GOSSIP => FilteredDeliveryPolicy::Gossip,
+        other => {
+            return Err(BlossomError::WireProtocol(format!(
+                "unknown filtered delivery policy {other}"
+            )));
+        }
+    };
+
+    let slot = FilteredTransactionSlot {
+        key_hash,
+        kind,
+        targets,
+        payload_commitment,
+        payload_len,
+        delivery_policy,
+    };
+    slot.validate()?;
+    Ok(slot)
 }
 
 fn scan_signature_tree(input: &mut &[u8]) -> Result<()> {
@@ -943,6 +1160,11 @@ fn append_len(bytes: &mut Vec<u8>, len: usize) {
     append_u32(bytes, len as u32);
 }
 
+#[cfg(feature = "filtered-transactions")]
+fn append_u16(bytes: &mut Vec<u8>, value: u16) {
+    bytes.extend_from_slice(&value.to_le_bytes());
+}
+
 fn append_u32(bytes: &mut Vec<u8>, value: u32) {
     bytes.extend_from_slice(&value.to_le_bytes());
 }
@@ -969,6 +1191,14 @@ fn take_signature(input: &mut &[u8]) -> Result<Signature> {
 
 fn take_u8(input: &mut &[u8], field: &str) -> Result<u8> {
     Ok(take_exact(input, 1, field)?[0])
+}
+
+#[cfg(feature = "filtered-transactions")]
+fn take_u16(input: &mut &[u8], field: &str) -> Result<u16> {
+    let bytes = take_exact(input, 2, field)?;
+    Ok(u16::from_le_bytes(bytes.try_into().map_err(|_| {
+        BlossomError::WireProtocol(format!("invalid {field}"))
+    })?))
 }
 
 fn take_u32(input: &mut &[u8], field: &str) -> Result<u32> {
@@ -1092,6 +1322,63 @@ mod tests {
     }
 
     #[test]
+    fn grouped_request_round_trips_through_borsh_frame() {
+        let group_id = ConsensusGroupId::named("cache-hotset-a");
+        let request = WireRequest::Group {
+            group_id,
+            request: Box::new(WireRequest::NextNonce),
+        };
+        let frame = EncodedFrame::encode_wire_request(&request).unwrap();
+        let decoded = decode_wire_request_payload(&frame.as_bytes()[FRAME_PREFIX_BYTES..]).unwrap();
+
+        match decoded {
+            WireRequest::Group {
+                group_id: decoded_group,
+                request,
+            } => {
+                assert_eq!(decoded_group, group_id);
+                assert!(matches!(*request, WireRequest::NextNonce));
+            }
+            response => panic!("expected grouped request, got {response:?}"),
+        }
+    }
+
+    #[test]
+    fn ping_request_and_pong_response_round_trip_through_borsh_frame() {
+        let request = WireRequest::Ping(NodePing::with_payload(99, b"are-you-there"));
+        let request_frame = EncodedFrame::encode_wire_request(&request).unwrap();
+        let decoded_request =
+            decode_wire_request_payload(&request_frame.as_bytes()[FRAME_PREFIX_BYTES..]).unwrap();
+
+        match decoded_request {
+            WireRequest::Ping(ping) => {
+                assert_eq!(ping.nonce, 99);
+                assert_eq!(ping.payload, b"are-you-there");
+            }
+            response => panic!("expected ping request, got {response:?}"),
+        }
+
+        let response = WireResponse::Pong(NodePong {
+            group_id: ConsensusGroupId::root(),
+            public_key: crate::PubKey::default(),
+            nonce: 99,
+            payload: b"are-you-there".to_vec(),
+        });
+        let response_frame = EncodedFrame::encode(&response).unwrap();
+        let decoded_response =
+            decode_wire_response_payload(&response_frame.as_bytes()[FRAME_PREFIX_BYTES..]).unwrap();
+
+        match decoded_response {
+            WireResponse::Pong(pong) => {
+                assert_eq!(pong.group_id, ConsensusGroupId::root());
+                assert_eq!(pong.nonce, 99);
+                assert_eq!(pong.payload, b"are-you-there");
+            }
+            response => panic!("expected pong response, got {response:?}"),
+        }
+    }
+
+    #[test]
     fn hot_submit_block_request_round_trips() {
         let block = signed_test_block();
         let request = WireRequest::SubmitBlock(block.clone());
@@ -1108,6 +1395,45 @@ mod tests {
                 assert_eq!(decoded_block.body.txs.len(), 1);
                 assert_eq!(decoded_block.body.txs[0].payload(), b"tx-1");
                 assert!(decoded_block.verify_integrity().is_ok());
+            }
+            response => panic!("expected hot submit block, got {response:?}"),
+        }
+    }
+
+    #[cfg(feature = "filtered-transactions")]
+    #[test]
+    fn hot_submit_block_preserves_filtered_transaction_metadata() {
+        let keypair = Keypair::generate();
+        let target = Keypair::generate();
+        let tx = Transaction::filtered_full(
+            HashType::hash(b"cache-key"),
+            3,
+            vec![target.public],
+            b"target-only-value".to_vec(),
+            FilteredDeliveryPolicy::Gossip,
+        )
+        .unwrap();
+        let expected_slot = tx.filtered_slot().unwrap().clone();
+        let mut block = Block::default();
+        block.body.last_epoch = HashType([1; 32]);
+        block.body.nonce = Nonce::new(1);
+        block.body.txs.push(tx);
+        block.sign(&keypair.secret);
+
+        let request = WireRequest::SubmitBlock(block.clone());
+        let frame = EncodedFrame::encode_hot_wire_request(&request)
+            .unwrap()
+            .unwrap();
+        let decoded = decode_wire_request_payload(&frame.as_bytes()[FRAME_PREFIX_BYTES..]).unwrap();
+
+        match decoded {
+            WireRequest::SubmitBlock(decoded_block) => {
+                assert_eq!(decoded_block.hash, block.hash);
+                assert!(decoded_block.verify_integrity().is_ok());
+                let decoded_tx = &decoded_block.body.txs[0];
+                assert_eq!(decoded_tx.filtered_view, FilteredPayloadView::Full);
+                assert_eq!(decoded_tx.filtered_slot(), Some(&expected_slot));
+                assert_eq!(decoded_tx.payload(), b"target-only-value");
             }
             response => panic!("expected hot submit block, got {response:?}"),
         }
@@ -1203,6 +1529,21 @@ mod tests {
     }
 
     #[test]
+    fn hot_io_selection_includes_large_block_paths() {
+        let block = signed_test_block();
+
+        assert!(hot_wire_request_is_selected_for_io(
+            &WireRequest::SubmitBlock(block.clone())
+        ));
+        assert!(hot_wire_request_is_selected_for_io(
+            &WireRequest::SendBlock(block)
+        ));
+        assert!(!hot_wire_request_is_selected_for_io(
+            &WireRequest::NextNonce
+        ));
+    }
+
+    #[test]
     fn hot_block_rejects_impossible_transaction_count_before_allocating() {
         let mut payload = Vec::new();
         append_hot_prefix(&mut payload, HOT_REQUEST_SUBMIT_BLOCK);
@@ -1262,6 +1603,79 @@ mod tests {
             .kind(),
             "health"
         );
+        assert_eq!(
+            WireResponse::Pong(NodePong {
+                group_id: ConsensusGroupId::root(),
+                public_key: crate::PubKey::default(),
+                nonce: 0,
+                payload: Vec::new(),
+            })
+            .kind(),
+            "pong"
+        );
+        #[cfg(feature = "availability-gossip")]
+        {
+            assert_eq!(
+                WireResponse::AvailabilityReceipt(AvailabilityReceipt {
+                    scope: ConsensusGroupId::root(),
+                    holder: crate::PubKey::default(),
+                    entries_accepted: 0,
+                })
+                .kind(),
+                "availability_receipt"
+            );
+            assert_eq!(
+                WireResponse::FilteredPayloadMissing(FilteredPayloadMissing {
+                    scope: ConsensusGroupId::root(),
+                    holder: crate::PubKey::default(),
+                    slot_hash: HashType::default(),
+                    payload_commitment: HashType::default(),
+                })
+                .kind(),
+                "filtered_payload_missing"
+            );
+
+            let slot = FilteredTransactionSlot::for_payload(
+                HashType::hash(b"key"),
+                1,
+                vec![crate::PubKey::default()],
+                b"value",
+                FilteredDeliveryPolicy::Gossip,
+            )
+            .unwrap();
+            assert_eq!(
+                WireResponse::FilteredPayload(
+                    FilteredPayloadDelivery::trusted(crate::FilteredPayloadDeliveryBody {
+                        scope: ConsensusGroupId::root(),
+                        holder: crate::PubKey::default(),
+                        slot_hash: slot.hash(),
+                        slot: slot.clone(),
+                        payload: b"value".to_vec(),
+                    })
+                    .unwrap()
+                )
+                .kind(),
+                "filtered_payload"
+            );
+            assert_eq!(
+                WireResponse::FilteredPayloadBatch(
+                    FilteredPayloadBatchDelivery::trusted(
+                        crate::FilteredPayloadBatchDeliveryBody {
+                            scope: ConsensusGroupId::root(),
+                            holder: crate::PubKey::default(),
+                            items: vec![crate::FilteredPayloadDeliveryItem {
+                                slot_hash: slot.hash(),
+                                slot,
+                                payload: b"value".to_vec(),
+                            }],
+                        },
+                    )
+                    .unwrap(),
+                )
+                .kind(),
+                "filtered_payload_batch"
+            );
+        }
     }
 
     #[test]

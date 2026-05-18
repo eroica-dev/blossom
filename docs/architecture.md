@@ -50,6 +50,34 @@ already compute stable operation or key hashes can pair those module payloads
 with `Transaction::from_external_hash_u64` under the
 `external-transaction-hashes` feature.
 
+The optional `filtered-transactions` feature adds a second transaction
+materialization mode without changing the consensus rule that every validator
+commits the same ordered slots. A filtered slot commits a key hash,
+application kind, sorted target set, payload commitment, payload length, and
+delivery policy. Target nodes may carry the full payload; non-target nodes
+carry a tombstone. Block hashing uses the canonical slot bytes rather than the
+local payload view, so both materializations verify against the same Merkle root
+and block hash. This is a filtered data-placement primitive, not a full privacy
+claim: encryption, metadata hiding, proofs, and gossip-assisted availability
+can be layered above it.
+
+With `availability-gossip`, Blossom adds that first data-availability layer:
+holders gossip signed filtered-slot availability entries, targets fetch payload
+bytes by slot hash and payload commitment, and receivers verify the bytes before
+storing them as local payloads. Gossip does not decide consensus truth; it only
+helps a target discover where committed bytes can be fetched.
+
+For KVCache, the useful property is that keys and commitments are relatively
+stable. Dissemination can therefore be planned in rounds rather than epochs.
+`ideal_push_gossip_rounds(node_count, fanout)` estimates
+`ceil(log_(fanout + 1)(node_count))` rounds under ideal push gossip. Wall-clock
+delay is that round count times the gossip interval, plus an operational safety
+round for duplicate fan-out, scheduling jitter, and loss. For 36 nodes at
+fanout 6, the ideal is 2 rounds; at a 100 ms interval, operators should expect
+about 200 ms ideal dissemination and plan around roughly 300 ms with one safety
+round. Payload readiness adds the target's fetch RTT, payload transfer time, and
+commitment-verification time on top of metadata dissemination.
+
 Blocks also expose a generic application-state channel. The payload is
 opaque `Vec<u8>` data with a 4 KiB soft budget and an 8 KiB hard limit.
 Blossom validates only the size and commits the bytes into the block hash;
@@ -69,6 +97,7 @@ quorum topology derived independently by every node.
 The current implementation maps that layer to:
 
 - `src/algorithm.rs`: deterministic quorum and round selection.
+- `src/group.rs`: stable root/subnet consensus group identifiers.
 - `src/messages.rs`: the transport enum for protocol messages.
 - `src/blossom.rs`: message headers, bodies, signatures, body hashing,
   and dispatch verification helpers.
@@ -80,6 +109,8 @@ The current implementation maps that layer to:
   service requests.
 - `src/tcp.rs`: reusable server/client path used by the node binary,
   harness, and end-to-end tests.
+- `src/wire.rs` and `src/tcp.rs`: direct `Ping`/`Pong` liveness checks
+  that target one peer and do not enter the epoch state machine.
 - `src/overlay.rs`: address-book-backed fan-out and broadcast APIs for
   using Blossom's topology without running epoch consensus.
 - `src/bin/blossom-node.rs`: TCP listener for block intake, message
@@ -100,6 +131,22 @@ messages populate the quorum message matrix so a node can distinguish
 missing dispatches, delayed peers, and likely faulty peers. Verification
 and proposal messages aggregate the quorum's view of accepted block
 sets, and commit records the outgoing result for the round.
+
+Consensus groups let a deployment run the full root network and narrower
+purpose-specific subnets in parallel. Each group has a stable
+`ConsensusGroupId`, its own verifier set, local block queue, consensus
+state, and epoch chain. The group id is committed into the genesis epoch
+hash and therefore into all later block and message contexts through
+`last_epoch`; this prevents a block or signed protocol message from being
+replayed across groups with different ids. Ungrouped TCP requests target
+the root group, while `WireRequest::Group { group_id, request }` routes a
+request to the matching subnet hosted by the same node process.
+
+Direct peer liveness is intentionally separate from both consensus groups
+and overlay broadcast. `WireRequest::Ping(NodePing)` is a point-to-point
+request that returns `WireResponse::Pong(NodePong)` with the caller's nonce
+and payload echoed. It is useful for health checks, latency probes, and
+connectivity tests where no block or quorum message should be created.
 
 Trusted mode is an explicit private-cluster optimization. When
 `RuntimeConfig::trust_mode` is `Trusted`, nodes assume the verifier set
@@ -137,6 +184,11 @@ The paper's transaction tagging, derivative hash, append-only ledger
 state, account/index update rules, and auditing/query behavior should
 be implemented as a ledger layer that consumes this crate's finalized
 block sets.
+
+Filtered transactions preserve that boundary. Blossom validates canonical slot
+commitments, tombstone shape, and full-payload hash matches, but the meaning of
+`kind`, key hashes, target selection, and delivery policy remains
+application-owned.
 
 ## Consensus Tree
 
@@ -177,6 +229,9 @@ channel is available only in the consensus runtime.
 
 - Primary Blossom message structures.
 - Deterministic quorum and round selection.
+- Root/subnet consensus groups with group-bound genesis epochs and TCP
+  grouped-request routing.
+- Direct point-to-point ping/pong liveness requests.
 - Overlay runtime and runtime broadcast APIs using the quorum topology.
 - Bounded block application-state payloads for piggy-backed coordination.
 - Primary dispatch, echo, verification, proposal, and commit message
