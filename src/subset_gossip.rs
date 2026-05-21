@@ -34,6 +34,7 @@ impl SubsetLatencyDistribution {
 pub enum SubsetPrefillMode {
     None,
     Random,
+    RandomQuorum,
     Scheduled,
 }
 
@@ -42,6 +43,7 @@ impl SubsetPrefillMode {
         match self {
             Self::None => "none",
             Self::Random => "random",
+            Self::RandomQuorum => "random-quorum",
             Self::Scheduled => "scheduled",
         }
     }
@@ -108,6 +110,8 @@ pub struct SubsetGossipConfig {
     pub repair_missing: bool,
     pub prefill_mode: SubsetPrefillMode,
     pub prefill_fanout: usize,
+    pub prefill_skip_rounds: usize,
+    pub prefill_replicas_per_quorum: usize,
     pub hash_advertise: bool,
     pub drop_round0_dispatch: bool,
     pub latency: SubsetLatencyProfile,
@@ -128,6 +132,8 @@ impl Default for SubsetGossipConfig {
             repair_missing: true,
             prefill_mode: SubsetPrefillMode::None,
             prefill_fanout: 0,
+            prefill_skip_rounds: 0,
+            prefill_replicas_per_quorum: 2,
             hash_advertise: false,
             drop_round0_dispatch: false,
             latency: SubsetLatencyProfile::default(),
@@ -162,6 +168,11 @@ impl SubsetGossipConfig {
                 "targets per command must be greater than zero".to_string(),
             ));
         }
+        if self.prefill_replicas_per_quorum == 0 {
+            return Err(BlossomError::WireProtocol(
+                "prefill replicas per quorum must be greater than zero".to_string(),
+            ));
+        }
         self.latency.validate()
     }
 }
@@ -184,6 +195,8 @@ pub struct SubsetGossipEpochRow {
     pub repair_missing: bool,
     pub prefill_mode: SubsetPrefillMode,
     pub prefill_fanout: usize,
+    pub prefill_skip_rounds: usize,
+    pub prefill_replicas_per_quorum: usize,
     pub hash_advertise: bool,
     pub drop_round0_dispatch: bool,
     pub latency_distribution: SubsetLatencyDistribution,
@@ -578,7 +591,15 @@ fn run_subset_epoch(
     let signature_tree_len = encoded_len(&SignatureTree::default())?;
     let mut byte_totals = EpochByteTotals::default();
     let mut latency_totals = EpochLatencyTotals::default();
-    let prefill_plan = build_prefill_plan(epoch, config, nodes, &blocks, &topology);
+    let consensus_start_round = consensus_start_round(config, topology.len());
+    let prefill_plan = build_prefill_plan(
+        epoch,
+        config,
+        nodes,
+        &blocks,
+        &topology,
+        consensus_start_round,
+    );
     apply_prefill(
         config,
         nodes,
@@ -591,7 +612,7 @@ fn run_subset_epoch(
         &mut latency_totals,
     )?;
 
-    for (round, quorums) in topology.iter().enumerate() {
+    for (round, quorums) in topology.iter().enumerate().skip(consensus_start_round) {
         let before_full = full_known.clone();
         let before_subset = subset_states.clone();
         let mut next_full = full_known.clone();
@@ -662,9 +683,11 @@ fn run_subset_epoch(
                             continue;
                         };
                         let target_mask = &block.target_masks[*recipient];
+                        let dedupe_from_inventory =
+                            config.hash_advertise || prefill_inventory_is_precomputed(config);
                         let recipient_had_metadata =
-                            before_subset[*recipient].blocks[block.owner].is_some();
-                        let full_count = if config.hash_advertise {
+                            next_subset[*recipient].blocks[block.owner].is_some();
+                        let full_count = if dedupe_from_inventory {
                             next_subset[*recipient].merge_missing_targeted_payloads(
                                 block.owner,
                                 sender_full,
@@ -677,7 +700,7 @@ fn run_subset_epoch(
                                 target_mask,
                             )
                         };
-                        if config.hash_advertise && recipient_had_metadata && full_count == 0 {
+                        if dedupe_from_inventory && recipient_had_metadata && full_count == 0 {
                             byte_totals.duplicate_suppressed_blocks += 1;
                             continue;
                         }
@@ -770,13 +793,24 @@ fn run_subset_epoch(
             epoch_depth: config.epochs,
             nodes: config.nodes,
             quorum_size: config.quorum_size,
-            rounds: topology.len(),
-            quorums: topology.iter().map(Vec::len).sum(),
+            rounds: topology.len().saturating_sub(consensus_start_round),
+            quorums: topology
+                .iter()
+                .skip(consensus_start_round)
+                .map(Vec::len)
+                .sum(),
             trusted: config.trusted,
             shuffle: config.shuffle,
             repair_missing: config.repair_missing,
             prefill_mode: config.prefill_mode,
-            prefill_fanout: effective_prefill_fanout(config),
+            prefill_fanout: prefill_plan
+                .recipients_by_sender
+                .iter()
+                .map(Vec::len)
+                .max()
+                .unwrap_or_default(),
+            prefill_skip_rounds: consensus_start_round,
+            prefill_replicas_per_quorum: config.prefill_replicas_per_quorum,
             hash_advertise: config.hash_advertise,
             drop_round0_dispatch: config.drop_round0_dispatch,
             latency_distribution: config.latency.distribution,
@@ -932,6 +966,21 @@ fn build_block_meta(
     })
 }
 
+fn consensus_start_round(config: &SubsetGossipConfig, topology_rounds: usize) -> usize {
+    let requested = if config.prefill_skip_rounds > 0 {
+        config.prefill_skip_rounds
+    } else if matches!(config.prefill_mode, SubsetPrefillMode::RandomQuorum) {
+        1
+    } else {
+        0
+    };
+    requested.min(topology_rounds)
+}
+
+fn prefill_inventory_is_precomputed(config: &SubsetGossipConfig) -> bool {
+    matches!(config.prefill_mode, SubsetPrefillMode::RandomQuorum)
+}
+
 fn effective_prefill_fanout(config: &SubsetGossipConfig) -> usize {
     let requested = if config.prefill_fanout == 0 {
         config.quorum_size
@@ -947,6 +996,7 @@ fn build_prefill_plan(
     nodes: &[BenchNode],
     blocks: &[BlockMeta],
     topology: &[Vec<Vec<usize>>],
+    consensus_start_round: usize,
 ) -> PrefillPlan {
     let mut recipients_by_sender = vec![Vec::new(); config.nodes];
     match config.prefill_mode {
@@ -967,9 +1017,56 @@ fn build_prefill_plan(
                 recipients.sort_unstable();
             }
         }
+        SubsetPrefillMode::RandomQuorum => {
+            let mut recipient_sets = vec![BTreeSet::new(); config.nodes];
+            if let Some(first_active_quorums) = topology.get(consensus_start_round) {
+                let replicas_per_quorum =
+                    config.prefill_replicas_per_quorum.min(config.quorum_size);
+                for (sender, recipients) in recipient_sets.iter_mut().enumerate() {
+                    for (quorum_index, quorum) in first_active_quorums.iter().enumerate() {
+                        let mut holders = BTreeSet::new();
+                        if quorum.binary_search(&sender).is_ok() {
+                            holders.insert(sender);
+                        }
+
+                        let mut candidates = quorum
+                            .iter()
+                            .copied()
+                            .filter(|candidate| !holders.contains(candidate))
+                            .collect::<Vec<_>>();
+                        candidates.sort_by_key(|candidate| {
+                            splitmix64(
+                                config.seed
+                                    ^ (epoch as u64).wrapping_mul(0x98a2_c64f_15b8_3d21)
+                                    ^ (sender as u64).wrapping_mul(0xd6e8_feb8_6659_fd93)
+                                    ^ (quorum_index as u64).wrapping_mul(0xa076_1d64_78bd_642f)
+                                    ^ (*candidate as u64).wrapping_mul(0xe703_7ed1_a0b4_28db),
+                            )
+                        });
+
+                        for candidate in candidates {
+                            if holders.len() >= replicas_per_quorum {
+                                break;
+                            }
+                            holders.insert(candidate);
+                        }
+
+                        for holder in holders {
+                            if holder != sender {
+                                recipients.insert(holder);
+                            }
+                        }
+                    }
+                }
+            }
+            recipients_by_sender = recipient_sets
+                .into_iter()
+                .map(|recipients| recipients.into_iter().collect())
+                .collect();
+        }
         SubsetPrefillMode::Scheduled => {
             let mut recipient_sets = vec![BTreeSet::new(); config.nodes];
-            for quorums in topology {
+            for quorums in topology.iter().skip(consensus_start_round) {
                 for quorum in quorums {
                     for sender in quorum {
                         for recipient in quorum {
@@ -1759,6 +1856,39 @@ mod tests {
                 < baseline_row.subset_missing_payloads_before_repair
         );
         assert!(random_row.prefill_bytes > 0);
+    }
+
+    #[test]
+    fn random_quorum_prefill_replaces_first_consensus_round() {
+        let config = SubsetGossipConfig {
+            nodes: 36,
+            epochs: 1,
+            quorum_size: 6,
+            commands_per_node: 16,
+            command_bytes: 128,
+            targets_per_command: 3,
+            repair_missing: false,
+            prefill_mode: SubsetPrefillMode::RandomQuorum,
+            prefill_replicas_per_quorum: 2,
+            ..SubsetGossipConfig::default()
+        };
+
+        let row = run_subset_gossip(config).unwrap().rows.remove(0);
+
+        assert_eq!(row.prefill_mode, SubsetPrefillMode::RandomQuorum);
+        assert_eq!(row.prefill_skip_rounds, 1);
+        assert_eq!(row.rounds, 1);
+        assert_eq!(row.prefill_fanout, 11);
+        assert_eq!(row.prefill_recipients, row.nodes * row.prefill_fanout);
+        assert_eq!(
+            row.prefill_expected_hashes,
+            row.nodes * (row.prefill_fanout + 1)
+        );
+        assert_eq!(row.hash_advertise_bytes, 0);
+        assert!(row.metadata_converged);
+        assert!(row.subset_payloads_complete_before_repair);
+        assert_eq!(row.subset_missing_payloads_before_repair, 0);
+        assert!(row.duplicate_suppressed_blocks > 0);
     }
 
     #[test]
