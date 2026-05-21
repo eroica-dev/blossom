@@ -249,9 +249,10 @@ impl NodeRuntime {
             TelemetryEvent::new(crate::telemetry::TelemetryEventKind::Event, stage, event)
                 .with_node(self.self_node().public_key())
                 .with_group_id(self.inner.group_id);
-        if let Some(target) = target {
-            telemetry = telemetry.with_target(target.last_epoch, target.nonce);
-        }
+        telemetry = match target {
+            Some(target) => telemetry.with_target(target.last_epoch, target.nonce),
+            None => telemetry,
+        };
         self.inner.telemetry.record(telemetry);
     }
 
@@ -738,13 +739,14 @@ impl NodeRuntime {
                 .read()
                 .expect("availability lock poisoned");
             for request in &fetch.body.requests {
-                if let Some(payload) = availability.get_local_payload(
+                match availability.get_local_payload(
                     self.inner.group_id,
                     &request.slot_hash,
                     &request.payload_commitment,
                     &fetch.body.requester,
                 )? {
-                    items.push(payload.delivery_item());
+                    Some(payload) => items.push(payload.delivery_item()),
+                    None => {}
                 }
             }
         }
@@ -1334,12 +1336,12 @@ impl NodeRuntime {
     }
 
     fn validate_block_service(&self, block: &Block) -> Result<()> {
-        if let Some(service) = self.block_service()
-            && block.body.validator != service.public_key
-        {
-            return Err(BlossomError::UnknownSender);
+        match self.block_service() {
+            Some(service) if block.body.validator != service.public_key => {
+                Err(BlossomError::UnknownSender)
+            }
+            _ => Ok(()),
         }
-        Ok(())
     }
 
     #[cfg(feature = "availability-gossip")]
@@ -1677,18 +1679,22 @@ impl MultiGroupRuntime {
 }
 
 fn apply_telemetry_meta(mut event: TelemetryEvent, meta: &RuntimeTelemetryMeta) -> TelemetryEvent {
-    if let (Some(last_epoch), Some(nonce)) = (meta.last_epoch, meta.nonce) {
-        event = event.with_target(last_epoch, nonce);
-    }
-    if let Some(round) = meta.round {
-        event = event.with_round(round);
-    }
-    if let Some(peer) = meta.peer {
-        event = event.with_peer(peer);
-    }
-    if let Some(message_kind) = meta.message_kind {
-        event = event.with_message_kind(message_kind);
-    }
+    event = match (meta.last_epoch, meta.nonce) {
+        (Some(last_epoch), Some(nonce)) => event.with_target(last_epoch, nonce),
+        _ => event,
+    };
+    event = match meta.round {
+        Some(round) => event.with_round(round),
+        None => event,
+    };
+    event = match meta.peer {
+        Some(peer) => event.with_peer(peer),
+        None => event,
+    };
+    event = match meta.message_kind {
+        Some(message_kind) => event.with_message_kind(message_kind),
+        None => event,
+    };
     event
 }
 
@@ -1927,8 +1933,9 @@ mod tests {
         let mut config = RuntimeConfig::new(nodes[0].clone());
         config.genesis = Some(genesis.clone());
         config.trust_mode = trust_mode;
-        if let Some(telemetry) = telemetry {
-            config.telemetry = telemetry;
+        match telemetry {
+            Some(telemetry) => config.telemetry = telemetry,
+            None => {}
         }
         let runtime = NodeRuntime::new(config);
         let target = EpochTarget {

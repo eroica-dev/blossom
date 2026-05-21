@@ -102,28 +102,24 @@ where
             + (self_index % (size_multiple * offset));
 
         let mut quorum = Vec::new();
-        for quorum_member in 0..QUORUM_SIZE {
-            let index = first_quorum_member + (quorum_member * size_multiple * offset);
-            if index >= ordered_indices.len() {
-                break;
-            }
-            if let Some(member) = member_at(node_map, ordered_indices, index) {
-                quorum.push(member);
-            }
-        }
+        push_quorum_members(
+            &mut quorum,
+            node_map,
+            ordered_indices,
+            first_quorum_member,
+            size_multiple,
+            offset,
+        );
 
         if ordered_indices.len() >= optimal_network_size {
-            for quorum_member in 0..QUORUM_SIZE {
-                let index = optimal_network_size
-                    + first_quorum_member
-                    + (quorum_member * size_multiple * offset);
-                if index >= ordered_indices.len() {
-                    break;
-                }
-                if let Some(member) = member_at(node_map, ordered_indices, index) {
-                    quorum.push(member);
-                }
-            }
+            push_quorum_members(
+                &mut quorum,
+                node_map,
+                ordered_indices,
+                optimal_network_size + first_quorum_member,
+                size_multiple,
+                offset,
+            );
         }
 
         quorum.sort_unstable();
@@ -134,6 +130,25 @@ where
     quorum_members_matrix
 }
 
+fn push_quorum_members<N>(
+    quorum: &mut Vec<PubKey>,
+    node_map: &IndexTreeMap<PubKey, N>,
+    ordered_indices: &[usize],
+    first_quorum_member: usize,
+    size_multiple: usize,
+    offset: usize,
+) where
+    N: Default + Clone,
+{
+    for quorum_member in 0..QUORUM_SIZE {
+        let index = first_quorum_member + (quorum_member * size_multiple * offset);
+        match member_at(node_map, ordered_indices, index) {
+            Some(member) => quorum.push(member),
+            None => break,
+        }
+    }
+}
+
 fn member_at<N>(
     node_map: &IndexTreeMap<PubKey, N>,
     ordered_indices: &[usize],
@@ -142,7 +157,7 @@ fn member_at<N>(
 where
     N: Default + Clone,
 {
-    let map_index = ordered_indices.get(index).copied().unwrap_or(index);
+    let map_index = ordered_indices.get(index).copied()?;
     node_map.get_key_from_index(map_index).copied()
 }
 

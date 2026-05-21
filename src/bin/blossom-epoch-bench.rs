@@ -297,9 +297,12 @@ async fn main() -> MainResult<()> {
         rows.push(row);
     }
 
-    if let Some(path) = args.csv {
-        write_csv(&path, args.append, &rows)?;
-        eprintln!("wrote {}", path.display());
+    match args.csv {
+        Some(path) => {
+            write_csv(&path, args.append, &rows)?;
+            eprintln!("wrote {}", path.display());
+        }
+        None => {}
     }
 
     Ok(())
@@ -696,22 +699,24 @@ fn quorum_algorithm(
             + (self_position % (size_multiple * offset));
 
         let mut quorum = Vec::new();
-        for quorum_member in 0..quorum_size {
-            let index = first_quorum_member + (quorum_member * size_multiple * offset);
-            if let Some(member) = ordered_indices.get(index) {
-                quorum.push(*member);
-            }
-        }
+        extend_quorum_indices(
+            &mut quorum,
+            ordered_indices,
+            first_quorum_member,
+            size_multiple,
+            offset,
+            quorum_size,
+        );
 
         if ordered_indices.len() >= optimal_network_size {
-            for quorum_member in 0..quorum_size {
-                let index = optimal_network_size
-                    + first_quorum_member
-                    + (quorum_member * size_multiple * offset);
-                if let Some(member) = ordered_indices.get(index) {
-                    quorum.push(*member);
-                }
-            }
+            extend_quorum_indices(
+                &mut quorum,
+                ordered_indices,
+                optimal_network_size + first_quorum_member,
+                size_multiple,
+                offset,
+                quorum_size,
+            );
         }
 
         quorum.sort_unstable();
@@ -720,6 +725,20 @@ fn quorum_algorithm(
     }
 
     quorum_members_matrix
+}
+
+fn extend_quorum_indices(
+    quorum: &mut Vec<usize>,
+    ordered_indices: &[usize],
+    first_quorum_member: usize,
+    size_multiple: usize,
+    offset: usize,
+    quorum_size: usize,
+) {
+    quorum.extend((0..quorum_size).filter_map(|quorum_member| {
+        let index = first_quorum_member + (quorum_member * size_multiple * offset);
+        ordered_indices.get(index).copied()
+    }));
 }
 
 fn find_round_number(network_size: usize, quorum_size: usize) -> (usize, usize) {
@@ -1200,8 +1219,9 @@ fn epoch_hash(last_epoch: HashType, nonce: Nonce, blocks_hash: HashType) -> Hash
 }
 
 fn write_csv(path: &PathBuf, append: bool, rows: &[EpochBenchRow]) -> MainResult<()> {
-    if let Some(parent) = path.parent() {
-        create_dir_all(parent)?;
+    match path.parent() {
+        Some(parent) => create_dir_all(parent)?,
+        None => {}
     }
 
     let write_header = !append || !path.exists() || path.metadata()?.len() == 0;

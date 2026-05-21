@@ -437,26 +437,32 @@ fn append_fast_span_jsonl_event(batch: &mut Vec<u8>, event: &TelemetryEvent) -> 
     batch.write_all(b"{").map_err(|_| ())?;
     append_json_u16_field(batch, "schema_version", event.schema_version, false)?;
     append_json_str_field(batch, "kind", kind, true)?;
-    if let Some(span_id) = event.span_id {
-        append_json_u64_field(batch, "span_id", span_id, true)?;
+    match event.span_id {
+        Some(span_id) => append_json_u64_field(batch, "span_id", span_id, true)?,
+        None => {}
     }
     append_json_u128_field(batch, "timestamp_micros", event.timestamp_micros, true)?;
-    if let Some(node) = event.node {
-        append_json_hex_field(batch, "node", node.as_ref(), true)?;
+    match event.node {
+        Some(node) => append_json_hex_field(batch, "node", node.as_ref(), true)?,
+        None => {}
     }
-    if let Some(group_id) = event.group_id {
-        append_json_hex_field(batch, "group_id", group_id.as_ref(), true)?;
+    match event.group_id {
+        Some(group_id) => append_json_hex_field(batch, "group_id", group_id.as_ref(), true)?,
+        None => {}
     }
     append_json_str_field(batch, "stage", &event.stage, true)?;
     append_json_str_field(batch, "event", &event.event, true)?;
-    if let Some(last_epoch) = event.last_epoch {
-        append_json_hex_field(batch, "last_epoch", last_epoch.as_ref(), true)?;
+    match event.last_epoch {
+        Some(last_epoch) => append_json_hex_field(batch, "last_epoch", last_epoch.as_ref(), true)?,
+        None => {}
     }
-    if let Some(nonce) = event.nonce {
-        append_json_u64_field(batch, "nonce", nonce.value(), true)?;
+    match event.nonce {
+        Some(nonce) => append_json_u64_field(batch, "nonce", nonce.value(), true)?,
+        None => {}
     }
-    if let Some(round) = event.round {
-        append_json_u8_field(batch, "round", round, true)?;
+    match event.round {
+        Some(round) => append_json_u8_field(batch, "round", round, true)?,
+        None => {}
     }
     batch.write_all(b"}\n").map_err(|_| ())?;
     Ok(true)

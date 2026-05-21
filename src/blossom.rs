@@ -627,13 +627,15 @@ impl ProposalBody {
             ));
         }
 
-        if let (Some(signature_tree), Some(signature_tree_hash)) =
-            (&self.signature_tree, self.signature_tree_hash)
-            && signature_tree.hash() != signature_tree_hash
-        {
-            return Err(BlossomError::WireProtocol(
-                "proposal signature-tree hash does not match signature tree".to_string(),
-            ));
+        match (&self.signature_tree, self.signature_tree_hash) {
+            (Some(signature_tree), Some(signature_tree_hash))
+                if signature_tree.hash() != signature_tree_hash =>
+            {
+                return Err(BlossomError::WireProtocol(
+                    "proposal signature-tree hash does not match signature tree".to_string(),
+                ));
+            }
+            _ => {}
         }
 
         Ok(())

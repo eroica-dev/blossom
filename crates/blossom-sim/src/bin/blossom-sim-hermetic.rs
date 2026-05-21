@@ -75,17 +75,26 @@ async fn main() -> MainResult<()> {
     let summary = SimSummary::from_log(&args, &log);
     println!("{}", summary.to_csv());
 
-    if let Some(path) = args.csv.as_ref() {
-        write_summary(path, &summary)?;
-        eprintln!("wrote {}", path.display());
+    match args.csv.as_ref() {
+        Some(path) => {
+            write_summary(path, &summary)?;
+            eprintln!("wrote {}", path.display());
+        }
+        None => {}
     }
-    if let Some(path) = args.event_log.as_ref() {
-        write_event_log(path, &log)?;
-        eprintln!("wrote {}", path.display());
+    match args.event_log.as_ref() {
+        Some(path) => {
+            write_event_log(path, &log)?;
+            eprintln!("wrote {}", path.display());
+        }
+        None => {}
     }
-    if let Some(path) = args.bug_log.as_ref() {
-        write_bug_log(path, &args, &summary, &log)?;
-        eprintln!("wrote {}", path.display());
+    match args.bug_log.as_ref() {
+        Some(path) => {
+            write_bug_log(path, &args, &summary, &log)?;
+            eprintln!("wrote {}", path.display());
+        }
+        None => {}
     }
 
     Ok(())
@@ -117,11 +126,14 @@ fn build_plan(args: &Args) -> MainResult<HermeticPlan> {
 
     for node in &args.down_nodes {
         plan.node_down(args.down_at_ms, *node);
-        if let Some(up_at_ms) = args.up_at_ms.or_else(|| {
+        match args.up_at_ms.or_else(|| {
             args.restart_after_ms
                 .map(|restart_after_ms| args.down_at_ms.saturating_add(restart_after_ms))
         }) {
-            plan.node_up(up_at_ms, *node);
+            Some(up_at_ms) => {
+                plan.node_up(up_at_ms, *node);
+            }
+            None => {}
         }
     }
 
@@ -220,8 +232,9 @@ impl SimSummary {
 }
 
 fn write_summary(path: &PathBuf, summary: &SimSummary) -> MainResult<()> {
-    if let Some(parent) = path.parent() {
-        create_dir_all(parent)?;
+    match path.parent() {
+        Some(parent) => create_dir_all(parent)?,
+        None => {}
     }
     let mut file = OpenOptions::new()
         .create(true)
@@ -237,8 +250,9 @@ fn write_summary(path: &PathBuf, summary: &SimSummary) -> MainResult<()> {
 }
 
 fn write_event_log(path: &PathBuf, log: &HermeticEventLog) -> MainResult<()> {
-    if let Some(parent) = path.parent() {
-        create_dir_all(parent)?;
+    match path.parent() {
+        Some(parent) => create_dir_all(parent)?,
+        None => {}
     }
     let mut file = OpenOptions::new()
         .create(true)
@@ -261,8 +275,9 @@ fn write_bug_log(
     summary: &SimSummary,
     log: &HermeticEventLog,
 ) -> MainResult<()> {
-    if let Some(parent) = path.parent() {
-        create_dir_all(parent)?;
+    match path.parent() {
+        Some(parent) => create_dir_all(parent)?,
+        None => {}
     }
 
     let mut file = OpenOptions::new()
@@ -510,22 +525,25 @@ fn collect_incidents(args: &Args, log: &HermeticEventLog) -> Vec<BugIncident> {
         });
     }
 
-    if let Some(budget_ms) = args.bug_latency_budget_ms {
-        let slow_records = records_with(log, |record| {
-            matches!(record.action, HermeticActionRecord::Request { .. })
-                && matches!(record.outcome, HermeticOutcome::Response { .. })
-                && record.delivered_at_ms.saturating_sub(record.planned_at_ms) > budget_ms
-        });
-        if !slow_records.is_empty() {
-            incidents.push(BugIncident {
-                severity: "medium",
-                title: format!("Requests exceeded {budget_ms}ms latency budget"),
-                count: slow_records.len(),
-                expected_under_faults: !args.slow_nodes.is_empty(),
-                event_ids: sample_event_ids(&slow_records),
-                note: "Latency budget is caller-defined. Use the event log to inspect the target nodes and injected latency rules.".to_string(),
+    match args.bug_latency_budget_ms {
+        Some(budget_ms) => {
+            let slow_records = records_with(log, |record| {
+                matches!(record.action, HermeticActionRecord::Request { .. })
+                    && matches!(record.outcome, HermeticOutcome::Response { .. })
+                    && record.delivered_at_ms.saturating_sub(record.planned_at_ms) > budget_ms
             });
+            if !slow_records.is_empty() {
+                incidents.push(BugIncident {
+                    severity: "medium",
+                    title: format!("Requests exceeded {budget_ms}ms latency budget"),
+                    count: slow_records.len(),
+                    expected_under_faults: !args.slow_nodes.is_empty(),
+                    event_ids: sample_event_ids(&slow_records),
+                    note: "Latency budget is caller-defined. Use the event log to inspect the target nodes and injected latency rules.".to_string(),
+                });
+            }
         }
+        None => {}
     }
 
     let request_records = log
@@ -626,14 +644,17 @@ fn replay_command(args: &Args) -> String {
     if !args.down_nodes.is_empty() {
         push_arg_value(&mut parts, "--down-nodes", join_nodes(&args.down_nodes));
         push_arg_value(&mut parts, "--down-at-ms", args.down_at_ms);
-        if let Some(up_at_ms) = args.up_at_ms {
-            push_arg_value(&mut parts, "--up-at-ms", up_at_ms);
-        } else if let Some(restart_after_ms) = args.restart_after_ms {
-            push_arg_value(&mut parts, "--restart-after-ms", restart_after_ms);
+        match (args.up_at_ms, args.restart_after_ms) {
+            (Some(up_at_ms), _) => push_arg_value(&mut parts, "--up-at-ms", up_at_ms),
+            (None, Some(restart_after_ms)) => {
+                push_arg_value(&mut parts, "--restart-after-ms", restart_after_ms);
+            }
+            (None, None) => {}
         }
     }
-    if let Some(budget_ms) = args.bug_latency_budget_ms {
-        push_arg_value(&mut parts, "--bug-latency-budget-ms", budget_ms);
+    match args.bug_latency_budget_ms {
+        Some(budget_ms) => push_arg_value(&mut parts, "--bug-latency-budget-ms", budget_ms),
+        None => {}
     }
     parts.join(" ")
 }

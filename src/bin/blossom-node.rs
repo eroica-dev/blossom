@@ -43,9 +43,12 @@ async fn main() -> MainResult<()> {
     if args.trusted {
         config.trust_mode = TrustMode::Trusted;
     }
-    if let Some(addr) = args.observer_addr.as_ref() {
-        config.telemetry =
-            TelemetryHandle::new(Arc::new(blossom::JsonlTcpTelemetrySink::connect(addr)?));
+    match args.observer_addr.as_ref() {
+        Some(addr) => {
+            config.telemetry =
+                TelemetryHandle::new(Arc::new(blossom::JsonlTcpTelemetrySink::connect(addr)?));
+        }
+        None => {}
     }
     let runtime = NodeRuntime::new(config);
 

@@ -50,6 +50,23 @@ impl SubsetPrefillMode {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SubsetGossipProtocolVersion {
+    V1,
+    V2,
+    Custom,
+}
+
+impl SubsetGossipProtocolVersion {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::V1 => "v1",
+            Self::V2 => "v2",
+            Self::Custom => "custom",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SubsetLatencyProfile {
     pub distribution: SubsetLatencyDistribution,
     pub latency_ms: u64,
@@ -144,6 +161,49 @@ impl Default for SubsetGossipConfig {
 }
 
 impl SubsetGossipConfig {
+    pub fn for_protocol_version(version: SubsetGossipProtocolVersion) -> Self {
+        match version {
+            SubsetGossipProtocolVersion::V1 => Self {
+                prefill_mode: SubsetPrefillMode::None,
+                prefill_fanout: 0,
+                prefill_skip_rounds: 0,
+                repair_missing: true,
+                hash_advertise: false,
+                ..Self::default()
+            },
+            SubsetGossipProtocolVersion::V2 => Self {
+                prefill_mode: SubsetPrefillMode::PrefillDispatch,
+                prefill_fanout: 0,
+                prefill_skip_rounds: 0,
+                prefill_replicas_per_quorum: 2,
+                repair_missing: false,
+                hash_advertise: false,
+                ..Self::default()
+            },
+            SubsetGossipProtocolVersion::Custom => Self::default(),
+        }
+    }
+
+    pub fn protocol_version(&self) -> SubsetGossipProtocolVersion {
+        if self.prefill_mode == SubsetPrefillMode::None
+            && self.repair_missing
+            && self.prefill_skip_rounds == 0
+            && !self.hash_advertise
+        {
+            return SubsetGossipProtocolVersion::V1;
+        }
+
+        if self.prefill_mode == SubsetPrefillMode::PrefillDispatch
+            && !self.repair_missing
+            && self.prefill_skip_rounds <= 1
+            && !self.hash_advertise
+        {
+            return SubsetGossipProtocolVersion::V2;
+        }
+
+        SubsetGossipProtocolVersion::Custom
+    }
+
     pub fn validate(&self) -> Result<()> {
         if self.nodes == 0 {
             return Err(BlossomError::WireProtocol(
@@ -195,6 +255,7 @@ pub struct SubsetGossipReport {
 pub struct SubsetGossipEpochRow {
     pub epoch: usize,
     pub epoch_depth: usize,
+    pub protocol_version: SubsetGossipProtocolVersion,
     pub nodes: usize,
     pub quorum_size: usize,
     pub rounds: usize,
@@ -292,10 +353,9 @@ impl NodeSubsetState {
     }
 
     fn insert_block_metadata(&mut self, owner: usize, command_count: usize) {
-        if let Some(slot) = self.blocks.get_mut(owner) {
-            if slot.is_none() {
-                *slot = Some(PayloadMask::empty(command_count));
-            }
+        match self.blocks.get_mut(owner) {
+            Some(slot @ None) => *slot = Some(PayloadMask::empty(command_count)),
+            Some(Some(_)) | None => {}
         }
     }
 
@@ -517,11 +577,9 @@ impl PayloadMask {
 
     fn clear_trailing_bits(&mut self) {
         let trailing = self.len % 64;
-        if trailing == 0 {
-            return;
-        }
-        if let Some(last) = self.words.last_mut() {
-            *last &= (1u64 << trailing) - 1;
+        match (trailing, self.words.last_mut()) {
+            (0, _) | (_, None) => {}
+            (trailing, Some(last)) => *last &= (1u64 << trailing) - 1,
         }
     }
 }
@@ -571,6 +629,30 @@ pub fn run_subset_gossip(config: SubsetGossipConfig) -> Result<SubsetGossipRepor
     }
 
     Ok(SubsetGossipReport { rows })
+}
+
+pub fn run_subset_gossip_v1(config: SubsetGossipConfig) -> Result<SubsetGossipReport> {
+    let config = SubsetGossipConfig {
+        prefill_mode: SubsetPrefillMode::None,
+        prefill_fanout: 0,
+        prefill_skip_rounds: 0,
+        repair_missing: true,
+        hash_advertise: false,
+        ..config
+    };
+    run_subset_gossip(config)
+}
+
+pub fn run_subset_gossip_v2(config: SubsetGossipConfig) -> Result<SubsetGossipReport> {
+    let config = SubsetGossipConfig {
+        prefill_mode: SubsetPrefillMode::PrefillDispatch,
+        prefill_fanout: 0,
+        prefill_skip_rounds: 0,
+        repair_missing: false,
+        hash_advertise: false,
+        ..config
+    };
+    run_subset_gossip(config)
 }
 
 fn run_subset_epoch(
@@ -720,37 +802,42 @@ fn run_subset_epoch(
                     let mut subset_block_bytes = 0usize;
                     let mut payload_delivery_items = Vec::new();
                     for block in &blocks {
-                        if let Some(routes) = &precomputed_inventory_routes {
-                            let Some(route) = routes.get(&(*sender, *recipient, block.owner))
-                            else {
-                                continue;
-                            };
-                            if route.attempt < config.prefill_byzantine_withholders_per_branch {
-                                continue;
-                            }
-                            if route.payloads.is_empty() {
-                                continue;
-                            }
-                            let Some(sender_full) =
-                                before_subset[*sender].blocks[block.owner].as_ref()
-                            else {
-                                continue;
-                            };
-                            let (incoming, full_count) =
-                                PayloadMask::intersection_with_count(sender_full, &route.payloads);
-                            if full_count == 0 {
-                                continue;
-                            }
-                            next_subset[*recipient]
-                                .mark_full_payloads(block.owner, incoming.clone());
-                            payload_delivery_items.extend(incoming.indices().map(|command| {
-                                FilteredPayloadDeliveryItem {
-                                    slot_hash: block.slots[command].hash(),
-                                    slot: block.slots[command].clone(),
-                                    payload: Vec::new(),
+                        match &precomputed_inventory_routes {
+                            Some(routes) => {
+                                let route = match routes.get(&(*sender, *recipient, block.owner)) {
+                                    Some(route)
+                                        if route.attempt
+                                            >= config.prefill_byzantine_withholders_per_branch
+                                            && !route.payloads.is_empty() =>
+                                    {
+                                        route
+                                    }
+                                    _ => continue,
+                                };
+                                let sender_full =
+                                    match before_subset[*sender].blocks[block.owner].as_ref() {
+                                        Some(sender_full) => sender_full,
+                                        None => continue,
+                                    };
+                                let (incoming, full_count) = PayloadMask::intersection_with_count(
+                                    sender_full,
+                                    &route.payloads,
+                                );
+                                if full_count == 0 {
+                                    continue;
                                 }
-                            }));
-                            continue;
+                                next_subset[*recipient]
+                                    .mark_full_payloads(block.owner, incoming.clone());
+                                payload_delivery_items.extend(incoming.indices().map(|command| {
+                                    FilteredPayloadDeliveryItem {
+                                        slot_hash: block.slots[command].hash(),
+                                        slot: block.slots[command].clone(),
+                                        payload: Vec::new(),
+                                    }
+                                }));
+                                continue;
+                            }
+                            None => {}
                         }
                         let Some(sender_full) = before_subset[*sender].blocks[block.owner].as_ref()
                         else {
@@ -881,6 +968,7 @@ fn run_subset_epoch(
         SubsetGossipEpochRow {
             epoch,
             epoch_depth: config.epochs,
+            protocol_version: config.protocol_version(),
             nodes: config.nodes,
             quorum_size: config.quorum_size,
             rounds: topology.len().saturating_sub(consensus_start_round),
@@ -1166,13 +1254,15 @@ fn build_prefill_plan(
         .map(|node| (node.keypair.public, BTreeSet::new()))
         .collect();
     for (owner, block) in blocks.iter().enumerate() {
-        if let Some(expected) = expected_by_node.get_mut(&nodes[owner].keypair.public) {
-            expected.insert(block.hash);
-        }
+        expected_by_node
+            .entry(nodes[owner].keypair.public)
+            .or_default()
+            .insert(block.hash);
         for recipient in &recipients_by_sender[owner] {
-            if let Some(expected) = expected_by_node.get_mut(&nodes[*recipient].keypair.public) {
-                expected.insert(block.hash);
-            }
+            expected_by_node
+                .entry(nodes[*recipient].keypair.public)
+                .or_default()
+                .insert(block.hash);
         }
     }
 
@@ -1321,10 +1411,11 @@ fn route_interest_mask(
     reachable_targets: &[usize],
 ) -> PayloadMask {
     let mut mask = PayloadMask::empty(config.commands_per_node);
-    for target in reachable_targets {
-        if let Some(target_mask) = block.target_masks.get(*target) {
-            mask.or_assign(target_mask);
-        }
+    for target_mask in reachable_targets
+        .iter()
+        .filter_map(|target| block.target_masks.get(*target))
+    {
+        mask.or_assign(target_mask);
     }
     mask
 }
@@ -1913,22 +2004,24 @@ fn quorum_algorithm(
             + (self_position % (size_multiple * offset));
 
         let mut quorum = Vec::new();
-        for quorum_member in 0..quorum_size {
-            let index = first_quorum_member + (quorum_member * size_multiple * offset);
-            if let Some(member) = ordered_indices.get(index) {
-                quorum.push(*member);
-            }
-        }
+        extend_quorum_indices(
+            &mut quorum,
+            ordered_indices,
+            first_quorum_member,
+            size_multiple,
+            offset,
+            quorum_size,
+        );
 
         if ordered_indices.len() >= optimal_network_size {
-            for quorum_member in 0..quorum_size {
-                let index = optimal_network_size
-                    + first_quorum_member
-                    + (quorum_member * size_multiple * offset);
-                if let Some(member) = ordered_indices.get(index) {
-                    quorum.push(*member);
-                }
-            }
+            extend_quorum_indices(
+                &mut quorum,
+                ordered_indices,
+                optimal_network_size + first_quorum_member,
+                size_multiple,
+                offset,
+                quorum_size,
+            );
         }
 
         quorum.sort_unstable();
@@ -1937,6 +2030,20 @@ fn quorum_algorithm(
     }
 
     quorum_members_matrix
+}
+
+fn extend_quorum_indices(
+    quorum: &mut Vec<usize>,
+    ordered_indices: &[usize],
+    first_quorum_member: usize,
+    size_multiple: usize,
+    offset: usize,
+    quorum_size: usize,
+) {
+    quorum.extend((0..quorum_size).filter_map(|quorum_member| {
+        let index = first_quorum_member + (quorum_member * size_multiple * offset);
+        ordered_indices.get(index).copied()
+    }));
 }
 
 fn find_round_number(network_size: usize, quorum_size: usize) -> (usize, usize) {
@@ -2109,6 +2216,76 @@ mod tests {
             assert_eq!(row.subset_missing_payloads_after_repair, 0);
             assert!(row.subset_wire_bytes <= row.full_wire_bytes);
         }
+    }
+
+    #[test]
+    fn protocol_v1_profile_preserves_old_repair_path() {
+        let config = SubsetGossipConfig {
+            nodes: 36,
+            epochs: 1,
+            quorum_size: 6,
+            commands_per_node: 16,
+            command_bytes: 128,
+            targets_per_command: 3,
+            ..SubsetGossipConfig::for_protocol_version(SubsetGossipProtocolVersion::V1)
+        };
+
+        let row = run_subset_gossip_v1(config).unwrap().rows.remove(0);
+
+        assert_eq!(row.protocol_version, SubsetGossipProtocolVersion::V1);
+        assert_eq!(row.prefill_mode, SubsetPrefillMode::None);
+        assert_eq!(row.prefill_skip_rounds, 0);
+        assert!(row.repair_missing);
+        assert!(row.metadata_converged);
+        assert!(row.subset_missing_payloads_before_repair > 0);
+        assert_eq!(row.subset_missing_payloads_after_repair, 0);
+        assert!(row.subset_repair_batches > 0);
+    }
+
+    #[test]
+    fn protocol_v2_profile_preserves_prefill_dispatch_path() {
+        let config = SubsetGossipConfig {
+            nodes: 72,
+            epochs: 1,
+            quorum_size: 6,
+            commands_per_node: 16,
+            command_bytes: 128,
+            targets_per_command: 3,
+            ..SubsetGossipConfig::for_protocol_version(SubsetGossipProtocolVersion::V2)
+        };
+
+        let row = run_subset_gossip_v2(config).unwrap().rows.remove(0);
+
+        assert_eq!(row.protocol_version, SubsetGossipProtocolVersion::V2);
+        assert_eq!(row.prefill_mode, SubsetPrefillMode::PrefillDispatch);
+        assert_eq!(row.prefill_skip_rounds, 1);
+        assert_eq!(row.prefill_fanout, 17);
+        assert!(!row.repair_missing);
+        assert!(row.metadata_converged);
+        assert!(row.subset_payloads_complete_before_repair);
+        assert_eq!(row.subset_missing_payloads_before_repair, 0);
+        assert_eq!(row.subset_repair_batches, 0);
+    }
+
+    #[test]
+    fn experimental_knobs_are_labeled_custom() {
+        let config = SubsetGossipConfig {
+            nodes: 12,
+            epochs: 1,
+            quorum_size: 3,
+            commands_per_node: 8,
+            command_bytes: 64,
+            targets_per_command: 2,
+            prefill_mode: SubsetPrefillMode::Random,
+            prefill_fanout: 3,
+            repair_missing: true,
+            ..SubsetGossipConfig::default()
+        };
+
+        let row = run_subset_gossip(config).unwrap().rows.remove(0);
+
+        assert_eq!(row.protocol_version, SubsetGossipProtocolVersion::Custom);
+        assert_eq!(row.prefill_mode, SubsetPrefillMode::Random);
     }
 
     #[test]

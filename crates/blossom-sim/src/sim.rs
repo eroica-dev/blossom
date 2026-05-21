@@ -450,8 +450,9 @@ impl HermeticCluster {
     pub async fn run_until_idle(&mut self) -> Result<()> {
         while let Some(((delivered_at_ms, event_id), event)) = self.pop_next() {
             self.now_ms = delivered_at_ms;
-            if let Some(record) = self.handle_event(event_id, delivered_at_ms, event).await? {
-                self.log.push(record);
+            match self.handle_event(event_id, delivered_at_ms, event).await? {
+                Some(record) => self.log.push(record),
+                None => {}
             }
         }
         Ok(())

@@ -55,36 +55,38 @@ async fn main() -> MainResult<()> {
 async fn serve(bind: String, output: Option<PathBuf>, ui_bind: Option<String>) -> MainResult<()> {
     let listener = TcpListener::bind(&bind).await?;
     let collector = Arc::new(ObserverCollector::default());
-    let ui_listener = if let Some(bind) = ui_bind {
-        Some((bind.clone(), TcpListener::bind(&bind).await?))
-    } else {
-        None
+    let ui_listener = match ui_bind {
+        Some(bind) => Some((bind.clone(), TcpListener::bind(&bind).await?)),
+        None => None,
     };
-    let output = if let Some(path) = output {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
+    let output = match output {
+        Some(path) => {
+            match path.parent() {
+                Some(parent) => std::fs::create_dir_all(parent)?,
+                None => {}
+            }
+            Some(Arc::new(std::sync::Mutex::new(std::io::BufWriter::new(
+                std::fs::OpenOptions::new()
+                    .create(true)
+                    .write(true)
+                    .truncate(true)
+                    .open(path)?,
+            ))))
         }
-        Some(Arc::new(std::sync::Mutex::new(std::io::BufWriter::new(
-            std::fs::OpenOptions::new()
-                .create(true)
-                .write(true)
-                .truncate(true)
-                .open(path)?,
-        ))))
-    } else {
-        None
+        None => None,
     };
     eprintln!("blossom-observer listening on {bind}");
-    let ui_task = if let Some((ui_bind, ui_listener)) = ui_listener {
-        let collector = Arc::clone(&collector);
-        eprintln!("blossom-observer dashboard listening on http://{ui_bind}");
-        Some(tokio::spawn(async move {
-            if let Err(err) = serve_ui(ui_listener, collector).await {
-                eprintln!("observer dashboard failed: {err}");
-            }
-        }))
-    } else {
-        None
+    let ui_task = match ui_listener {
+        Some((ui_bind, ui_listener)) => {
+            let collector = Arc::clone(&collector);
+            eprintln!("blossom-observer dashboard listening on http://{ui_bind}");
+            Some(tokio::spawn(async move {
+                if let Err(err) = serve_ui(ui_listener, collector).await {
+                    eprintln!("observer dashboard failed: {err}");
+                }
+            }))
+        }
+        None => None,
     };
 
     loop {
@@ -108,8 +110,9 @@ async fn serve(bind: String, output: Option<PathBuf>, ui_bind: Option<String>) -
         }
     }
 
-    if let Some(ui_task) = ui_task {
-        ui_task.abort();
+    match ui_task {
+        Some(ui_task) => ui_task.abort(),
+        None => {}
     }
 
     Ok(())
@@ -124,16 +127,20 @@ async fn handle_connection(
     let mut output_batch = Vec::with_capacity(OUTPUT_BATCH_BYTES);
     while let Some(line) = lines.next_line().await? {
         collector.ingest_json_line(&line)?;
-        if let Some(output) = output.as_ref() {
-            output_batch.extend_from_slice(line.as_bytes());
-            output_batch.push(b'\n');
-            if output_batch.len() >= OUTPUT_BATCH_BYTES {
-                flush_output_batch(output, &mut output_batch)?;
+        match output.as_ref() {
+            Some(output) => {
+                output_batch.extend_from_slice(line.as_bytes());
+                output_batch.push(b'\n');
+                if output_batch.len() >= OUTPUT_BATCH_BYTES {
+                    flush_output_batch(output, &mut output_batch)?;
+                }
             }
+            None => {}
         }
     }
-    if let Some(output) = output.as_ref() {
-        flush_output_batch(output, &mut output_batch)?;
+    match output.as_ref() {
+        Some(output) => flush_output_batch(output, &mut output_batch)?,
+        None => {}
     }
     Ok(())
 }

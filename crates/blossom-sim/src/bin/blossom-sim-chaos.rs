@@ -114,9 +114,12 @@ async fn main() -> MainResult<()> {
         rows.push(row);
     }
 
-    if let Some(path) = args.csv {
-        write_csv(&path, args.append, &rows)?;
-        eprintln!("wrote {}", path.display());
+    match args.csv {
+        Some(path) => {
+            write_csv(&path, args.append, &rows)?;
+            eprintln!("wrote {}", path.display());
+        }
+        None => {}
     }
 
     Ok(())
@@ -222,8 +225,9 @@ async fn run_iteration(iteration: usize, config: IterationConfig) -> MainResult<
 }
 
 fn write_csv(path: &PathBuf, append: bool, rows: &[ChaosBenchRow]) -> MainResult<()> {
-    if let Some(parent) = path.parent() {
-        create_dir_all(parent)?;
+    match path.parent() {
+        Some(parent) => create_dir_all(parent)?,
+        None => {}
     }
 
     let write_header = !append || !path.exists() || path.metadata()?.len() == 0;

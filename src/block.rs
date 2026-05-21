@@ -545,8 +545,9 @@ impl Transaction {
     #[inline]
     fn canonical_payload_encoded_len(&self) -> usize {
         #[cfg(feature = "filtered-transactions")]
-        if let Some(slot) = &self.filtered_slot {
-            return slot.encoded_len();
+        match &self.filtered_slot {
+            Some(slot) => return slot.encoded_len(),
+            None => {}
         }
 
         self.payload.bytes.len()
@@ -559,9 +560,12 @@ impl Transaction {
 
     fn append_canonical_payload_to(&self, bytes: &mut Vec<u8>) {
         #[cfg(feature = "filtered-transactions")]
-        if let Some(slot) = &self.filtered_slot {
-            slot.append_bytes_to(bytes);
-            return;
+        match &self.filtered_slot {
+            Some(slot) => {
+                slot.append_bytes_to(bytes);
+                return;
+            }
+            None => {}
         }
 
         bytes.extend_from_slice(self.payload.bytes.as_slice());
@@ -569,9 +573,12 @@ impl Transaction {
 
     fn update_canonical_payload_hash(&self, hasher: &mut ProtocolHasher) {
         #[cfg(feature = "filtered-transactions")]
-        if let Some(slot) = &self.filtered_slot {
-            slot.update_hash(hasher);
-            return;
+        match &self.filtered_slot {
+            Some(slot) => {
+                slot.update_hash(hasher);
+                return;
+            }
+            None => {}
         }
 
         hasher.update(self.payload.bytes.as_slice());

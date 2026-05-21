@@ -11,8 +11,8 @@ mod bench {
     use std::path::PathBuf;
 
     use blossom::{
-        SubsetGossipConfig, SubsetGossipEpochRow, SubsetLatencyDistribution, SubsetLatencyProfile,
-        SubsetPrefillMode, run_subset_gossip,
+        SubsetGossipConfig, SubsetGossipEpochRow, SubsetGossipProtocolVersion,
+        SubsetLatencyDistribution, SubsetLatencyProfile, SubsetPrefillMode, run_subset_gossip,
     };
     use clap::{Parser, ValueEnum};
 
@@ -40,14 +40,16 @@ mod bench {
         command_bytes: usize,
         #[arg(long, default_value_t = 3)]
         targets_per_command: usize,
+        #[arg(long, value_enum, default_value_t = ProtocolVersionArg::V1)]
+        protocol_version: ProtocolVersionArg,
         #[arg(long, default_value_t = false)]
         trusted: bool,
         #[arg(long, default_value_t = false)]
         shuffle: bool,
-        #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
-        repair_missing: bool,
-        #[arg(long, value_enum, default_value_t = PrefillModeArg::None)]
-        prefill_mode: PrefillModeArg,
+        #[arg(long, action = clap::ArgAction::Set)]
+        repair_missing: Option<bool>,
+        #[arg(long, value_enum)]
+        prefill_mode: Option<PrefillModeArg>,
         #[arg(long, default_value_t = 0)]
         prefill_fanout: usize,
         #[arg(long, default_value_t = 0)]
@@ -87,6 +89,13 @@ mod bench {
     }
 
     #[derive(Debug, Clone, Copy, ValueEnum)]
+    enum ProtocolVersionArg {
+        V1,
+        V2,
+        Custom,
+    }
+
+    #[derive(Debug, Clone, Copy, ValueEnum)]
     enum PrefillModeArg {
         None,
         Random,
@@ -99,6 +108,16 @@ mod bench {
             match value {
                 LatencyDistributionArg::Even => Self::Even,
                 LatencyDistributionArg::Random => Self::Random,
+            }
+        }
+    }
+
+    impl From<ProtocolVersionArg> for SubsetGossipProtocolVersion {
+        fn from(value: ProtocolVersionArg) -> Self {
+            match value {
+                ProtocolVersionArg::V1 => Self::V1,
+                ProtocolVersionArg::V2 => Self::V2,
+                ProtocolVersionArg::Custom => Self::Custom,
             }
         }
     }
@@ -116,7 +135,8 @@ mod bench {
 
     pub fn main() -> MainResult<()> {
         let args = Args::parse();
-        let config = SubsetGossipConfig {
+        let mut config = SubsetGossipConfig::for_protocol_version(args.protocol_version.into());
+        config = SubsetGossipConfig {
             seed: args.seed,
             nodes: args.nodes,
             epochs: args.epoch_depth,
@@ -126,8 +146,8 @@ mod bench {
             targets_per_command: args.targets_per_command,
             trusted: args.trusted,
             shuffle: args.shuffle,
-            repair_missing: args.repair_missing,
-            prefill_mode: args.prefill_mode.into(),
+            repair_missing: args.repair_missing.unwrap_or(config.repair_missing),
+            prefill_mode: args.prefill_mode.map_or(config.prefill_mode, Into::into),
             prefill_fanout: args.prefill_fanout,
             prefill_skip_rounds: args.prefill_skip_rounds,
             prefill_replicas_per_quorum: args.prefill_replicas_per_quorum,
@@ -141,6 +161,7 @@ mod bench {
                 max_ms: args.latency_max_ms,
                 seed: args.latency_seed,
             },
+            ..config
         };
 
         let report = run_subset_gossip(config)?;
@@ -152,9 +173,12 @@ mod bench {
             println!("{}", row_to_csv(&args.scenario, args.repeat, row));
         }
 
-        if let Some(path) = args.csv.as_ref() {
-            write_csv(path, args.append, &args.scenario, args.repeat, &report.rows)?;
-            eprintln!("wrote {}", path.display());
+        match args.csv.as_ref() {
+            Some(path) => {
+                write_csv(path, args.append, &args.scenario, args.repeat, &report.rows)?;
+                eprintln!("wrote {}", path.display());
+            }
+            None => {}
         }
 
         Ok(())
@@ -187,8 +211,9 @@ mod bench {
         repeat: usize,
         rows: &[SubsetGossipEpochRow],
     ) -> MainResult<()> {
-        if let Some(parent) = path.parent() {
-            create_dir_all(parent)?;
+        match path.parent() {
+            Some(parent) => create_dir_all(parent)?,
+            None => {}
         }
 
         let write_header = !append || !path.exists() || path.metadata()?.len() == 0;
@@ -202,7 +227,7 @@ mod bench {
         if write_header {
             writeln!(
                 file,
-                "scenario,repeat,epoch,epoch_depth,nodes,quorum_size,rounds,quorums,trusted,shuffle,repair_missing,prefill_mode,prefill_fanout,prefill_skip_rounds,prefill_replicas_per_quorum,prefill_byzantine_withholders_per_branch,hash_advertise,drop_round0_dispatch,latency_distribution,latency_ms,latency_min_ms,latency_max_ms,commands_per_node,command_bytes,targets_per_command,total_commands,target_payload_deliveries,metadata_converged_nodes,metadata_converged,subset_payloads_complete_before_repair,subset_payloads_complete_after_repair,subset_missing_payloads_before_repair,subset_missing_payloads_after_repair,subset_delivered_payloads_before_repair,subset_delivered_payloads_after_repair,subset_repair_batches,subset_repair_bytes,subset_repair_latency_ms,prefill_recipients,prefill_expected_hashes,prefill_bytes,hash_advertise_messages,hash_advertise_bytes,duplicate_suppressed_blocks,modeled_prefill_latency_ms,modeled_hash_advertise_latency_ms,modeled_finality_latency_ms,modeled_dispatch_latency_ms,modeled_control_latency_ms,subset_payload_ready_latency_ms,full_block_bytes,full_dispatch_bytes,subset_dispatch_bytes,control_bytes,full_wire_bytes,subset_wire_bytes,full_amplification,subset_amplification,subset_savings_pct,full_tps,subset_payload_ready_tps,full_total_gbps,subset_total_gbps,full_per_node_gbps,subset_per_node_gbps"
+                "scenario,repeat,epoch,epoch_depth,protocol_version,nodes,quorum_size,rounds,quorums,trusted,shuffle,repair_missing,prefill_mode,prefill_fanout,prefill_skip_rounds,prefill_replicas_per_quorum,prefill_byzantine_withholders_per_branch,hash_advertise,drop_round0_dispatch,latency_distribution,latency_ms,latency_min_ms,latency_max_ms,commands_per_node,command_bytes,targets_per_command,total_commands,target_payload_deliveries,metadata_converged_nodes,metadata_converged,subset_payloads_complete_before_repair,subset_payloads_complete_after_repair,subset_missing_payloads_before_repair,subset_missing_payloads_after_repair,subset_delivered_payloads_before_repair,subset_delivered_payloads_after_repair,subset_repair_batches,subset_repair_bytes,subset_repair_latency_ms,prefill_recipients,prefill_expected_hashes,prefill_bytes,hash_advertise_messages,hash_advertise_bytes,duplicate_suppressed_blocks,modeled_prefill_latency_ms,modeled_hash_advertise_latency_ms,modeled_finality_latency_ms,modeled_dispatch_latency_ms,modeled_control_latency_ms,subset_payload_ready_latency_ms,full_block_bytes,full_dispatch_bytes,subset_dispatch_bytes,control_bytes,full_wire_bytes,subset_wire_bytes,full_amplification,subset_amplification,subset_savings_pct,full_tps,subset_payload_ready_tps,full_total_gbps,subset_total_gbps,full_per_node_gbps,subset_per_node_gbps"
             )?;
         }
         for row in rows {
@@ -217,6 +242,7 @@ mod bench {
             repeat.to_string(),
             row.epoch.to_string(),
             row.epoch_depth.to_string(),
+            row.protocol_version.as_str().to_string(),
             row.nodes.to_string(),
             row.quorum_size.to_string(),
             row.rounds.to_string(),

@@ -418,34 +418,39 @@ impl TempQuorum {
             )));
         }
 
-        if let Some(raw_payload_len) = dispatch.raw_payload_len() {
-            let pending_raw_bytes = self.pending_raw_dispatch_bytes();
-            let next_raw_bytes =
-                pending_raw_bytes
+        match dispatch.raw_payload_len() {
+            Some(raw_payload_len) => {
+                let pending_raw_bytes = self.pending_raw_dispatch_bytes();
+                let next_raw_bytes =
+                    pending_raw_bytes
+                        .checked_add(raw_payload_len)
+                        .ok_or_else(|| {
+                            BlossomError::WireProtocol(
+                                "pending raw dispatch byte overflow".to_string(),
+                            )
+                        })?;
+                if next_raw_bytes > max_raw_dispatch_bytes {
+                    return Err(BlossomError::WireProtocol(format!(
+                        "pending raw dispatch bytes exceed quorum cap: {next_raw_bytes} > {max_raw_dispatch_bytes}"
+                    )));
+                }
+
+                let sender = dispatch.sender();
+                let pending_sender_raw_bytes = self.pending_raw_dispatch_bytes_for_sender(&sender);
+                let next_sender_raw_bytes = pending_sender_raw_bytes
                     .checked_add(raw_payload_len)
                     .ok_or_else(|| {
-                        BlossomError::WireProtocol("pending raw dispatch byte overflow".to_string())
-                    })?;
-            if next_raw_bytes > max_raw_dispatch_bytes {
-                return Err(BlossomError::WireProtocol(format!(
-                    "pending raw dispatch bytes exceed quorum cap: {next_raw_bytes} > {max_raw_dispatch_bytes}"
-                )));
-            }
-
-            let sender = dispatch.sender();
-            let pending_sender_raw_bytes = self.pending_raw_dispatch_bytes_for_sender(&sender);
-            let next_sender_raw_bytes = pending_sender_raw_bytes
-                .checked_add(raw_payload_len)
-                .ok_or_else(|| {
                     BlossomError::WireProtocol(
                         "pending raw dispatch sender byte overflow".to_string(),
                     )
                 })?;
-            if next_sender_raw_bytes > max_raw_dispatch_bytes_per_sender {
-                return Err(BlossomError::WireProtocol(format!(
-                    "pending raw dispatch bytes exceed sender cap: {next_sender_raw_bytes} > {max_raw_dispatch_bytes_per_sender}"
-                )));
+                if next_sender_raw_bytes > max_raw_dispatch_bytes_per_sender {
+                    return Err(BlossomError::WireProtocol(format!(
+                        "pending raw dispatch bytes exceed sender cap: {next_sender_raw_bytes} > {max_raw_dispatch_bytes_per_sender}"
+                    )));
+                }
             }
+            None => {}
         }
 
         self.pending_dispatches.push(dispatch);
@@ -594,8 +599,9 @@ impl VerifCount {
     pub fn record(&mut self, verification: Verification) {
         let sender = verification.header.sender;
         let blocks_hash = verification.body.blocks_hash;
-        if let Some(previous) = self.verifications.insert(sender, verification) {
-            decrement_count_u8(&mut self.count, previous.body.blocks_hash);
+        match self.verifications.insert(sender, verification) {
+            Some(previous) => decrement_count_u8(&mut self.count, previous.body.blocks_hash),
+            None => {}
         }
         *self.count.entry(blocks_hash).or_default() += 1;
     }
@@ -619,13 +625,17 @@ impl PropCount {
     pub fn record(&mut self, proposal: Proposal) {
         let sender = proposal.header.sender;
         let approved_hash = proposal.body.approved_hash;
-        if let Some(previous) = self.proposals.insert(sender, proposal) {
-            if let Some(previous_hash) = previous.body.approved_hash {
-                decrement_count_u32(&mut self.count, previous_hash);
-            }
+        match self
+            .proposals
+            .insert(sender, proposal)
+            .and_then(|previous| previous.body.approved_hash)
+        {
+            Some(previous_hash) => decrement_count_u32(&mut self.count, previous_hash),
+            None => {}
         }
-        if let Some(hash) = approved_hash {
-            *self.count.entry(hash).or_default() += 1;
+        match approved_hash {
+            Some(hash) => *self.count.entry(hash).or_default() += 1,
+            None => {}
         }
     }
 
@@ -864,8 +874,9 @@ fn block_merkle_root(blocks: &BTreeMap<HashType, Block>) -> HashType {
         if blocks.is_empty() {
             return HashType::default();
         }
-        if let Some(hash) = blocks.keys().next().copied().filter(|_| blocks.len() == 1) {
-            return hash;
+        match blocks.keys().next().copied().filter(|_| blocks.len() == 1) {
+            Some(hash) => return hash,
+            None => {}
         }
         blocks.hash()
     }

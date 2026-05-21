@@ -8,6 +8,7 @@
 #   COMMANDS_PER_NODE=256
 #   COMMAND_BYTES=1024
 #   QUORUM_SIZE=6
+#   PROTOCOL_VERSIONS="v1 v2"
 
 set -euo pipefail
 
@@ -22,7 +23,8 @@ cd "$ws_root"
 report_pinning
 
 timestamp_value="$(timestamp)"
-out_dir="${OUT_DIR:-$root/results/subset_gossip_${timestamp_value}}"
+protocol_versions="${PROTOCOL_VERSIONS:-${PROTOCOL_VERSION:-v1}}"
+out_dir="${OUT_DIR:-$root/results/subset_gossip_${protocol_versions// /_}_${timestamp_value}}"
 mkdir -p "$out_dir"
 
 csv="$out_dir/subset_gossip_runs.csv"
@@ -37,6 +39,8 @@ latency_seed_base="${LATENCY_SEED_BASE:-918273645}"
 cargo build --release --features availability-gossip --bin blossom-subset-gossip-bench
 
 run_case() {
+  local protocol_version="$1"
+  shift
   local nodes="$1"
   local targets="$2"
   local architecture="$3"
@@ -51,11 +55,12 @@ run_case() {
 
   local seed=$((seed_base + repeat * 1000003 + nodes * 9176 + targets * 131))
   local latency_seed=$((latency_seed_base + repeat * 65537 + nodes * 4099 + targets * 257))
-  local scenario="subset_${architecture}_${latency_profile}_n${nodes}_t${targets}_r${repeat}"
+  local scenario="subset_${protocol_version}_${architecture}_${latency_profile}_n${nodes}_t${targets}_r${repeat}"
 
-  echo "subset matrix: scenario=$scenario epochs=$epochs commands_per_node=$commands_per_node command_bytes=$command_bytes"
+  echo "subset matrix: scenario=$scenario protocol=$protocol_version epochs=$epochs commands_per_node=$commands_per_node command_bytes=$command_bytes"
   target/release/blossom-subset-gossip-bench \
     --scenario "$scenario" \
+    --protocol-version "$protocol_version" \
     --repeat "$repeat" \
     --nodes "$nodes" \
     --quorum-size "$quorum_size" \
@@ -72,18 +77,20 @@ run_case() {
     "$@" > "$out_dir/${scenario}.stdout" 2> "$out_dir/${scenario}.stderr"
 }
 
-for repeat in $(seq 1 "$repeat_runs"); do
-  for nodes in 12 36 64; do
-    for targets in 1 3 6; do
-      for architecture in verified trusted; do
-        run_case "$nodes" "$targets" "$architecture" even150 "$repeat" \
-          --latency-distribution even \
-          --latency-ms 150
+for protocol_version in $protocol_versions; do
+  for repeat in $(seq 1 "$repeat_runs"); do
+    for nodes in 12 36 64; do
+      for targets in 1 3 6; do
+        for architecture in verified trusted; do
+          run_case "$protocol_version" "$nodes" "$targets" "$architecture" even150 "$repeat" \
+            --latency-distribution even \
+            --latency-ms 150
 
-        run_case "$nodes" "$targets" "$architecture" random1_300 "$repeat" \
-          --latency-distribution random \
-          --latency-min-ms 1 \
-          --latency-max-ms 300
+          run_case "$protocol_version" "$nodes" "$targets" "$architecture" random1_300 "$repeat" \
+            --latency-distribution random \
+            --latency-min-ms 1 \
+            --latency-max-ms 300
+        done
       done
     done
   done

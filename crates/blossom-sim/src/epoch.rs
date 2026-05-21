@@ -182,23 +182,26 @@ impl EpochChaosConfig {
                 "partition_end_epoch requires partition_start_epoch".to_string(),
             ));
         }
-        if let Some(start) = self.partition_start_epoch {
-            let Some(end) = self.partition_end_epoch else {
-                return Err(blossom::BlossomError::WireProtocol(
-                    "partition_start_epoch requires partition_end_epoch".to_string(),
-                ));
-            };
-            if end <= start {
-                return Err(blossom::BlossomError::WireProtocol(format!(
-                    "partition_end_epoch ({end}) must be greater than partition_start_epoch ({start})"
-                )));
+        match self.partition_start_epoch {
+            Some(start) => {
+                let Some(end) = self.partition_end_epoch else {
+                    return Err(blossom::BlossomError::WireProtocol(
+                        "partition_start_epoch requires partition_end_epoch".to_string(),
+                    ));
+                };
+                if end <= start {
+                    return Err(blossom::BlossomError::WireProtocol(format!(
+                        "partition_end_epoch ({end}) must be greater than partition_start_epoch ({start})"
+                    )));
+                }
+                let left_nodes = self.effective_partition_left_nodes();
+                if left_nodes == 0 || left_nodes >= self.nodes {
+                    return Err(blossom::BlossomError::WireProtocol(format!(
+                        "partition_left_nodes ({left_nodes}) must split the network into two non-empty sides"
+                    )));
+                }
             }
-            let left_nodes = self.effective_partition_left_nodes();
-            if left_nodes == 0 || left_nodes >= self.nodes {
-                return Err(blossom::BlossomError::WireProtocol(format!(
-                    "partition_left_nodes ({left_nodes}) must split the network into two non-empty sides"
-                )));
-            }
+            None => {}
         }
         if self.repair_rounds > 0 {
             let max_peers = self.nodes.saturating_sub(1);
@@ -678,9 +681,10 @@ impl EpochTelemetryEmitter {
                 TelemetryEvent::span_start_with_timestamp_micros(span_id, stage, event, timestamp)
                     .with_node(*node)
                     .with_group_id(ConsensusGroupId::root());
-            if let Some(round) = round.and_then(|round| u8::try_from(round).ok()) {
-                telemetry = telemetry.with_round(round);
-            }
+            telemetry = match round.and_then(|round| u8::try_from(round).ok()) {
+                Some(round) => telemetry.with_round(round),
+                None => telemetry,
+            };
             handle.record(telemetry);
         }
         Some(EpochTelemetrySpan {
@@ -703,9 +707,10 @@ impl EpochTelemetryEmitter {
             .with_node(node)
             .with_group_id(ConsensusGroupId::root())
             .with_target(record.canonical_epoch_hash, record.nonce);
-            if let Some(round) = record.round.and_then(|round| u8::try_from(round).ok()) {
-                telemetry = telemetry.with_round(round);
-            }
+            telemetry = match record.round.and_then(|round| u8::try_from(round).ok()) {
+                Some(round) => telemetry.with_round(round),
+                None => telemetry,
+            };
             handle.record(telemetry);
         }
     }
@@ -903,9 +908,10 @@ fn stage_metric_event(record: &EpochStageProgressRecord) -> TelemetryEvent {
             .to_string(),
     )
     .with_target(record.canonical_epoch_hash, record.nonce);
-    if let Some(round) = record.round.and_then(|round| u8::try_from(round).ok()) {
-        event = event.with_round(round);
-    }
+    event = match record.round.and_then(|round| u8::try_from(round).ok()) {
+        Some(round) => event.with_round(round),
+        None => event,
+    };
     event
 }
 
@@ -988,106 +994,110 @@ fn run_epoch_chaos_inner(
         let active_node_keys = collect_active_node_keys(&keys, &active_indices);
         let active_nodes = active_indices.len();
         let dropped_nodes = config.nodes.saturating_sub(active_nodes);
-        if let Some(pending) = pending_reconciliation.clone() {
-            let mut canonical_data_holders = pending
-                .canonical_data_holders
-                .iter()
-                .copied()
-                .filter(|index| active.get(*index).copied().unwrap_or(false))
-                .collect::<BTreeSet<_>>();
-            let mut canonical_block_replicas = pending.canonical_block_replicas.clone();
-            retain_active_replicas(&mut canonical_block_replicas, &active);
-            let correct_start_nodes = count_active_correct(
-                &states,
-                &active_indices,
-                pending.canonical_hash,
-                pending.nonce,
-            );
-            if correct_start_nodes < active_nodes {
-                let mut totals = EpochTransportTotals::default();
-                let repaired_nodes = repair_epoch(
-                    &config,
-                    &mut transport,
-                    epoch,
-                    pending.nonce,
-                    &mut states,
-                    pending.canonical_hash,
-                    &mut totals,
-                    &mut stage_progress,
-                    pending.canonical_blocks,
-                    &pending.canonical_block_sources,
-                    &mut canonical_data_holders,
-                    &mut canonical_block_replicas,
-                    pending.min_blocks_per_node,
-                    pending.max_blocks_per_node,
-                    &active_indices,
-                    &active_node_keys,
-                    dropped_nodes,
-                    &mut telemetry,
-                );
-                let correct_nodes = count_active_correct(
+        match pending_reconciliation.clone() {
+            Some(pending) => {
+                let mut canonical_data_holders = pending
+                    .canonical_data_holders
+                    .iter()
+                    .copied()
+                    .filter(|index| active.get(*index).copied().unwrap_or(false))
+                    .collect::<BTreeSet<_>>();
+                let mut canonical_block_replicas = pending.canonical_block_replicas.clone();
+                retain_active_replicas(&mut canonical_block_replicas, &active);
+                let correct_start_nodes = count_active_correct(
                     &states,
                     &active_indices,
                     pending.canonical_hash,
                     pending.nonce,
                 );
-                let unique_epoch_hashes = unique_active_epoch_hashes(&states, &active_indices);
-                let data_available_nodes = count_active_data_available(
-                    &states,
-                    &active_indices,
-                    pending.canonical_hash,
-                    pending.nonce,
-                    &canonical_data_holders,
-                );
+                if correct_start_nodes < active_nodes {
+                    let mut totals = EpochTransportTotals::default();
+                    let repaired_nodes = repair_epoch(
+                        &config,
+                        &mut transport,
+                        epoch,
+                        pending.nonce,
+                        &mut states,
+                        pending.canonical_hash,
+                        &mut totals,
+                        &mut stage_progress,
+                        pending.canonical_blocks,
+                        &pending.canonical_block_sources,
+                        &mut canonical_data_holders,
+                        &mut canonical_block_replicas,
+                        pending.min_blocks_per_node,
+                        pending.max_blocks_per_node,
+                        &active_indices,
+                        &active_node_keys,
+                        dropped_nodes,
+                        &mut telemetry,
+                    );
+                    let correct_nodes = count_active_correct(
+                        &states,
+                        &active_indices,
+                        pending.canonical_hash,
+                        pending.nonce,
+                    );
+                    let unique_epoch_hashes = unique_active_epoch_hashes(&states, &active_indices);
+                    let data_available_nodes = count_active_data_available(
+                        &states,
+                        &active_indices,
+                        pending.canonical_hash,
+                        pending.nonce,
+                        &canonical_data_holders,
+                    );
 
-                let incorrectly_lost_local_blocks = count_incorrectly_lost_local_blocks(
-                    &pending.expected_canonical_block_hashes,
-                    &canonical_block_replicas,
-                );
+                    let incorrectly_lost_local_blocks = count_incorrectly_lost_local_blocks(
+                        &pending.expected_canonical_block_hashes,
+                        &canonical_block_replicas,
+                    );
 
-                epoch_reports.push(EpochChaosEpochReport {
-                    epoch,
-                    nonce: pending.nonce,
-                    start_active_nodes: active_nodes,
-                    start_dropped_nodes: dropped_nodes,
-                    active_nodes,
-                    dropped_nodes,
-                    reconnected_nodes: 0,
-                    correct_start_nodes,
-                    correct_nodes,
-                    incorrect_nodes: active_nodes.saturating_sub(correct_nodes),
-                    data_available_nodes,
-                    data_unavailable_nodes: data_unavailable_nodes(
+                    epoch_reports.push(EpochChaosEpochReport {
+                        epoch,
+                        nonce: pending.nonce,
+                        start_active_nodes: active_nodes,
+                        start_dropped_nodes: dropped_nodes,
                         active_nodes,
+                        dropped_nodes,
+                        reconnected_nodes: 0,
+                        correct_start_nodes,
+                        correct_nodes,
+                        incorrect_nodes: active_nodes.saturating_sub(correct_nodes),
                         data_available_nodes,
-                    ),
-                    unique_epoch_hashes,
-                    min_blocks_per_node: pending.min_blocks_per_node,
-                    max_blocks_per_node: pending.max_blocks_per_node,
-                    valid_local_blocks: pending.valid_local_blocks,
-                    intentionally_dropped_local_blocks: pending.intentionally_dropped_local_blocks,
-                    incorrectly_lost_local_blocks,
-                    canonical_blocks: pending.canonical_blocks,
-                    canonical_epoch_hash: pending.canonical_hash,
-                    pre_repair_correct_nodes: correct_start_nodes,
-                    repaired_nodes,
-                    messages: totals,
-                });
-                latest_canonical_data_holders = canonical_data_holders.clone();
-                if correct_nodes == active_nodes
-                    && data_available_nodes == active_nodes
-                    && unique_epoch_hashes == 1
-                {
-                    pending_reconciliation = None;
-                } else {
-                    pending_reconciliation = Some(PendingEpochReconciliation {
-                        canonical_data_holders,
-                        canonical_block_replicas,
-                        ..pending
+                        data_unavailable_nodes: data_unavailable_nodes(
+                            active_nodes,
+                            data_available_nodes,
+                        ),
+                        unique_epoch_hashes,
+                        min_blocks_per_node: pending.min_blocks_per_node,
+                        max_blocks_per_node: pending.max_blocks_per_node,
+                        valid_local_blocks: pending.valid_local_blocks,
+                        intentionally_dropped_local_blocks: pending
+                            .intentionally_dropped_local_blocks,
+                        incorrectly_lost_local_blocks,
+                        canonical_blocks: pending.canonical_blocks,
+                        canonical_epoch_hash: pending.canonical_hash,
+                        pre_repair_correct_nodes: correct_start_nodes,
+                        repaired_nodes,
+                        messages: totals,
                     });
+                    latest_canonical_data_holders = canonical_data_holders.clone();
+                    if correct_nodes == active_nodes
+                        && data_available_nodes == active_nodes
+                        && unique_epoch_hashes == 1
+                    {
+                        pending_reconciliation = None;
+                    } else {
+                        pending_reconciliation = Some(PendingEpochReconciliation {
+                            canonical_data_holders,
+                            canonical_block_replicas,
+                            ..pending
+                        });
+                    }
+                    continue;
                 }
-                continue;
             }
+            None => {}
         }
         let nonce = canonical_nonce.new_next();
         let correct_start_nodes = active_indices
@@ -1242,8 +1252,11 @@ fn run_epoch_chaos_inner(
             if dropped_local_block_sources.contains(&index) {
                 continue;
             }
-            if let Some(block) = local_blocks[index].as_ref() {
-                known_blocks[index].insert(block.hash, block.clone());
+            match local_blocks[index].as_ref() {
+                Some(block) => {
+                    known_blocks[index].insert(block.hash, block.clone());
+                }
+                None => {}
             }
         }
 
@@ -2718,7 +2731,7 @@ fn repair_epoch(
                 }
             }
 
-            if let Some((state, peers)) = returned_summaries
+            match returned_summaries
                 .into_iter()
                 .filter(|(state, peers)| {
                     peers.len() >= quorum
@@ -2731,37 +2744,45 @@ fn repair_epoch(
                         .cmp(&right_peers.len())
                         .then_with(|| left_state.nonce.cmp(&right_state.nonce))
                         .then_with(|| left_state.last_epoch.cmp(&right_state.last_epoch))
-                })
-            {
-                let peer_sources = peers.iter().copied().collect::<BTreeSet<_>>();
-                let Some(sender) = peers
-                    .iter()
-                    .copied()
-                    .find(|peer| canonical_blocks == 0 || canonical_data_holders.contains(peer))
-                    .or_else(|| {
-                        can_reconstruct_canonical_data(
-                            canonical_block_replicas,
-                            &peer_sources,
-                            canonical_blocks,
-                        )
-                        .then_some(peers[0])
-                    })
-                else {
-                    continue;
-                };
-                let outcome = transport.sample_repair_fetch(epoch, repair_round, sender, recipient);
-                let (delta, delivered) = repair_outcome_delta(&outcome, config.repair_timeout_ms);
-                merge_transport_totals(totals, &delta);
-                merge_transport_totals(&mut summary_totals, &delta);
-                if !delivered {
-                    continue;
+                }) {
+                Some((state, peers)) => {
+                    let peer_sources = peers.iter().copied().collect::<BTreeSet<_>>();
+                    let Some(sender) = peers
+                        .iter()
+                        .copied()
+                        .find(|peer| canonical_blocks == 0 || canonical_data_holders.contains(peer))
+                        .or_else(|| {
+                            can_reconstruct_canonical_data(
+                                canonical_block_replicas,
+                                &peer_sources,
+                                canonical_blocks,
+                            )
+                            .then_some(peers[0])
+                        })
+                    else {
+                        continue;
+                    };
+                    let outcome =
+                        transport.sample_repair_fetch(epoch, repair_round, sender, recipient);
+                    let (delta, delivered) =
+                        repair_outcome_delta(&outcome, config.repair_timeout_ms);
+                    merge_transport_totals(totals, &delta);
+                    merge_transport_totals(&mut summary_totals, &delta);
+                    if !delivered {
+                        continue;
+                    }
+                    totals.repair_successes += 1;
+                    summary_totals.repair_successes += 1;
+                    states[recipient] = state;
+                    add_full_data_holder(
+                        canonical_data_holders,
+                        canonical_block_replicas,
+                        recipient,
+                    );
+                    repaired += 1;
+                    summary_repaired += 1;
                 }
-                totals.repair_successes += 1;
-                summary_totals.repair_successes += 1;
-                states[recipient] = state;
-                add_full_data_holder(canonical_data_holders, canonical_block_replicas, recipient);
-                repaired += 1;
-                summary_repaired += 1;
+                None => {}
             }
         }
 

@@ -580,12 +580,13 @@ fn hot_wire_response_is_selected_for_io(value: &WireResponse) -> bool {
 }
 
 pub fn decode_wire_request_frame(bytes: Bytes) -> Result<WireRequestFrame> {
-    if let Some((kind, payload)) = hot_wire_payload(bytes.as_ref())?
-        && kind == HOT_REQUEST_MESSAGE_DISPATCH
-    {
-        let payload_start = bytes.len() - payload.len();
-        let dispatch = take_hot_dispatch(bytes.slice(payload_start..))?;
-        return Ok(WireRequestFrame::HotDispatch(dispatch));
+    match hot_wire_payload(bytes.as_ref())? {
+        Some((kind, payload)) if kind == HOT_REQUEST_MESSAGE_DISPATCH => {
+            let payload_start = bytes.len() - payload.len();
+            let dispatch = take_hot_dispatch(bytes.slice(payload_start..))?;
+            return Ok(WireRequestFrame::HotDispatch(dispatch));
+        }
+        _ => {}
     }
 
     decode_wire_request_payload(bytes.as_ref()).map(WireRequestFrame::Request)

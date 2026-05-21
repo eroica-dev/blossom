@@ -121,14 +121,17 @@ pub fn analyze_events(events: &[TelemetryEvent]) -> ObserverAnalysis {
             .events_by_stage
             .entry(format!("{}:{}", event.stage, event.event))
             .or_default() += 1;
-        if let Some(node) = node.as_ref() {
-            nodes.insert(node.clone());
-            *analysis.events_by_node.entry(node.clone()).or_default() += 1;
-            analysis
-                .last_event_timestamp_micros_by_node
-                .entry(node.clone())
-                .and_modify(|timestamp| *timestamp = (*timestamp).max(event.timestamp_micros))
-                .or_insert(event.timestamp_micros);
+        match node.as_ref() {
+            Some(node) => {
+                nodes.insert(node.clone());
+                *analysis.events_by_node.entry(node.clone()).or_default() += 1;
+                analysis
+                    .last_event_timestamp_micros_by_node
+                    .entry(node.clone())
+                    .and_modify(|timestamp| *timestamp = (*timestamp).max(event.timestamp_micros))
+                    .or_insert(event.timestamp_micros);
+            }
+            None => {}
         }
         if event.error.is_some() || event.outcome.as_deref() == Some("error") {
             analysis.error_events += 1;
@@ -136,8 +139,9 @@ pub fn analyze_events(events: &[TelemetryEvent]) -> ObserverAnalysis {
                 .errors_by_stage
                 .entry(event.stage.clone())
                 .or_default() += 1;
-            if let Some(node) = node.as_ref() {
-                *analysis.errors_by_node.entry(node.clone()).or_default() += 1;
+            match node.as_ref() {
+                Some(node) => *analysis.errors_by_node.entry(node.clone()).or_default() += 1,
+                None => {}
             }
         }
         if event.kind == TelemetryEventKind::Event
@@ -145,11 +149,14 @@ pub fn analyze_events(events: &[TelemetryEvent]) -> ObserverAnalysis {
                 || (event.stage == "membership_pruning" && event.event == "node_dropped"))
         {
             analysis.dropped_node_events += 1;
-            if let Some(node) = node.as_ref() {
-                *analysis
-                    .dropped_nodes_by_node
-                    .entry(node.clone())
-                    .or_default() += 1;
+            match node.as_ref() {
+                Some(node) => {
+                    *analysis
+                        .dropped_nodes_by_node
+                        .entry(node.clone())
+                        .or_default() += 1;
+                }
+                None => {}
             }
         }
         if event.kind == TelemetryEventKind::Event
@@ -157,11 +164,14 @@ pub fn analyze_events(events: &[TelemetryEvent]) -> ObserverAnalysis {
                 || (event.stage == "membership_reconnect" && event.event == "node_reconnected"))
         {
             analysis.reconnected_node_events += 1;
-            if let Some(node) = node.as_ref() {
-                *analysis
-                    .reconnected_nodes_by_node
-                    .entry(node.clone())
-                    .or_default() += 1;
+            match node.as_ref() {
+                Some(node) => {
+                    *analysis
+                        .reconnected_nodes_by_node
+                        .entry(node.clone())
+                        .or_default() += 1;
+                }
+                None => {}
             }
         }
         if event.kind == TelemetryEventKind::Event {
@@ -180,59 +190,81 @@ pub fn analyze_events(events: &[TelemetryEvent]) -> ObserverAnalysis {
             TelemetryEventKind::Event => analysis.event_records += 1,
             TelemetryEventKind::SpanStart => {
                 analysis.span_starts += 1;
-                if let Some(node) = node.as_ref() {
-                    *analysis
-                        .span_starts_by_node
-                        .entry(node.clone())
-                        .or_default() += 1;
+                match node.as_ref() {
+                    Some(node) => {
+                        *analysis
+                            .span_starts_by_node
+                            .entry(node.clone())
+                            .or_default() += 1;
+                    }
+                    None => {}
                 }
-                if let Some(span_id) = event.span_id {
-                    open_spans.insert(span_key(event, span_id), event);
+                match event.span_id {
+                    Some(span_id) => {
+                        open_spans.insert(span_key(event, span_id), event);
+                    }
+                    None => {}
                 }
             }
             TelemetryEventKind::SpanEnd => {
                 analysis.span_ends += 1;
-                if let Some(node) = node.as_ref() {
-                    *analysis.span_ends_by_node.entry(node.clone()).or_default() += 1;
+                match node.as_ref() {
+                    Some(node) => {
+                        *analysis.span_ends_by_node.entry(node.clone()).or_default() += 1;
+                    }
+                    None => {}
                 }
-                if let Some(span_id) = event.span_id {
-                    if let Some(start) = open_spans.remove(&span_key(event, span_id)) {
-                        let duration = event
-                            .timestamp_micros
-                            .saturating_sub(start.timestamp_micros);
-                        record_duration(
-                            &mut analysis.span_durations_by_stage,
-                            &event.stage,
-                            duration,
-                        );
-                        record_duration(
-                            &mut analysis.span_durations_by_stage_event,
-                            &format!("{}:{}", event.stage, event.event),
-                            duration,
-                        );
-                        if let Some(node) = event.node.or(start.node) {
+                match event.span_id {
+                    Some(span_id) => match open_spans.remove(&span_key(event, span_id)) {
+                        Some(start) => {
+                            let duration = event
+                                .timestamp_micros
+                                .saturating_sub(start.timestamp_micros);
                             record_duration(
-                                &mut analysis.span_durations_by_node_stage,
-                                &format!("{node}:{}", event.stage),
+                                &mut analysis.span_durations_by_stage,
+                                &event.stage,
                                 duration,
                             );
+                            record_duration(
+                                &mut analysis.span_durations_by_stage_event,
+                                &format!("{}:{}", event.stage, event.event),
+                                duration,
+                            );
+                            match event.node.or(start.node) {
+                                Some(node) => {
+                                    record_duration(
+                                        &mut analysis.span_durations_by_node_stage,
+                                        &format!("{node}:{}", event.stage),
+                                        duration,
+                                    );
+                                }
+                                None => {}
+                            }
                         }
-                    } else {
+                        None => {
+                            analysis.orphan_span_ends += 1;
+                            match node.as_ref() {
+                                Some(node) => {
+                                    *analysis
+                                        .orphan_span_ends_by_node
+                                        .entry(node.clone())
+                                        .or_default() += 1;
+                                }
+                                None => {}
+                            }
+                        }
+                    },
+                    None => {
                         analysis.orphan_span_ends += 1;
-                        if let Some(node) = node.as_ref() {
-                            *analysis
-                                .orphan_span_ends_by_node
-                                .entry(node.clone())
-                                .or_default() += 1;
+                        match node.as_ref() {
+                            Some(node) => {
+                                *analysis
+                                    .orphan_span_ends_by_node
+                                    .entry(node.clone())
+                                    .or_default() += 1;
+                            }
+                            None => {}
                         }
-                    }
-                } else {
-                    analysis.orphan_span_ends += 1;
-                    if let Some(node) = node.as_ref() {
-                        *analysis
-                            .orphan_span_ends_by_node
-                            .entry(node.clone())
-                            .or_default() += 1;
                     }
                 }
             }
@@ -241,11 +273,14 @@ pub fn analyze_events(events: &[TelemetryEvent]) -> ObserverAnalysis {
 
     analysis.incomplete_spans = open_spans.len();
     for start in open_spans.values() {
-        if let Some(node) = start.node {
-            *analysis
-                .incomplete_spans_by_node
-                .entry(node.to_string())
-                .or_default() += 1;
+        match start.node {
+            Some(node) => {
+                *analysis
+                    .incomplete_spans_by_node
+                    .entry(node.to_string())
+                    .or_default() += 1;
+            }
+            None => {}
         }
     }
     analysis.nodes = nodes.len();

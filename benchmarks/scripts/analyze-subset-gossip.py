@@ -86,6 +86,17 @@ def architecture(row: dict[str, str]) -> str:
     return "trusted" if b(row, "trusted") else "verified"
 
 
+def protocol_version(row: dict[str, str]) -> str:
+    value = row.get("protocol_version", "")
+    if value:
+        return value
+    if row.get("prefill_mode") == "prefill-dispatch" and not b(row, "repair_missing"):
+        return "v2"
+    if row.get("prefill_mode") == "none" and b(row, "repair_missing"):
+        return "v1"
+    return "custom"
+
+
 def summarize_runs(rows: list[dict[str, str]]) -> list[dict[str, object]]:
     grouped: dict[tuple[object, ...], list[dict[str, str]]] = defaultdict(list)
     for row in rows:
@@ -93,6 +104,7 @@ def summarize_runs(rows: list[dict[str, str]]) -> list[dict[str, object]]:
             (
                 row["scenario"],
                 int(row["repeat"]),
+                protocol_version(row),
                 architecture(row),
                 latency_profile(row),
                 int(row["nodes"]),
@@ -101,7 +113,7 @@ def summarize_runs(rows: list[dict[str, str]]) -> list[dict[str, object]]:
         ].append(row)
 
     summaries = []
-    for (scenario, repeat, arch, latency, nodes, targets), items in sorted(grouped.items()):
+    for (scenario, repeat, version, arch, latency, nodes, targets), items in sorted(grouped.items()):
         full_latency_seconds = sum(f(row, "modeled_finality_latency_ms") for row in items) / 1000.0
         subset_latency_seconds = (
             sum(f(row, "subset_payload_ready_latency_ms") for row in items) / 1000.0
@@ -118,6 +130,7 @@ def summarize_runs(rows: list[dict[str, str]]) -> list[dict[str, object]]:
             {
                 "scenario": scenario,
                 "repeat": repeat,
+                "protocol_version": version,
                 "architecture": arch,
                 "latency_profile": latency,
                 "nodes": nodes,
@@ -179,6 +192,7 @@ def aggregate_runs(rows: list[dict[str, object]]) -> list[dict[str, object]]:
     for row in rows:
         grouped[
             (
+                row["protocol_version"],
                 row["architecture"],
                 row["latency_profile"],
                 row["nodes"],
@@ -187,10 +201,11 @@ def aggregate_runs(rows: list[dict[str, object]]) -> list[dict[str, object]]:
         ].append(row)
 
     output = []
-    for (arch, latency, nodes, targets), items in sorted(grouped.items()):
+    for (version, arch, latency, nodes, targets), items in sorted(grouped.items()):
         values = lambda key: [float(item[key]) for item in items]
         output.append(
             {
+                "protocol_version": version,
                 "architecture": arch,
                 "latency_profile": latency,
                 "nodes": nodes,
@@ -233,6 +248,7 @@ def aggregate_runs(rows: list[dict[str, object]]) -> list[dict[str, object]]:
 
 def row_for(
     rows: list[dict[str, object]],
+    version: str,
     arch: str,
     latency: str,
     nodes: int,
@@ -240,7 +256,8 @@ def row_for(
 ) -> dict[str, object] | None:
     for row in rows:
         if (
-            row["architecture"] == arch
+            row["protocol_version"] == version
+            and row["architecture"] == arch
             and row["latency_profile"] == latency
             and int(row["nodes"]) == nodes
             and int(row["targets_per_command"]) == targets
@@ -259,7 +276,9 @@ def write_plots(path: Path, rows: list[dict[str, object]]) -> None:
         for arch, mark in (("verified", "*"), ("trusted", "square*")):
             coords = []
             for targets in (1, 3, 6):
-                row = row_for(rows, arch, "even150", 64, targets)
+                row = row_for(rows, "v2", arch, "even150", 64, targets)
+                if row is None:
+                    row = row_for(rows, "v1", arch, "even150", 64, targets)
                 if row:
                     coords.append(
                         f"({targets},{row['subset_savings_pct_mean']}) +- (0,{row['subset_savings_pct_ci95']})"
@@ -279,7 +298,9 @@ def write_plots(path: Path, rows: list[dict[str, object]]) -> None:
         for targets, mark in ((1, "*"), (3, "square*"), (6, "triangle*")):
             coords = []
             for nodes in (12, 36, 64):
-                row = row_for(rows, "verified", "even150", nodes, targets)
+                row = row_for(rows, "v2", "verified", "even150", nodes, targets)
+                if row is None:
+                    row = row_for(rows, "v1", "verified", "even150", nodes, targets)
                 if row:
                     coords.append(
                         f"({nodes},{row['subset_per_node_gbps_mean']}) +- (0,{row['subset_per_node_gbps_ci95']})"
@@ -313,7 +334,7 @@ def write_markdown(path: Path, summaries: list[dict[str, object]], aggregates: l
         handle.write(f"- complete metadata/payload runs after repair: {complete_runs}/{len(summaries)}\n")
         handle.write(
             f"- best mean wire savings: {best['subset_savings_pct_mean']}% "
-            f"({best['architecture']}, {best['latency_profile']}, n={best['nodes']}, targets={best['targets_per_command']})\n"
+            f"({best['protocol_version']}, {best['architecture']}, {best['latency_profile']}, n={best['nodes']}, targets={best['targets_per_command']})\n"
         )
         handle.write(
             f"- highest before-repair missing target payload rate: {float(worst_missing['missing_before_repair_pct']):.2f}% "

@@ -18,6 +18,24 @@ Result directory:
 benchmarks/results/subset_gossip_20260521_051925
 ```
 
+## Protocol Versions
+
+The simulator keeps two stable protocol profiles so optimization work can be
+compared without mutating the baseline:
+
+- `v1`: the original recipient-filtered subset gossip path. It starts consensus
+  at round 0, uses no prefill dispatch, and relies on repair to fill missing
+  target payloads.
+- `v2`: the prefill-dispatch path. It performs one deterministic prefill stage
+  to future quorum contacts, skips exactly one consensus wave, and disables
+  repair by default so missing-data regressions are visible.
+
+Low-level experiments that change the propagation shape, such as random prefill,
+scheduled prefill, hash advertisement, or unsafe fanout overrides, are labeled
+`custom`. The benchmark CLI exposes the profile through
+`--protocol-version v1|v2|custom`, and `SubsetGossipConfig::for_protocol_version`
+provides the same presets in code.
+
 ## Model
 
 Each command is represented by a filtered transaction slot:

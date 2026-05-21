@@ -66,17 +66,21 @@ pub fn future_round_assist_decision(input: FutureRoundAssistInput) -> FutureRoun
         return FutureRoundAssistDecision::ServeDataBeforeAssist;
     }
 
-    if !input.parent_data_replicated {
-        if !input.parent_data_repairable {
-            return FutureRoundAssistDecision::BufferForRepair;
-        }
-        if input.holds_unreplicated_parent_data {
-            return FutureRoundAssistDecision::ServeDataBeforeAssist;
-        }
+    match (
+        input.parent_data_replicated,
+        input.parent_data_repairable,
+        input.holds_unreplicated_parent_data,
+    ) {
+        (false, false, _) => return FutureRoundAssistDecision::BufferForRepair,
+        (false, true, true) => return FutureRoundAssistDecision::ServeDataBeforeAssist,
+        _ => {}
     }
 
-    if input.kind == FutureRoundAssistKind::DataBearing && !input.future_body_validated {
-        return FutureRoundAssistDecision::RejectDataVoteUntilValidated;
+    match (input.kind, input.future_body_validated) {
+        (FutureRoundAssistKind::DataBearing, false) => {
+            return FutureRoundAssistDecision::RejectDataVoteUntilValidated;
+        }
+        _ => {}
     }
 
     FutureRoundAssistDecision::Assist

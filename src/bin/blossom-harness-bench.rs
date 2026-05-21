@@ -136,9 +136,12 @@ async fn main() -> MainResult<()> {
         rows.push(row);
     }
 
-    if let Some(path) = args.csv {
-        write_csv(&path, args.append, &rows)?;
-        eprintln!("wrote {}", path.display());
+    match args.csv {
+        Some(path) => {
+            write_csv(&path, args.append, &rows)?;
+            eprintln!("wrote {}", path.display());
+        }
+        None => {}
     }
 
     Ok(())
@@ -441,8 +444,9 @@ fn deliver_frame_from_dispatch_response(
 }
 
 fn write_csv(path: &PathBuf, append: bool, rows: &[HarnessBenchRow]) -> MainResult<()> {
-    if let Some(parent) = path.parent() {
-        create_dir_all(parent)?;
+    match path.parent() {
+        Some(parent) => create_dir_all(parent)?,
+        None => {}
     }
 
     let write_header = !append || !path.exists() || path.metadata()?.len() == 0;

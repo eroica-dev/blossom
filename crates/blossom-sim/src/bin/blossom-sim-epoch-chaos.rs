@@ -130,28 +130,42 @@ async fn main() -> MainResult<()> {
         (run_epoch_chaos_once(&args, config)?, None)
     };
     println!("{}", summary_csv(&report));
-    if let Some(cost) = telemetry_cost.as_ref() {
-        eprintln!("{}", cost.summary_line());
+    match telemetry_cost.as_ref() {
+        Some(cost) => eprintln!("{}", cost.summary_line()),
+        None => {}
     }
 
-    if let Some(path) = args.csv.as_ref() {
-        write_summary_csv(path, &report)?;
-        eprintln!("wrote {}", path.display());
+    match args.csv.as_ref() {
+        Some(path) => {
+            write_summary_csv(path, &report)?;
+            eprintln!("wrote {}", path.display());
+        }
+        None => {}
     }
-    if let Some(path) = args.epoch_log.as_ref() {
-        write_epoch_csv(path, &report)?;
-        eprintln!("wrote {}", path.display());
+    match args.epoch_log.as_ref() {
+        Some(path) => {
+            write_epoch_csv(path, &report)?;
+            eprintln!("wrote {}", path.display());
+        }
+        None => {}
     }
-    if let Some(path) = args.stage_log.as_ref() {
-        write_stage_csv(path, &report)?;
-        eprintln!("wrote {}", path.display());
+    match args.stage_log.as_ref() {
+        Some(path) => {
+            write_stage_csv(path, &report)?;
+            eprintln!("wrote {}", path.display());
+        }
+        None => {}
     }
-    if let Some(path) = args.bug_log.as_ref() {
-        write_bug_log(path, &args, &report)?;
-        eprintln!("wrote {}", path.display());
+    match args.bug_log.as_ref() {
+        Some(path) => {
+            write_bug_log(path, &args, &report)?;
+            eprintln!("wrote {}", path.display());
+        }
+        None => {}
     }
-    if let Some(addr) = args.observer_addr.as_ref() {
-        eprintln!("streamed runtime telemetry to {addr}");
+    match args.observer_addr.as_ref() {
+        Some(addr) => eprintln!("streamed runtime telemetry to {addr}"),
+        None => {}
     }
     if args.require_reconciliation {
         let check = report.check_runtime_reconciliation()?;
@@ -171,14 +185,16 @@ async fn main() -> MainResult<()> {
 }
 
 fn run_epoch_chaos_once(args: &Args, config: EpochChaosConfig) -> MainResult<EpochChaosReport> {
-    if let Some(addr) = args.observer_addr.as_ref() {
-        let sink = JsonlTcpTelemetrySink::connect(addr)?;
-        return Ok(run_epoch_chaos_with_telemetry(
-            config,
-            TelemetryHandle::new(Arc::new(sink)),
-        )?);
+    match args.observer_addr.as_ref() {
+        Some(addr) => {
+            let sink = JsonlTcpTelemetrySink::connect(addr)?;
+            Ok(run_epoch_chaos_with_telemetry(
+                config,
+                TelemetryHandle::new(Arc::new(sink)),
+            )?)
+        }
+        None => Ok(run_epoch_chaos(config)?),
     }
-    Ok(run_epoch_chaos(config)?)
 }
 
 #[derive(Debug)]
@@ -237,10 +253,9 @@ fn measure_telemetry_cost(
         let started = Instant::now();
         let report = run_epoch_chaos(config.clone())?;
         baseline_total += started.elapsed();
-        if let Some(reference) = baseline_report.as_ref() {
-            ensure_matching_outcome(reference, &report, "baseline")?;
-        } else {
-            baseline_report = Some(report);
+        match baseline_report.as_ref() {
+            Some(reference) => ensure_matching_outcome(reference, &report, "baseline")?,
+            None => baseline_report = Some(report),
         }
     }
 
@@ -273,10 +288,9 @@ fn measure_telemetry_cost(
 }
 
 fn counting_sink(args: &Args) -> MainResult<Arc<CountingTelemetrySink>> {
-    let inner: Arc<dyn TelemetrySink> = if let Some(addr) = args.observer_addr.as_ref() {
-        Arc::new(JsonlTcpTelemetrySink::connect(addr)?)
-    } else {
-        Arc::new(InMemoryTelemetrySink::default())
+    let inner: Arc<dyn TelemetrySink> = match args.observer_addr.as_ref() {
+        Some(addr) => Arc::new(JsonlTcpTelemetrySink::connect(addr)?),
+        None => Arc::new(InMemoryTelemetrySink::default()),
     };
     Ok(Arc::new(CountingTelemetrySink::new(inner)))
 }
@@ -403,8 +417,9 @@ fn config_from_args(args: &Args) -> EpochChaosConfig {
 }
 
 fn write_summary_csv(path: &PathBuf, report: &EpochChaosReport) -> MainResult<()> {
-    if let Some(parent) = path.parent() {
-        create_dir_all(parent)?;
+    match path.parent() {
+        Some(parent) => create_dir_all(parent)?,
+        None => {}
     }
     let mut file = OpenOptions::new()
         .create(true)
@@ -420,8 +435,9 @@ fn write_summary_csv(path: &PathBuf, report: &EpochChaosReport) -> MainResult<()
 }
 
 fn write_epoch_csv(path: &PathBuf, report: &EpochChaosReport) -> MainResult<()> {
-    if let Some(parent) = path.parent() {
-        create_dir_all(parent)?;
+    match path.parent() {
+        Some(parent) => create_dir_all(parent)?,
+        None => {}
     }
     let mut file = OpenOptions::new()
         .create(true)
@@ -439,8 +455,9 @@ fn write_epoch_csv(path: &PathBuf, report: &EpochChaosReport) -> MainResult<()> 
 }
 
 fn write_stage_csv(path: &PathBuf, report: &EpochChaosReport) -> MainResult<()> {
-    if let Some(parent) = path.parent() {
-        create_dir_all(parent)?;
+    match path.parent() {
+        Some(parent) => create_dir_all(parent)?,
+        None => {}
     }
     let mut file = OpenOptions::new()
         .create(true)
@@ -574,8 +591,9 @@ fn epoch_csv(epoch: &blossom_sim::EpochChaosEpochReport) -> String {
 }
 
 fn write_bug_log(path: &PathBuf, args: &Args, report: &EpochChaosReport) -> MainResult<()> {
-    if let Some(parent) = path.parent() {
-        create_dir_all(parent)?;
+    match path.parent() {
+        Some(parent) => create_dir_all(parent)?,
+        None => {}
     }
     let mut file = OpenOptions::new()
         .create(true)
@@ -1200,11 +1218,13 @@ fn replay_command(args: &Args) -> String {
         args.max_reconnected_nodes_per_epoch,
     );
     push_arg(&mut parts, "--seed", args.seed);
-    if let Some(epoch) = args.partition_start_epoch {
-        push_arg(&mut parts, "--partition-start-epoch", epoch);
+    match args.partition_start_epoch {
+        Some(epoch) => push_arg(&mut parts, "--partition-start-epoch", epoch),
+        None => {}
     }
-    if let Some(epoch) = args.partition_end_epoch {
-        push_arg(&mut parts, "--partition-end-epoch", epoch);
+    match args.partition_end_epoch {
+        Some(epoch) => push_arg(&mut parts, "--partition-end-epoch", epoch),
+        None => {}
     }
     push_arg(
         &mut parts,
@@ -1214,8 +1234,9 @@ fn replay_command(args: &Args) -> String {
     if args.partition_reconnect_only {
         parts.push("--partition-reconnect-only".to_string());
     }
-    if let Some(round) = args.assist_after_skipped_round {
-        push_arg(&mut parts, "--assist-after-skipped-round", round);
+    match args.assist_after_skipped_round {
+        Some(round) => push_arg(&mut parts, "--assist-after-skipped-round", round),
+        None => {}
     }
     if args.trusted {
         parts.push("--trusted".to_string());
@@ -1234,9 +1255,12 @@ fn replay_command(args: &Args) -> String {
             args.telemetry_cost_runs,
         );
     }
-    if let Some(addr) = args.observer_addr.as_ref() {
-        parts.push("--observer-addr".to_string());
-        parts.push(addr.clone());
+    match args.observer_addr.as_ref() {
+        Some(addr) => {
+            parts.push("--observer-addr".to_string());
+            parts.push(addr.clone());
+        }
+        None => {}
     }
     parts.join(" ")
 }
