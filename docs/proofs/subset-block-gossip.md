@@ -240,6 +240,12 @@ continue to track both canonical metadata convergence and per-target payload
 completeness, and reconciliation should treat missing target payloads as a
 repairable availability gap rather than a successful epoch.
 
+The first-round prefill optimization is specified separately in
+[`future-contact-prefill.md`](future-contact-prefill.md). That proof replaces
+the experimental "random quorum" wording with deterministic future-contact
+placement: one prefill stage materializes the first data frontier, then
+consensus starts one layer later.
+
 ## Reproducibility
 
 Primary code and test harnesses:
@@ -257,4 +263,3 @@ EPOCHS=50 REPEAT_RUNS=3 benchmarks/scripts/run-subset-gossip-matrix.sh
 cmp -s benchmarks/results/subset_gossip_20260521_050337/subset_gossip_aggregate.csv \
        benchmarks/results/subset_gossip_20260521_051925/subset_gossip_aggregate.csv
 ```
-
