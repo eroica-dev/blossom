@@ -154,6 +154,48 @@ pub trait BlossomBody {
     fn to_bytes(&self) -> Vec<u8>;
 }
 
+impl BlossomBody for BTreeMap<HashType, ()> {
+    fn update_signing_hash(&self, hasher: &mut ProtocolHasher) {
+        hasher.update((self.len() as u64).to_le_bytes());
+        for hash in self.keys() {
+            hasher.update(hash.as_ref());
+        }
+    }
+
+    fn to_bytes(&self) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(8 + (self.len() * 32));
+        bytes.extend_from_slice(&(self.len() as u64).to_le_bytes());
+        for hash in self.keys() {
+            bytes.extend_from_slice(hash.as_ref());
+        }
+        bytes
+    }
+}
+
+impl BlossomBody for BTreeMap<HashType, Block> {
+    fn update_signing_hash(&self, hasher: &mut ProtocolHasher) {
+        hasher.update((self.len() as u64).to_le_bytes());
+        for (hash, block) in self {
+            hasher.update(hash.as_ref());
+            hasher.update(block.hash.as_ref());
+            hasher.update(block.body.hash().as_ref());
+            hasher.update(block.signature.as_ref());
+        }
+    }
+
+    fn to_bytes(&self) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(8 + (self.len() * (32 + 32 + 32 + 64)));
+        bytes.extend_from_slice(&(self.len() as u64).to_le_bytes());
+        for (hash, block) in self {
+            bytes.extend_from_slice(hash.as_ref());
+            bytes.extend_from_slice(block.hash.as_ref());
+            bytes.extend_from_slice(block.body.hash().as_ref());
+            bytes.extend_from_slice(block.signature.as_ref());
+        }
+        bytes
+    }
+}
+
 #[derive(Serialize, Deserialize, BorshSerialize, BorshDeserialize, Debug, Clone, Default)]
 pub struct SignatureTree(pub BTreeMap<HashType, SignaturesForHash>);
 
@@ -249,7 +291,7 @@ pub struct Dispatch {
     pub body: DispatchBody,
 }
 
-#[derive(Serialize, Deserialize, BorshSerialize, BorshDeserialize, Debug, Clone, Default)]
+#[derive(Serialize, Deserialize, BorshSerialize, BorshDeserialize, Debug, Clone)]
 pub struct DispatchBody {
     pub blocks: BTreeMap<HashType, Block>,
     pub blocks_hash: HashType,
@@ -257,7 +299,34 @@ pub struct DispatchBody {
     pub signature_tree_hash: HashType,
 }
 
+impl Default for DispatchBody {
+    fn default() -> Self {
+        let blocks = BTreeMap::new();
+        let signature_tree = SignatureTree::default();
+        Self {
+            blocks_hash: blocks.hash(),
+            blocks,
+            signature_tree_hash: signature_tree.hash(),
+            signature_tree,
+        }
+    }
+}
+
 impl DispatchBody {
+    pub fn validate(&self) -> Result<()> {
+        if self.blocks.hash() != self.blocks_hash {
+            return Err(BlossomError::WireProtocol(
+                "dispatch blocks hash does not match block set".to_string(),
+            ));
+        }
+        if self.signature_tree.hash() != self.signature_tree_hash {
+            return Err(BlossomError::WireProtocol(
+                "dispatch signature-tree hash does not match signature tree".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
     pub fn verify_body(
         &self,
         already_verified_blocks: &BTreeMap<HashType, Block>,
@@ -279,7 +348,7 @@ impl DispatchBody {
     ) -> (BTreeMap<HashType, Block>, HashType, SignatureTree, HashType) {
         let mut accepted_blocks = BTreeMap::new();
 
-        if self.blocks.hash() != self.blocks_hash {
+        if self.validate().is_err() {
             return (
                 accepted_blocks,
                 HashType::default(),
@@ -353,10 +422,11 @@ impl Dispatch {
             )));
         }
         quorum.try_push_pending_dispatch(
-            PendingDispatch::Decoded(self),
+            PendingDispatch::Decoded(self.clone()),
             configured_max_pending_raw_dispatch_bytes(),
             configured_max_pending_raw_dispatch_bytes_per_sender(),
         )?;
+        quorum.msg_matrix.update(true, Msg::Dispatch(self));
         quorum.received_dispatches.push(sender);
         Ok(())
     }
@@ -465,19 +535,41 @@ pub struct Verification {
     pub body: VerificationBody,
 }
 
-#[derive(Serialize, Deserialize, BorshSerialize, BorshDeserialize, Debug, Clone, Default)]
+#[derive(Serialize, Deserialize, BorshSerialize, BorshDeserialize, Debug, Clone)]
 pub struct VerificationBody {
     pub blocks_hash: HashType,
     pub blocks: BTreeMap<HashType, ()>,
 }
 
+impl Default for VerificationBody {
+    fn default() -> Self {
+        let blocks = BTreeMap::new();
+        Self {
+            blocks_hash: blocks.hash(),
+            blocks,
+        }
+    }
+}
+
+impl VerificationBody {
+    pub fn validate(&self) -> Result<()> {
+        if self.blocks.hash() != self.blocks_hash {
+            return Err(BlossomError::WireProtocol(
+                "verification blocks hash does not match block set".to_string(),
+            ));
+        }
+        Ok(())
+    }
+}
+
 impl BlossomBody for VerificationBody {
     fn update_signing_hash(&self, hasher: &mut ProtocolHasher) {
         hasher.update(self.blocks_hash.as_ref());
+        self.blocks.update_signing_hash(hasher);
     }
 
     fn to_bytes(&self) -> Vec<u8> {
-        self.blocks_hash.as_ref().to_vec()
+        [self.blocks_hash.as_ref(), self.blocks.to_bytes().as_slice()].concat()
     }
 }
 
@@ -515,27 +607,89 @@ pub struct ProposalBody {
     pub signature_tree_hash: Option<HashType>,
 }
 
+impl ProposalBody {
+    pub fn validate(&self) -> Result<()> {
+        if !self.consensus {
+            return Ok(());
+        }
+
+        let approved_blocks = self.approved_blocks.as_ref().ok_or_else(|| {
+            BlossomError::WireProtocol(
+                "consensus proposal must include approved blocks".to_string(),
+            )
+        })?;
+        let approved_hash = self.approved_hash.ok_or_else(|| {
+            BlossomError::WireProtocol("consensus proposal must include approved hash".to_string())
+        })?;
+        if approved_blocks.hash() != approved_hash {
+            return Err(BlossomError::WireProtocol(
+                "proposal approved hash does not match approved blocks".to_string(),
+            ));
+        }
+
+        if let (Some(signature_tree), Some(signature_tree_hash)) =
+            (&self.signature_tree, self.signature_tree_hash)
+            && signature_tree.hash() != signature_tree_hash
+        {
+            return Err(BlossomError::WireProtocol(
+                "proposal signature-tree hash does not match signature tree".to_string(),
+            ));
+        }
+
+        Ok(())
+    }
+}
+
 impl BlossomBody for ProposalBody {
     fn update_signing_hash(&self, hasher: &mut ProtocolHasher) {
+        hasher.update([self.consensus as u8]);
         if !self.consensus {
-            hasher.update([0]);
             return;
         }
 
-        hasher.update(self.approved_hash.unwrap_or_default().as_ref());
-        hasher.update(self.signature_tree_hash.unwrap_or_default().as_ref());
+        match &self.approved_blocks {
+            Some(blocks) => {
+                hasher.update([1]);
+                blocks.update_signing_hash(hasher);
+            }
+            None => hasher.update([0]),
+        }
+        match self.approved_hash {
+            Some(hash) => {
+                hasher.update([1]);
+                hasher.update(hash.as_ref());
+            }
+            None => hasher.update([0]),
+        }
+        match &self.verif {
+            Some(verifications) => {
+                hasher.update([1]);
+                hasher.update((verifications.len() as u64).to_le_bytes());
+                for (pubkey, signature) in verifications {
+                    hasher.update(pubkey.as_ref());
+                    hasher.update(signature.as_ref());
+                }
+            }
+            None => hasher.update([0]),
+        }
+        match &self.signature_tree {
+            Some(tree) => {
+                hasher.update([1]);
+                tree.update_signing_hash(hasher);
+            }
+            None => hasher.update([0]),
+        }
+        match self.signature_tree_hash {
+            Some(hash) => {
+                hasher.update([1]);
+                hasher.update(hash.as_ref());
+            }
+            None => hasher.update([0]),
+        }
     }
 
     fn to_bytes(&self) -> Vec<u8> {
-        if !self.consensus {
-            return vec![0];
-        }
-
-        [
-            self.approved_hash.unwrap_or_default().as_ref(),
-            self.signature_tree_hash.unwrap_or_default().as_ref(),
-        ]
-        .concat()
+        self.signing_hash().to_bytes()
     }
 }
 
@@ -571,8 +725,11 @@ pub struct CommitBody {
 
 impl BlossomBody for CommitBody {
     fn update_signing_hash(&self, hasher: &mut ProtocolHasher) {
+        hasher.update([self.consensus as u8]);
         match &self.signature_tree_insert {
             Some(tree) => {
+                hasher.update([1]);
+                hasher.update((tree.len() as u64).to_le_bytes());
                 for key in tree.keys() {
                     hasher.update(key.as_ref());
                 }
@@ -582,15 +739,21 @@ impl BlossomBody for CommitBody {
     }
 
     fn to_bytes(&self) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        bytes.push(self.consensus as u8);
         match &self.signature_tree_insert {
             Some(tree) => {
-                let mut bytes = Vec::with_capacity(tree.len() * 32);
+                bytes.push(1);
+                bytes.extend_from_slice(&(tree.len() as u64).to_le_bytes());
                 for key in tree.keys() {
                     bytes.extend_from_slice(key.as_ref());
                 }
                 bytes
             }
-            None => vec![0],
+            None => {
+                bytes.push(0);
+                bytes
+            }
         }
     }
 }
@@ -768,6 +931,7 @@ mod tests {
             signature_tree_hash: SignatureTree::default().hash(),
         };
 
+        assert!(body.validate().is_ok());
         let (accepted, accepted_hash, tree, tree_hash) = body.verify_body(&BTreeMap::new());
         assert_eq!(accepted.len(), 1);
         assert_eq!(accepted.get(&block.hash).unwrap().hash, block.hash);
@@ -776,10 +940,35 @@ mod tests {
 
         let mut bad_body = body;
         bad_body.blocks_hash = HashType([9; 32]);
+        assert!(matches!(
+            bad_body.validate(),
+            Err(BlossomError::WireProtocol(message))
+                if message.contains("dispatch blocks hash")
+        ));
         let (accepted, accepted_hash, _, tree_hash) = bad_body.verify_body(&BTreeMap::new());
         assert!(accepted.is_empty());
         assert_eq!(accepted_hash, HashType::default());
         assert_eq!(tree_hash, HashType::default());
+    }
+
+    #[test]
+    fn dispatch_body_rejects_bad_signature_tree_hash() {
+        let keypair = Keypair::generate();
+        let block = signed_block(&keypair);
+        let mut blocks = BTreeMap::new();
+        blocks.insert(block.hash, block);
+        let body = DispatchBody {
+            blocks_hash: blocks.hash(),
+            blocks,
+            signature_tree: SignatureTree::default(),
+            signature_tree_hash: HashType([9; 32]),
+        };
+
+        assert!(matches!(
+            body.validate(),
+            Err(BlossomError::WireProtocol(message))
+                if message.contains("dispatch signature-tree hash")
+        ));
     }
 
     #[test]
@@ -907,5 +1096,213 @@ mod tests {
                 .verify_signature(MSGKey::Verification, &body)
                 .is_err()
         );
+    }
+
+    #[test]
+    fn header_signature_binds_verification_block_set() {
+        let keypair = Keypair::generate();
+        let mut blocks = BTreeMap::new();
+        blocks.insert(HashType([1; 32]), ());
+        let body = VerificationBody {
+            blocks_hash: blocks.hash(),
+            blocks,
+        };
+        let header = Header {
+            sender: keypair.public,
+            last_epoch: HashType([2; 32]),
+            nonce: Nonce::new(7),
+            round: 1,
+            signature: keypair.signer().sign(
+                Header::signature_hash_for_body(
+                    &keypair.public,
+                    &HashType([2; 32]),
+                    Nonce::new(7),
+                    1,
+                    MSGKey::Verification,
+                    &body,
+                )
+                .as_ref(),
+            ),
+        };
+        let mut tampered = body.clone();
+        tampered.blocks.insert(HashType([9; 32]), ());
+
+        assert!(header.verify_signature(MSGKey::Verification, &body).is_ok());
+        assert!(
+            header
+                .verify_signature(MSGKey::Verification, &tampered)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn verification_body_validate_rejects_mismatched_block_hash() {
+        let mut blocks = BTreeMap::new();
+        blocks.insert(HashType([1; 32]), ());
+        let body = VerificationBody {
+            blocks_hash: HashType([9; 32]),
+            blocks,
+        };
+
+        assert!(matches!(
+            body.validate(),
+            Err(BlossomError::WireProtocol(message))
+                if message.contains("verification blocks hash")
+        ));
+    }
+
+    #[test]
+    fn proposal_signature_binds_embedded_proof_fields() {
+        let keypair = Keypair::generate();
+        let mut approved_blocks = BTreeMap::new();
+        approved_blocks.insert(HashType([1; 32]), ());
+        let body = ProposalBody {
+            consensus: true,
+            approved_hash: Some(approved_blocks.hash()),
+            approved_blocks: Some(approved_blocks.clone()),
+            verif: Some(vec![(keypair.public, Signature([7; 64]))]),
+            signature_tree: Some(approved_blocks.clone()),
+            signature_tree_hash: Some(approved_blocks.hash()),
+        };
+        let header = signed_header_for_body(&keypair, MSGKey::Proposal, &body);
+        let mut tampered = body.clone();
+        tampered.verif = Some(vec![(keypair.public, Signature([8; 64]))]);
+
+        assert!(body.validate().is_ok());
+        assert!(header.verify_signature(MSGKey::Proposal, &body).is_ok());
+        assert!(
+            header
+                .verify_signature(MSGKey::Proposal, &tampered)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn proposal_body_validate_rejects_missing_and_mismatched_proofs() {
+        let missing_blocks = ProposalBody {
+            consensus: true,
+            approved_blocks: None,
+            approved_hash: Some(HashType([1; 32])),
+            verif: None,
+            signature_tree: None,
+            signature_tree_hash: None,
+        };
+        assert!(matches!(
+            missing_blocks.validate(),
+            Err(BlossomError::WireProtocol(message))
+                if message.contains("approved blocks")
+        ));
+
+        let mut approved_blocks = BTreeMap::new();
+        approved_blocks.insert(HashType([1; 32]), ());
+        let mismatched_hash = ProposalBody {
+            consensus: true,
+            approved_blocks: Some(approved_blocks.clone()),
+            approved_hash: Some(HashType([9; 32])),
+            verif: None,
+            signature_tree: None,
+            signature_tree_hash: None,
+        };
+        assert!(matches!(
+            mismatched_hash.validate(),
+            Err(BlossomError::WireProtocol(message))
+                if message.contains("approved hash")
+        ));
+
+        let mismatched_tree = ProposalBody {
+            consensus: true,
+            approved_hash: Some(approved_blocks.hash()),
+            approved_blocks: Some(approved_blocks.clone()),
+            verif: None,
+            signature_tree: Some(approved_blocks),
+            signature_tree_hash: Some(HashType([8; 32])),
+        };
+        assert!(matches!(
+            mismatched_tree.validate(),
+            Err(BlossomError::WireProtocol(message))
+                if message.contains("signature-tree hash")
+        ));
+    }
+
+    #[test]
+    fn commit_signature_binds_consensus_decision() {
+        let keypair = Keypair::generate();
+        let body = CommitBody {
+            consensus: true,
+            signature_tree_insert: None,
+        };
+        let header = signed_header_for_body(&keypair, MSGKey::Commit, &body);
+        let tampered = CommitBody {
+            consensus: false,
+            signature_tree_insert: None,
+        };
+
+        assert!(header.verify_signature(MSGKey::Commit, &body).is_ok());
+        assert!(header.verify_signature(MSGKey::Commit, &tampered).is_err());
+    }
+
+    #[test]
+    fn echo_recovery_signatures_bind_requested_and_redispatched_blocks() {
+        let keypair = Keypair::generate();
+        let mut requested = BTreeMap::new();
+        requested.insert(HashType([1; 32]), ());
+        let request_header = signed_header_for_body(&keypair, MSGKey::EchoRequest, &requested);
+        let mut tampered_requested = requested.clone();
+        tampered_requested.insert(HashType([2; 32]), ());
+
+        assert!(
+            request_header
+                .verify_signature(MSGKey::EchoRequest, &requested)
+                .is_ok()
+        );
+        assert!(
+            request_header
+                .verify_signature(MSGKey::EchoRequest, &tampered_requested)
+                .is_err()
+        );
+
+        let block = signed_block(&keypair);
+        let mut redispatched = BTreeMap::new();
+        redispatched.insert(block.hash, block.clone());
+        let redispatch_header =
+            signed_header_for_body(&keypair, MSGKey::EchoReDispatch, &redispatched);
+        let mut tampered_block = block;
+        tampered_block.body.txs.push(Transaction::new("tamper"));
+        let mut tampered_redispatched = BTreeMap::new();
+        tampered_redispatched.insert(tampered_block.hash, tampered_block);
+
+        assert!(
+            redispatch_header
+                .verify_signature(MSGKey::EchoReDispatch, &redispatched)
+                .is_ok()
+        );
+        assert!(
+            redispatch_header
+                .verify_signature(MSGKey::EchoReDispatch, &tampered_redispatched)
+                .is_err()
+        );
+    }
+
+    fn signed_header_for_body<T: BlossomBody>(keypair: &Keypair, kind: MSGKey, body: &T) -> Header {
+        let last_epoch = HashType([2; 32]);
+        let nonce = Nonce::new(7);
+        let round = 1;
+        Header {
+            sender: keypair.public,
+            last_epoch,
+            nonce,
+            round,
+            signature: keypair.signer().sign(
+                Header::signature_hash_for_body(
+                    &keypair.public,
+                    &last_epoch,
+                    nonce,
+                    round,
+                    kind,
+                    body,
+                )
+                .as_ref(),
+            ),
+        }
     }
 }

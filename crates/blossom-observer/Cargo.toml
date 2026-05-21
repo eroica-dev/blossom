@@ -1,0 +1,13 @@
+[package]
+name = "blossom-observer"
+version = "0.1.0"
+edition = "2024"
+description = "Telemetry collector and analyzer for distributed Blossom protocol runs."
+license = "UNLICENSED"
+
+[dependencies]
+blossom = { path = "../.." }
+clap = { version = "4.5", features = ["derive", "env"] }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.145"
+tokio = { version = "1.48", features = ["io-util", "macros", "net", "rt-multi-thread", "signal", "sync"] }

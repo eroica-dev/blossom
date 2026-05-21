@@ -1,11 +1,12 @@
 use std::io;
+use std::sync::Arc;
 
 use clap::Parser;
 use tokio::net::TcpListener;
 
 use blossom::{
     BlossomError, NodeIdentity, NodeRuntime, PubKey, Result as BlossomResult, RuntimeConfig,
-    SecKey, Service, TcpNode, TrustMode,
+    SecKey, Service, TcpNode, TelemetryHandle, TrustMode,
 };
 
 type MainResult<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
@@ -29,6 +30,8 @@ struct Args {
     trusted: bool,
     #[arg(long, value_name = "KIND:PUBKEY@HOST:PORT")]
     service: Vec<String>,
+    #[arg(long, env = "BLOSSOM_OBSERVER_ADDR")]
+    observer_addr: Option<String>,
 }
 
 #[tokio::main]
@@ -39,6 +42,10 @@ async fn main() -> MainResult<()> {
     config.block_cap = args.block_cap;
     if args.trusted {
         config.trust_mode = TrustMode::Trusted;
+    }
+    if let Some(addr) = args.observer_addr.as_ref() {
+        config.telemetry =
+            TelemetryHandle::new(Arc::new(blossom::JsonlTcpTelemetrySink::connect(addr)?));
     }
     let runtime = NodeRuntime::new(config);
 

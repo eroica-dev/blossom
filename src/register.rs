@@ -239,6 +239,40 @@ mod tests {
         (0..6).map(|index| PubKey([index; 32])).collect()
     }
 
+    fn dispatch_from(sender: PubKey) -> Msg {
+        Msg::Dispatch(Dispatch {
+            header: Header {
+                sender,
+                ..Default::default()
+            },
+            body: DispatchBody::default(),
+        })
+    }
+
+    fn echo_from_about(observer: PubKey, subject: PubKey) -> Msg {
+        Msg::EchoResponse(EchoResponse {
+            header: Header {
+                sender: observer,
+                ..Default::default()
+            },
+            body: EchoResponseBody {
+                sender: subject,
+                ..Default::default()
+            },
+        })
+    }
+
+    fn update_all_echoes(matrix: &mut MessageMatrix, quorum: &[PubKey]) {
+        for receiver in 0..quorum.len() {
+            for sender in 1..quorum.len() {
+                if receiver == sender {
+                    continue;
+                }
+                matrix.update(true, echo_from_about(quorum[sender], quorum[receiver]));
+            }
+        }
+    }
+
     #[test]
     fn new_matrix_marks_self_axis() {
         let quorum = key_vec();
@@ -263,40 +297,92 @@ mod tests {
         let mut matrix = MessageMatrix::new(&quorum, &quorum[0]);
 
         for pk in &quorum[1..] {
+            matrix.update(true, dispatch_from(*pk));
+        }
+
+        update_all_echoes(&mut matrix, &quorum);
+
+        assert!(matrix.status());
+    }
+
+    #[test]
+    fn missing_dispatch_keeps_echoed_node_pending() {
+        let quorum = key_vec();
+        let mut matrix = MessageMatrix::new(&quorum, &quorum[0]);
+        let missing_dispatch_sender = 1;
+
+        for observer in 2..quorum.len() {
             matrix.update(
                 true,
-                Msg::Dispatch(Dispatch {
-                    header: Header {
-                        sender: *pk,
-                        ..Default::default()
-                    },
-                    body: DispatchBody::default(),
-                }),
+                echo_from_about(quorum[observer], quorum[missing_dispatch_sender]),
             );
         }
 
-        for receiver in 0..quorum.len() {
-            for sender in 1..quorum.len() {
-                if receiver == sender {
-                    continue;
-                }
-                matrix.update(
-                    true,
-                    Msg::EchoResponse(EchoResponse {
-                        header: Header {
-                            sender: quorum[sender],
-                            ..Default::default()
-                        },
-                        body: EchoResponseBody {
-                            sender: quorum[receiver],
-                            ..Default::default()
-                        },
-                    }),
-                );
-            }
-        }
+        assert!(!matrix.status());
+        assert_eq!(
+            matrix.node_status[missing_dispatch_sender],
+            Status::NodePending
+        );
+        assert_eq!(
+            matrix.matrix[matrix.self_index][missing_dispatch_sender],
+            Status::DispatchVoid
+        );
+    }
 
-        assert!(matrix.status());
+    #[test]
+    fn delayed_dispatch_can_complete_existing_echo_evidence() {
+        let quorum = key_vec()[..4].to_vec();
+        let mut matrix = MessageMatrix::new(&quorum, &quorum[0]);
+        let delayed_sender = quorum[1];
+
+        for sender in &quorum[2..] {
+            matrix.update(true, dispatch_from(*sender));
+        }
+        update_all_echoes(&mut matrix, &quorum);
+        assert_eq!(matrix.node_status[1], Status::NodePending);
+
+        matrix.update(true, dispatch_from(delayed_sender));
+
+        assert_eq!(matrix.node_status[1], Status::NodePassed);
+    }
+
+    #[test]
+    fn false_echo_is_recorded_as_void_without_passing() {
+        let quorum = key_vec();
+        let mut matrix = MessageMatrix::new(&quorum, &quorum[0]);
+
+        assert!(!matrix.update(false, echo_from_about(quorum[2], quorum[1])));
+
+        let sender_index = matrix.find_key_index(&quorum[1]).unwrap();
+        let receiver_index = matrix.find_key_index(&quorum[2]).unwrap();
+        assert_eq!(matrix.matrix[receiver_index][sender_index], Status::Void);
+        assert!(matches!(
+            matrix.message_matrix[sender_index][receiver_index],
+            Some(Msg::EchoResponse(_))
+        ));
+        assert!(!matrix.status());
+    }
+
+    #[test]
+    fn unknown_echo_peer_does_not_change_matrix() {
+        let quorum = key_vec();
+        let mut matrix = MessageMatrix::new(&quorum, &quorum[0]);
+
+        assert!(!matrix.update(true, echo_from_about(PubKey([99; 32]), quorum[1])));
+        assert!(!matrix.update(true, echo_from_about(quorum[2], PubKey([99; 32]))));
+
+        assert!(
+            matrix
+                .message_matrix
+                .iter()
+                .all(|row| row.iter().all(Option::is_none))
+        );
+        assert!(
+            matrix
+                .node_status
+                .iter()
+                .all(|status| *status == Status::NodeVoid)
+        );
     }
 
     #[test]

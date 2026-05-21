@@ -1,0 +1,191 @@
+\section{Implementation-Aligned Projections}\label{proj}
+
+This section replaces the first-order projection model with one that matches
+the implemented protocol. The v1 model used a single latency value \(l\) and
+treated it as a representative network latency. The implementation requires a
+more precise model: a quorum stage can advance once the required
+supermajority has arrived, so finality is governed by the slowest member of
+the fastest safe supermajority, not by arithmetic average latency.
+
+\subsection{Protocol Throughput and Finality}\label{proj:tps}
+
+We use the following variables:
+
+\begin{description}
+\item[\(n\)] active validator count.
+\item[\(q\)] quorum size. The current implementation uses \(q=6\).
+\item[\(R(n,q)\)] number of deterministic quorum rounds selected by the
+implementation.
+\item[\(S(x)\)] implemented supermajority threshold, where
+\(S(x)=x-\lfloor x/3 \rfloor\).
+\item[\(F(x)\)] Byzantine safety bound, where
+\(F(x)=\lfloor (x-1)/3 \rfloor\).
+\item[\(\beta\)] transactions per block.
+\item[\(\tau\)] transaction payload size in bytes.
+\item[\(E\)] block utilization, \(0 \le E \le 1\).
+\item[\(b_{1/3}\)] bandwidth of the lower-third infrastructure class, measured
+in bytes per second.
+\item[\(t_{1/3}\)] thread count of the lower-third infrastructure class.
+\item[\(\nu_{1/3}\)] signature verifications per second per thread for the
+lower-third infrastructure class.
+\end{description}
+
+The implemented finality model must also include a latency distribution. Let
+\(\delta_{u,v}^{(a)}\) be the one-way latency from sender \(u\) to receiver
+\(v\) during stage \(a\). For a quorum \(Q\), define the stage latency ceiling
+for receiver \(v\) as the \(S(|Q|)\)-th order statistic of the valid arrivals:
+\[
+\lambda_{a}(Q,v)
+=
+\operatorname{os}_{S(|Q|)}
+\left(
+\left\{
+\delta_{u,v}^{(a)} : u \in Q
+\right\}
+\right).
+\]
+The local node's own vote may be represented with latency \(0\). With
+\(q=6\), the threshold is \(S(6)=4\), so this expression waits for the fourth
+valid vote and excludes the two slowest or absent validators from the liveness
+ceiling.
+
+The quorum stage latency is the slowest receiver that must participate in the
+accepted supermajority:
+\[
+\Lambda_a(Q)
+=
+\operatorname{os}_{S(|Q|)}
+\left(
+\left\{
+\lambda_a(Q,v) : v \in Q
+\right\}
+\right).
+\]
+This is the boundary between the fastest two-thirds and the slowest one-third
+of the quorum. It is intentionally not the mean latency. Average latency can be
+reported as an operational diagnostic, but it must not be used as the finality
+ceiling for a Byzantine-tolerant model.
+
+Let \(A_m\) be the ordered stage list for mode \(m\). For the trusted path,
+\[
+A_{\mathrm{trusted}}=\{\mathrm{dispatch}\}.
+\]
+For the verified path,
+\[
+A_{\mathrm{verified}}
+=
+\{\mathrm{dispatch},\mathrm{echo},\mathrm{verification},
+\mathrm{proposal},\mathrm{commit}\}.
+\]
+The modeled propagation latency is therefore:
+\[
+L_m(n,q)
+=
+\sum_{r=1}^{R(n,q)}
+\sum_{a \in A_m}
+\max_{Q \in \mathcal{Q}_r}
+\Lambda_a(Q).
+\]
+If every directed edge has the same latency \(l\), this reduces to
+\[
+L_{\mathrm{trusted}}(n,q)=R(n,q)l,
+\]
+\[
+L_{\mathrm{verified}}(n,q)=5R(n,q)l.
+\]
+For \(n=36\) and \(q=6\), \(R(n,q)=2\), so the trusted path uses two network
+stages and the verified path uses ten network stages.
+
+The block-time model is:
+\[
+B_t =
+C_{\mathrm{form}}(n)
++
+\frac{W_m(n,q,\beta,E,\tau)}{b_{1/3}}
++
+\frac{V(n,\beta,E)}{\nu_{1/3}t_{1/3}}
++
+L_m(n,q),
+\]
+where \(W_m\) is implementation-modeled wire traffic and \(V\) is the number
+of required verification operations. Throughput is:
+\[
+T_m=\frac{\beta n E}{B_t}.
+\]
+
+For all-node convergence rather than finality, replace the order statistic in
+\(\Lambda_a(Q)\) with a maximum over all non-faulty receivers. That stricter
+model is useful for catch-up and observer health analysis, but it is not the
+right ceiling for finality throughput when the protocol can finalize after a
+safe supermajority.
+
+\subsection{Latency Ceiling Proof Sketch}\label{proj:latency-proof}
+
+The implementation accepts a stage proof only after it observes
+\(S(x)=x-\lfloor x/3 \rfloor\) distinct valid signatures from the current
+validator set for that stage body. Therefore, at most
+\(\lfloor x/3 \rfloor\) validators can be slow, absent, or non-responsive
+without preventing liveness. The earliest time at which a receiver can accept
+the stage is exactly the arrival time of the \(S(x)\)-th valid message. This
+is an order statistic, not an average.
+
+Safety follows from quorum intersection. Any two accepted vote sets of size
+\(S(x)\) intersect in at least \(2S(x)-x\) validators. For
+\(F(x)=\lfloor (x-1)/3 \rfloor\), this intersection is always larger than
+\(F(x)\), so under the Byzantine bound the intersection contains at least one
+honest validator. Since an honest validator signs only one valid body for a
+given epoch, nonce, round, and stage, two conflicting accepted proofs cannot
+both be valid. This is the same threshold invariant tested in the protocol
+code.
+
+Thus, the correct latency ceiling for finality is the slowest arrival inside
+the first safe supermajority. The slowest one-third can affect catch-up time,
+observer health, and eventual all-node convergence, but it does not define
+the finality ceiling unless the protocol is configured to require every node
+to complete the stage.
+
+\subsection{Fault Tolerance}\label{proj:ft}
+
+The implemented verified path requires supermajority evidence for epoch
+approval, repair, reconnect ping evidence, reconnect catch-up proofs, and
+reconnect admission votes. The threshold is always counted over distinct
+current validator identities and is bound to the current epoch and proof body.
+This prevents replayed evidence, duplicate votes, and Sybil identity changes
+from increasing the proof count.
+
+The v2 safety claim is therefore narrower and more precise than the informal
+v1 statement: a six-member quorum can continue without two slow participants,
+but the honest-overlap Byzantine safety proof for conflicting supermajority
+proofs admits one Byzantine equivocator in that six-member quorum. Larger
+validator sets preserve the standard less-than-one-third Byzantine bound.
+
+\subsection{Failure Bleed}\label{proj:fb}
+
+Failure bleed remains the case where a faulty quorum prevents honest members
+from learning data that the rest of the network has accepted. The implemented
+mitigation is now expressed as reconciliation rather than as a purely
+theoretical second recursion. When a node lacks a certified summary quorum for
+an epoch, it collects signed manifests, rebuilds the candidate block set, and
+admits the result only after the same supermajority threshold is satisfied.
+This behavior is exercised in the simulator and should be modeled as an
+exception path with additional latency and bandwidth, rather than as the
+default epoch path.
+
+\subsection{Dynamic Utilization}\label{proj:dyn_ut}
+
+The dynamic utilization model continues to use \(E\) as the block utilization
+term, but the v2 model moves utilization through the implementation-modeled
+wire function \(W_m(n,q,\beta,E,\tau)\). For \(q=6\) and \(n=36\), measured
+wire traffic is close to the all-to-all lower bound because every node must
+eventually learn every node's block. Smaller or non-square quorums can exceed
+that bound due to repeated full-payload propagation across intermediate
+quorum rounds.
+
+The following legacy figures are retained as historical references until they
+are regenerated from the v2 model.
+
+\input{figures/proj_small}
+\input{figures/proj_large}
+\input{figures/fin_change}
+\input{figures/tps_change}
+\input{figures/comp_change}

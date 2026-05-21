@@ -243,6 +243,7 @@ pub fn apply_epoch_membership_transition(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::algorithm::select_quorums_from_index_tree;
     use crate::crypto::Keypair;
     use crate::encounter::{EncounterPhase, EncounterRecord, EncounterRecordBody};
 
@@ -479,6 +480,64 @@ mod tests {
 
         assert_eq!(plan.decisions.len(), 1);
         assert_eq!(plan.retained_verifier_count, 5);
+    }
+
+    #[test]
+    fn pruned_verifier_set_produces_compatible_round_schedules() {
+        let keypairs = (0..13).map(|_| Keypair::generate()).collect::<Vec<_>>();
+        let verifiers = verifier_set(&keypairs);
+        let last_epoch = HashType([7; 32]);
+        let nonce = Nonce::new(3);
+        let removed_subjects = [keypairs[11].public, keypairs[12].public];
+        let mut blocks = BTreeMap::new();
+
+        for subject in removed_subjects {
+            for observer in &keypairs[..9] {
+                let block = evidence_block(
+                    observer,
+                    subject,
+                    last_epoch,
+                    nonce,
+                    EncounterOutcome::MissingSignature,
+                );
+                blocks.insert(block.hash, block);
+            }
+        }
+
+        let (next_verifiers, plan) = apply_epoch_membership_transition(
+            &verifiers,
+            &blocks,
+            last_epoch,
+            nonce,
+            ConsensusNodeRemovalPolicy::supermajority()
+                .with_min_remaining_verifiers(6)
+                .with_max_removals_per_epoch(2),
+        );
+
+        assert_eq!(plan.decisions.len(), 2);
+        assert_eq!(next_verifiers.len(), 11);
+        for subject in removed_subjects {
+            assert!(!next_verifiers.contains_key(&subject));
+        }
+
+        let seed = HashType::hash(b"post-prune-round-schedule");
+        for self_key in next_verifiers.keys().copied().collect::<Vec<_>>() {
+            let self_quorums =
+                select_quorums_from_index_tree(&next_verifiers, &self_key, seed, true);
+            assert!(!self_quorums.is_empty());
+            for (round, quorum) in self_quorums.iter().enumerate() {
+                assert!(quorum.contains(&self_key));
+                for peer in quorum {
+                    let peer_quorums =
+                        select_quorums_from_index_tree(&next_verifiers, peer, seed, true);
+                    assert_eq!(
+                        peer_quorums.get(round),
+                        Some(quorum),
+                        "round {round} self {self_key} peer {peer}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]

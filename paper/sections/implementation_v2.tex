@@ -1,0 +1,109 @@
+\section{Implementation Alignment}\label{impl:v2}
+
+This v2 draft is intended to align the paper model with the protocol that is
+now implemented in the repository. The original protocol description remains
+the conceptual source, while this section records the concrete implementation
+choices that affect safety, finality, latency, and benchmark interpretation.
+
+\subsection{Implemented Quorum Parameters}
+
+The current protocol implementation defines a fixed quorum size of six in
+\path{src/algorithm.rs}. The same module defines the implemented
+supermajority threshold:
+\[
+S(x)=x-\left\lfloor \frac{x}{3}\right\rfloor .
+\]
+For a six-member quorum this gives \(S(6)=4\). The verified path's Byzantine
+safety proof uses
+\[
+F(x)=\left\lfloor \frac{x-1}{3}\right\rfloor
+\]
+as the maximum Byzantine population that can be tolerated while guaranteeing
+honest overlap between two accepted supermajority proofs. Therefore a
+six-member quorum can make liveness progress without two slow or absent
+members, but the honest-overlap safety proof admits one Byzantine signer in
+that six-member quorum. This distinction is important: slow-node tolerance and
+Byzantine equivocator tolerance are related, but not identical.
+
+The implemented quorum schedule is deterministic. Nodes are sorted by public
+key, optionally shuffled from the epoch seed, and then assigned to recursive
+round quorums. For \(n=36\) and \(q=6\), the implementation creates two rounds:
+one row-like round and one transposed column-like round. Non-square network
+sizes are mapped to the largest implementation-supported topology below or
+equal to the active set, with extra nodes appended into existing quorums.
+
+\subsection{Trusted and Verified Paths}
+
+The implementation now distinguishes two execution paths:
+
+\begin{description}
+\item[Trusted path] assumes known-safe operators and uses dispatch-only
+propagation. This path models private or permissioned environments where
+operators do not intentionally equivocate.
+\item[Verified path] uses the full message sequence: dispatch, echo,
+verification, proposal, and commit. Votes are counted by distinct current
+validator identities, and each signed message is bound to the epoch, nonce,
+round, message kind, sender identity, and body being admitted.
+\end{description}
+
+The benchmark binary \path{src/bin/blossom-epoch-bench.rs} models these paths
+separately. For a two-round \(q=6\) topology, trusted propagation has two
+network stages, while verified propagation has ten network stages.
+
+\subsection{Runtime Reconciliation and Membership}
+
+The protocol code now contains explicit runtime repair and reconnect behavior.
+Dropped nodes do not re-enter merely by becoming reachable. A reconnecting node
+must ping active peers, obtain a catch-up proof for the current canonical state,
+and receive an admission supermajority. In trustless mode, these ping,
+catch-up, and admission thresholds are clamped to the same supermajority rule
+used elsewhere in the verified path. Duplicate votes, stale proofs, replayed
+evidence, and identity changes are counted as telemetry but do not increase the
+admission count.
+
+If summary repair cannot find a certified supermajority for an epoch hash, the
+simulator falls back to signed block-set reconciliation. The reconciliation
+path rebuilds the candidate epoch from signed manifests and requires
+supermajority agreement before admitting the result as canonical. These
+behaviors are implemented in \path{crates/blossom-sim/src/epoch.rs} and are
+covered by deterministic scenario tests.
+
+\subsection{Bounded Awaits and Round-Skip Evidence}
+
+The v2 implementation separates a slow validator from a Byzantine validator.
+A node may observe future-round progress and assist that future round, but only
+through evidence bound to the current epoch, nonce, source round, target round,
+and certified data manifest. The protocol helper in \path{src/round_skip.rs}
+defines signed round-skip votes and certificates that count only distinct
+current-validator identities under the same supermajority rule used by the
+verified path.
+
+The first fanout round is a data-availability boundary. If that round is
+skipped before a node's local block has entered the dissemination tree, the
+local block is dropped from the assisted future branch. If a later round is
+skipped after first fanout, the block is not dropped by default; it is carried
+forward by the certified manifest and remains eligible for repair and
+reconciliation. The manifest records per-block replica holders, so repair can
+reconstruct the full canonical data set from distributed replicas without
+requiring one peer to already hold the entire set immediately after first
+fanout. Data-bearing future-round votes require validation of the future body
+and parent data chain before they can contribute to advancement.
+
+\subsection{Telemetry and Observation}
+
+The v2 implementation embeds protocol telemetry and exports spans to the
+observer service in \path{crates/blossom-observer}. The observer is outside the
+measured node hot path, but the emitting cost inside each node is part of the
+runtime overhead. The current benchmark target is to preserve the telemetry
+overhead as an explicit protocol cost while keeping observer analysis separate
+from node finality measurements.
+
+\subsection{Benchmark Interpretation}
+
+The benchmark results should be read as implementation-aligned models, not as
+proofs that a deployment's network interface can sustain the required load. For
+\(n=36\), \(q=6\), and maximum-size blocks under the current frame limit, the
+model sends roughly the all-to-all lower-bound amount of full payload data. The
+remaining performance question is therefore dominated by the number of network
+stages, the supermajority latency ceiling, per-node bandwidth, and the cost of
+local verification.

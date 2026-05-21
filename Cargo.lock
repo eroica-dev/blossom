@@ -100,6 +100,7 @@ dependencies = [
  "env_logger",
  "hex",
  "indextreemap",
+ "itoa",
  "log",
  "rand_core",
  "rs_merkle",
@@ -112,7 +113,18 @@ dependencies = [
 ]
 
 [[package]]
-name = "blossom-lab"
+name = "blossom-observer"
+version = "0.1.0"
+dependencies = [
+ "blossom",
+ "clap",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "blossom-sim"
 version = "0.1.0"
 dependencies = [
  "blossom",

@@ -1,0 +1,710 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Blossom Observer</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --bg: #f5f6f1;
+      --panel: #ffffff;
+      --ink: #17211b;
+      --muted: #657166;
+      --line: #dce1d6;
+      --good: #16784f;
+      --warn: #a86610;
+      --bad: #b73535;
+      --accent: #286e73;
+      --accent-soft: #d9ece8;
+    }
+
+    * { box-sizing: border-box; }
+
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--ink);
+      font: 14px/1.45 ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+
+    header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 16px;
+      padding: 20px 24px 16px;
+      border-bottom: 1px solid var(--line);
+      background: rgba(255, 255, 255, 0.76);
+      position: sticky;
+      top: 0;
+      z-index: 4;
+      backdrop-filter: blur(10px);
+    }
+
+    h1 {
+      margin: 0;
+      font-size: 20px;
+      font-weight: 720;
+      letter-spacing: 0;
+    }
+
+    button, input {
+      font: inherit;
+    }
+
+    .toolbar {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      color: var(--muted);
+      flex-wrap: wrap;
+    }
+
+    .toggle {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      user-select: none;
+    }
+
+    .toggle input {
+      width: 16px;
+      height: 16px;
+      accent-color: var(--accent);
+    }
+
+    .shell {
+      width: min(1480px, 100%);
+      margin: 0 auto;
+      padding: 20px 24px 28px;
+    }
+
+    .overview {
+      display: grid;
+      grid-template-columns: repeat(7, minmax(130px, 1fr));
+      gap: 12px;
+      margin-bottom: 18px;
+    }
+
+    .panel, .metric {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+    }
+
+    .metric {
+      padding: 14px;
+      min-height: 96px;
+    }
+
+    .label {
+      color: var(--muted);
+      font-size: 12px;
+      text-transform: uppercase;
+      letter-spacing: .06em;
+    }
+
+    .value {
+      margin-top: 8px;
+      font-size: 24px;
+      line-height: 1.1;
+      font-weight: 760;
+      overflow-wrap: anywhere;
+    }
+
+    .subtle {
+      margin-top: 6px;
+      color: var(--muted);
+      font-size: 12px;
+      overflow-wrap: anywhere;
+    }
+
+    .grid {
+      display: grid;
+      grid-template-columns: minmax(420px, 1.15fr) minmax(360px, .85fr);
+      gap: 16px;
+      align-items: start;
+    }
+
+    .panel-head {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 12px;
+      padding: 14px 14px 10px;
+      border-bottom: 1px solid var(--line);
+    }
+
+    .panel-title {
+      margin: 0;
+      font-size: 15px;
+      font-weight: 720;
+    }
+
+    .search {
+      width: min(340px, 100%);
+      height: 34px;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      padding: 0 10px;
+      background: #fbfcfa;
+      color: var(--ink);
+    }
+
+    .table-wrap {
+      overflow: auto;
+      max-height: 62vh;
+    }
+
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      font-variant-numeric: tabular-nums;
+    }
+
+    th, td {
+      padding: 10px 12px;
+      border-bottom: 1px solid var(--line);
+      text-align: left;
+      vertical-align: middle;
+      white-space: nowrap;
+    }
+
+    th {
+      position: sticky;
+      top: 0;
+      background: #fbfcfa;
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 680;
+      z-index: 1;
+    }
+
+    tr.node-row {
+      cursor: pointer;
+    }
+
+    tr.node-row:hover {
+      background: #f8faf5;
+    }
+
+    tr.node-row.selected {
+      background: var(--accent-soft);
+    }
+
+    .node-id {
+      max-width: 220px;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    }
+
+    .pill {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      min-width: 68px;
+      height: 24px;
+      border-radius: 999px;
+      padding: 0 9px;
+      font-size: 12px;
+      font-weight: 680;
+      text-transform: capitalize;
+    }
+
+    .pill.healthy {
+      background: #dff1e8;
+      color: var(--good);
+    }
+
+    .pill.warning {
+      background: #f7ead3;
+      color: var(--warn);
+    }
+
+    .pill.degraded {
+      background: #f5dddd;
+      color: var(--bad);
+    }
+
+    .pill.dropped {
+      background: #e7e4dc;
+      color: #5f594c;
+    }
+
+    .pill.reconnected {
+      background: #d9ece8;
+      color: var(--accent);
+    }
+
+    .detail {
+      padding: 14px;
+    }
+
+    .detail-node {
+      display: flex;
+      justify-content: space-between;
+      align-items: flex-start;
+      gap: 10px;
+      margin-bottom: 14px;
+    }
+
+    .mono {
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      overflow-wrap: anywhere;
+    }
+
+    .mini-grid {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(88px, 1fr));
+      gap: 10px;
+      margin-bottom: 14px;
+    }
+
+    .mini {
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      padding: 10px;
+      background: #fbfcfa;
+    }
+
+    .mini strong {
+      display: block;
+      font-size: 18px;
+      line-height: 1.2;
+      margin-top: 3px;
+    }
+
+    .bar-cell {
+      min-width: 150px;
+    }
+
+    .detail table {
+      table-layout: fixed;
+    }
+
+    .detail th, .detail td {
+      white-space: normal;
+    }
+
+    .detail .bar-cell {
+      min-width: 92px;
+      width: 24%;
+    }
+
+    .detail th:first-child,
+    .detail td:first-child {
+      width: 28%;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .detail th:nth-child(2),
+    .detail td:nth-child(2) {
+      width: 16%;
+    }
+
+    .detail th:nth-child(3),
+    .detail td:nth-child(3),
+    .detail th:nth-child(4),
+    .detail td:nth-child(4) {
+      width: 16%;
+      white-space: nowrap;
+    }
+
+    .bar {
+      position: relative;
+      height: 8px;
+      border-radius: 999px;
+      overflow: hidden;
+      background: #e8ece4;
+    }
+
+    .bar span {
+      display: block;
+      height: 100%;
+      width: 0%;
+      background: var(--accent);
+    }
+
+    .empty {
+      padding: 26px 14px;
+      color: var(--muted);
+      text-align: center;
+    }
+
+    @media (max-width: 1100px) {
+      .overview { grid-template-columns: repeat(3, minmax(150px, 1fr)); }
+      .grid { grid-template-columns: 1fr; }
+    }
+
+    @media (max-width: 680px) {
+      header {
+        align-items: flex-start;
+        flex-direction: column;
+      }
+
+      .shell { padding: 14px; }
+      .overview { grid-template-columns: 1fr 1fr; }
+      .mini-grid { grid-template-columns: 1fr 1fr; }
+      th, td { padding: 9px 10px; }
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>Blossom Observer</h1>
+    <div class="toolbar">
+      <label class="toggle"><input id="liveToggle" type="checkbox" checked> Live</label>
+      <span id="updatedAt">Waiting for telemetry</span>
+    </div>
+  </header>
+
+  <main class="shell">
+    <section class="overview">
+      <div class="metric">
+        <div class="label">Network</div>
+        <div class="value" id="networkStatus">-</div>
+        <div class="subtle" id="networkSub">No samples yet</div>
+      </div>
+      <div class="metric">
+        <div class="label">Nodes</div>
+        <div class="value" id="nodeCount">0</div>
+        <div class="subtle" id="nodeSub">tracked identities</div>
+      </div>
+      <div class="metric">
+        <div class="label">Events</div>
+        <div class="value" id="eventCount">0</div>
+        <div class="subtle" id="eventSub">total telemetry records</div>
+      </div>
+      <div class="metric">
+        <div class="label">Errors</div>
+        <div class="value" id="errorCount">0</div>
+        <div class="subtle" id="errorSub">reported failures</div>
+      </div>
+      <div class="metric">
+        <div class="label">Span Balance</div>
+        <div class="value" id="spanBalance">0</div>
+        <div class="subtle" id="spanSub">starts minus ends</div>
+      </div>
+      <div class="metric">
+        <div class="label">Open/Orphan</div>
+        <div class="value" id="spanGaps">0</div>
+        <div class="subtle">incomplete plus orphan spans</div>
+      </div>
+      <div class="metric">
+        <div class="label">Block Flow</div>
+        <div class="value" id="blockFlow">0</div>
+        <div class="subtle" id="blockFlowSub">accepted / denied bytes</div>
+      </div>
+    </section>
+
+    <section class="grid">
+      <div class="panel">
+        <div class="panel-head">
+          <h2 class="panel-title">Nodes</h2>
+          <input id="nodeSearch" class="search" placeholder="Filter node or status">
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>Status</th>
+                <th>Node</th>
+                <th>Events</th>
+                <th>Errors</th>
+                <th>Spans</th>
+                <th>Gaps</th>
+                <th>Avg</th>
+              </tr>
+            </thead>
+            <tbody id="nodeRows">
+              <tr><td colspan="7" class="empty">No node telemetry yet</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      <div class="panel" id="nodePanel">
+        <div class="panel-head">
+          <h2 class="panel-title">Node Detail</h2>
+        </div>
+        <div class="detail" id="nodeDetail">
+          <div class="empty">Select a node to inspect stage timings.</div>
+        </div>
+      </div>
+    </section>
+
+    <section class="panel" style="margin-top:16px">
+      <div class="panel-head">
+        <h2 class="panel-title">Stage Latency</h2>
+      </div>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Stage</th>
+              <th>Samples</th>
+              <th>Avg</th>
+              <th>Min</th>
+              <th>Max</th>
+              <th>Share</th>
+            </tr>
+          </thead>
+          <tbody id="stageRows">
+            <tr><td colspan="6" class="empty">No completed spans yet</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+  </main>
+
+  <script>
+    const state = {
+      analysis: null,
+      selectedNode: null,
+      timer: null
+    };
+
+    const $ = (id) => document.getElementById(id);
+    const fmt = new Intl.NumberFormat();
+
+    function esc(value) {
+      return String(value ?? '').replace(/[&<>"']/g, (ch) => ({
+        '&': '&amp;',
+        '<': '&lt;',
+        '>': '&gt;',
+        '"': '&quot;',
+        "'": '&#39;'
+      }[ch]));
+    }
+
+    function micros(value) {
+      const n = Number(value || 0);
+      if (n >= 1000) return `${(n / 1000).toFixed(2)} ms`;
+      return `${fmt.format(Math.round(n))} us`;
+    }
+
+    function shortNode(node) {
+      return node.length > 18 ? `${node.slice(0, 10)}...${node.slice(-8)}` : node;
+    }
+
+    function mapValue(map, key) {
+      return (map && map[key]) || 0;
+    }
+
+    function networkHealth(a) {
+      if (!a || a.total_events === 0) return 'warning';
+      if (a.error_events > 0) return 'degraded';
+      if (a.incomplete_spans > 0 || a.orphan_span_ends > 0) return 'warning';
+      if (a.dropped_node_events > 0) return 'warning';
+      return 'healthy';
+    }
+
+    function nodeHealth(a, node) {
+      const errors = mapValue(a.errors_by_node, node);
+      const dropped = mapValue(a.dropped_nodes_by_node, node);
+      const reconnected = mapValue(a.reconnected_nodes_by_node, node);
+      const incomplete = mapValue(a.incomplete_spans_by_node, node);
+      const orphan = mapValue(a.orphan_span_ends_by_node, node);
+      const starts = mapValue(a.span_starts_by_node, node);
+      const ends = mapValue(a.span_ends_by_node, node);
+      if (errors > 0) return 'degraded';
+      if (dropped > reconnected) return 'dropped';
+      if (reconnected > 0) return 'reconnected';
+      if (incomplete > 0 || orphan > 0 || starts !== ends) return 'warning';
+      return 'healthy';
+    }
+
+    function pill(status) {
+      return `<span class="pill ${status}">${status}</span>`;
+    }
+
+    function stageNames(a) {
+      return Object.keys(a.span_durations_by_stage || {}).sort();
+    }
+
+    function nodeStageStats(a, node) {
+      const prefix = `${node}:`;
+      return Object.entries(a.span_durations_by_node_stage || {})
+        .filter(([key]) => key.startsWith(prefix))
+        .map(([key, stats]) => ({ stage: key.slice(prefix.length), stats }))
+        .sort((left, right) => left.stage.localeCompare(right.stage));
+    }
+
+    function nodeAvg(a, node) {
+      const stages = nodeStageStats(a, node);
+      const total = stages.reduce((sum, row) => sum + Number(row.stats.total_micros || 0), 0);
+      const count = stages.reduce((sum, row) => sum + Number(row.stats.count || 0), 0);
+      return count > 0 ? total / count : 0;
+    }
+
+    function setText(id, value) {
+      $(id).textContent = value;
+    }
+
+    function updateOverview(a) {
+      const health = networkHealth(a);
+      setText('networkStatus', health[0].toUpperCase() + health.slice(1));
+      setText('networkSub', `${fmt.format(a.span_starts)} starts / ${fmt.format(a.span_ends)} ends`);
+      setText('nodeCount', fmt.format(a.nodes || 0));
+      setText('eventCount', fmt.format(a.total_events || 0));
+      setText('errorCount', fmt.format(a.error_events || 0));
+      setText('spanBalance', fmt.format((a.span_starts || 0) - (a.span_ends || 0)));
+      setText('spanSub', `${fmt.format(a.span_starts || 0)} starts, ${fmt.format(a.span_ends || 0)} ends`);
+      setText('spanGaps', fmt.format((a.incomplete_spans || 0) + (a.orphan_span_ends || 0)));
+      setText('blockFlow', fmt.format(a.block_transfer_attempts || 0));
+      $('blockFlowSub').textContent = `${fmt.format(a.accepted_blocks || 0)} accepted / ${fmt.format(a.denied_blocks || 0)} denied, ${fmt.format(a.accepted_block_bytes || 0)} / ${fmt.format(a.denied_block_bytes || 0)} bytes`;
+      setText('updatedAt', `Updated ${new Date().toLocaleTimeString()}`);
+      $('errorSub').textContent = Object.keys(a.errors_by_stage || {}).join(', ') || 'reported failures';
+      $('nodeSub').textContent = `${fmt.format(Object.keys(a.events_by_node || {}).length)} seen, ${fmt.format(a.dropped_node_events || 0)} dropped, ${fmt.format(a.reconnected_node_events || 0)} reconnected`;
+    }
+
+    function renderNodes(a) {
+      const query = $('nodeSearch').value.trim().toLowerCase();
+      const nodes = Object.keys(a.events_by_node || {}).filter((node) => {
+        if (!query) return true;
+        return node.toLowerCase().includes(query) || nodeHealth(a, node).includes(query);
+      }).sort((left, right) => {
+        const order = { degraded: 0, dropped: 1, warning: 2, reconnected: 3, healthy: 4 };
+        return order[nodeHealth(a, left)] - order[nodeHealth(a, right)] || left.localeCompare(right);
+      });
+
+      if (!nodes.length) {
+        $('nodeRows').innerHTML = '<tr><td colspan="7" class="empty">No matching nodes</td></tr>';
+        return;
+      }
+
+      if (!state.selectedNode || !nodes.includes(state.selectedNode)) {
+        state.selectedNode = nodes[0];
+      }
+
+      $('nodeRows').innerHTML = nodes.map((node) => {
+        const status = nodeHealth(a, node);
+        const starts = mapValue(a.span_starts_by_node, node);
+        const ends = mapValue(a.span_ends_by_node, node);
+        const gaps = mapValue(a.incomplete_spans_by_node, node) + mapValue(a.orphan_span_ends_by_node, node);
+        const selected = node === state.selectedNode ? ' selected' : '';
+        return `<tr class="node-row${selected}" data-node="${esc(node)}">
+          <td>${pill(status)}</td>
+          <td><div class="node-id" title="${esc(node)}">${esc(shortNode(node))}</div></td>
+          <td>${fmt.format(mapValue(a.events_by_node, node))}</td>
+          <td>${fmt.format(mapValue(a.errors_by_node, node))}</td>
+          <td>${fmt.format(starts)} / ${fmt.format(ends)}</td>
+          <td>${fmt.format(gaps)}</td>
+          <td>${micros(nodeAvg(a, node))}</td>
+        </tr>`;
+      }).join('');
+
+      document.querySelectorAll('.node-row').forEach((row) => {
+        row.addEventListener('click', () => {
+          state.selectedNode = row.dataset.node;
+          renderNodes(state.analysis);
+          renderNodeDetail(state.analysis);
+        });
+      });
+    }
+
+    function renderNodeDetail(a) {
+      const node = state.selectedNode;
+      if (!node) {
+        $('nodeDetail').innerHTML = '<div class="empty">Select a node to inspect stage timings.</div>';
+        return;
+      }
+
+      const status = nodeHealth(a, node);
+      const stages = nodeStageStats(a, node);
+      const maxAvg = Math.max(1, ...stages.map((row) => Number(row.stats.avg_micros || 0)));
+      const gaps = mapValue(a.incomplete_spans_by_node, node) + mapValue(a.orphan_span_ends_by_node, node);
+      const dropped = mapValue(a.dropped_nodes_by_node, node);
+      const reconnected = mapValue(a.reconnected_nodes_by_node, node);
+
+      const rows = stages.map(({ stage, stats }) => {
+        const width = Math.max(2, Math.round((Number(stats.avg_micros || 0) / maxAvg) * 100));
+        return `<tr>
+          <td>${esc(stage)}</td>
+          <td>${fmt.format(stats.count || 0)}</td>
+          <td>${micros(stats.avg_micros)}</td>
+          <td>${micros(stats.max_micros)}</td>
+          <td class="bar-cell"><div class="bar"><span style="width:${width}%"></span></div></td>
+        </tr>`;
+      }).join('') || '<tr><td colspan="5" class="empty">No completed spans for this node</td></tr>';
+
+      $('nodeDetail').innerHTML = `
+        <div class="detail-node">
+          <div>
+            <div class="label">Node</div>
+            <div class="mono">${esc(node)}</div>
+          </div>
+          ${pill(status)}
+        </div>
+        <div class="mini-grid">
+          <div class="mini"><span class="label">Events</span><strong>${fmt.format(mapValue(a.events_by_node, node))}</strong></div>
+          <div class="mini"><span class="label">Errors</span><strong>${fmt.format(mapValue(a.errors_by_node, node))}</strong></div>
+          <div class="mini"><span class="label">Dropped/Rejoined</span><strong>${fmt.format(dropped)} / ${fmt.format(reconnected)}</strong></div>
+          <div class="mini"><span class="label">Avg Span</span><strong>${micros(nodeAvg(a, node))}</strong></div>
+        </div>
+        <table>
+          <thead><tr><th>Stage</th><th>Samples</th><th>Avg</th><th>Max</th><th>Load</th></tr></thead>
+          <tbody>${rows}</tbody>
+        </table>
+      `;
+    }
+
+    function renderStages(a) {
+      const stages = Object.entries(a.span_durations_by_stage || {})
+        .sort((left, right) => Number(right[1].total_micros || 0) - Number(left[1].total_micros || 0));
+      const maxTotal = Math.max(1, ...stages.map(([, stats]) => Number(stats.total_micros || 0)));
+      if (!stages.length) {
+        $('stageRows').innerHTML = '<tr><td colspan="6" class="empty">No completed spans yet</td></tr>';
+        return;
+      }
+      $('stageRows').innerHTML = stages.map(([stage, stats]) => {
+        const width = Math.max(2, Math.round((Number(stats.total_micros || 0) / maxTotal) * 100));
+        return `<tr>
+          <td>${esc(stage)}</td>
+          <td>${fmt.format(stats.count || 0)}</td>
+          <td>${micros(stats.avg_micros)}</td>
+          <td>${micros(stats.min_micros)}</td>
+          <td>${micros(stats.max_micros)}</td>
+          <td class="bar-cell"><div class="bar"><span style="width:${width}%"></span></div></td>
+        </tr>`;
+      }).join('');
+    }
+
+    async function refresh() {
+      try {
+        const response = await fetch('/api/analysis', { cache: 'no-store' });
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        const analysis = await response.json();
+        state.analysis = analysis;
+        updateOverview(analysis);
+        renderNodes(analysis);
+        renderNodeDetail(analysis);
+        renderStages(analysis);
+      } catch (error) {
+        $('updatedAt').textContent = `Disconnected: ${error.message}`;
+      }
+    }
+
+    function schedule() {
+      if (state.timer) clearInterval(state.timer);
+      if ($('liveToggle').checked) {
+        state.timer = setInterval(refresh, 2000);
+      }
+    }
+
+    $('nodeSearch').addEventListener('input', () => {
+      if (!state.analysis) return;
+      renderNodes(state.analysis);
+      renderNodeDetail(state.analysis);
+    });
+    $('liveToggle').addEventListener('change', schedule);
+
+    refresh();
+    schedule();
+  </script>
+</body>
+</html>

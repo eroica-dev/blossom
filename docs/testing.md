@@ -3,6 +3,14 @@
 The test suite is split between focused unit tests and TCP end-to-end
 tests that exercise the deployable node path over real local sockets.
 
+Protocol-stage closure is tracked in `docs/protocol-stage-checklist.md`. That
+checklist defines the expected proof sketches and test gates for each stage of
+the protocol, from wire signatures through epoch finality, recovery, and ledger
+validation.
+
+Runtime telemetry and observer-service analysis are documented in
+`docs/protocol-telemetry.md`.
+
 ## Commands
 
 Run everything:

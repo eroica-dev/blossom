@@ -8,7 +8,7 @@
 #   TX_BYTES=32
 #   LATENCY_MS=1
 #   JITTER_MS=0
-#   ROUND_TIMEOUT_MS=50
+#   ROUND_TIMEOUT_MS=0
 #   DROP_PPM=0
 #   FUZZ_PPM=0
 #   SPIKE_PPM=0
@@ -20,6 +20,8 @@
 #   EPOCH_CHAOS_SEED=7308332182487356264
 #   TRUSTED=0
 #   SHUFFLE=0
+#   REQUIRE_RECONCILIATION=0
+#   OBSERVER_ADDR=
 
 set -euo pipefail
 
@@ -35,6 +37,7 @@ report_pinning
 mkdir -p "$root/results"
 summary="$root/results/epoch_chaos_$(timestamp).csv"
 epochs="${summary%.csv}_epochs.csv"
+stages="${summary%.csv}_stages.csv"
 bugs="${summary%.csv}_bugs.md"
 
 trusted_arg=()
@@ -47,14 +50,24 @@ if [[ "${SHUFFLE:-0}" == "1" || "${SHUFFLE:-false}" == "true" ]]; then
   shuffle_arg=(--shuffle)
 fi
 
-pinned_exec cargo run --release -p blossom-lab --bin blossom-lab-epoch-chaos -- \
+reconciliation_arg=()
+if [[ "${REQUIRE_RECONCILIATION:-0}" == "1" || "${REQUIRE_RECONCILIATION:-false}" == "true" ]]; then
+  reconciliation_arg=(--require-reconciliation)
+fi
+
+observer_arg=()
+if [[ -n "${OBSERVER_ADDR:-}" ]]; then
+  observer_arg=(--observer-addr "$OBSERVER_ADDR")
+fi
+
+pinned_exec cargo run --release -p blossom-sim --bin blossom-sim-epoch-chaos -- \
   --nodes "${NODES:-36}" \
   --epochs "${EPOCHS:-4}" \
   --transactions-per-node "${TXS_PER_NODE:-16}" \
   --transaction-bytes "${TX_BYTES:-32}" \
   --latency-ms "${LATENCY_MS:-1}" \
   --jitter-ms "${JITTER_MS:-0}" \
-  --round-timeout-ms "${ROUND_TIMEOUT_MS:-50}" \
+  --round-timeout-ms "${ROUND_TIMEOUT_MS:-0}" \
   --drop-ppm "${DROP_PPM:-0}" \
   --fuzz-ppm "${FUZZ_PPM:-0}" \
   --spike-ppm "${SPIKE_PPM:-0}" \
@@ -66,10 +79,14 @@ pinned_exec cargo run --release -p blossom-lab --bin blossom-lab-epoch-chaos -- 
   --seed "${EPOCH_CHAOS_SEED:-7308332182487356264}" \
   ${trusted_arg[@]+"${trusted_arg[@]}"} \
   ${shuffle_arg[@]+"${shuffle_arg[@]}"} \
+  ${reconciliation_arg[@]+"${reconciliation_arg[@]}"} \
+  ${observer_arg[@]+"${observer_arg[@]}"} \
   --csv "$summary" \
   --epoch-log "$epochs" \
+  --stage-log "$stages" \
   --bug-log "$bugs"
 
 echo "wrote $summary"
 echo "wrote $epochs"
+echo "wrote $stages"
 echo "wrote $bugs"

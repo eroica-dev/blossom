@@ -25,14 +25,21 @@ pub mod node;
 pub mod nonce;
 pub mod overlay;
 pub mod register;
+pub mod round_skip;
 pub mod runtime;
 pub mod service_client;
 pub mod state;
 pub mod tcp;
+pub mod telemetry;
 pub mod wire;
 
 pub use address_book::{AddressBook, Service, ServiceKind};
-pub use algorithm::{QUORUM_SIZE, SUPERMAJORITY};
+pub use algorithm::{
+    QUORUM_SIZE, SUPERMAJORITY, byzantine_fault_bound, distinct_current_validator_count,
+    has_distinct_supermajority, has_supermajority, max_liveness_omissions,
+    min_supermajority_intersection, supermajority_count, supermajority_has_honest_overlap,
+    supermajority_order_statistic,
+};
 #[cfg(feature = "availability-gossip")]
 pub use availability::{
     AvailabilityEntry, AvailabilityGossip, AvailabilityGossipBody, AvailabilityReceipt,
@@ -72,6 +79,12 @@ pub use node::{NodeIdentity, NodeType};
 pub use nonce::Nonce;
 pub use overlay::{BroadcastReceipt, BroadcastReport, FanOutStrategy, OverlayRuntime};
 pub use register::{MessageMatrix, QuorumQueue, Status};
+pub use round_skip::{
+    DataDisseminationManifest, DataDisseminationManifestValidation, FutureRoundAssistDecision,
+    FutureRoundAssistInput, FutureRoundAssistKind, RoundSkipCertificate,
+    RoundSkipCertificateValidation, RoundSkipVote, future_round_assist_decision,
+    skipped_round_assist_decision,
+};
 pub use runtime::{
     AcceptedBlock, EpochTarget, MessageReceipt, MultiGroupRuntime, NodeRuntime, NodeStatus,
     ObservedEncounterRecord, PeerApplicationState, RuntimeConfig, RuntimeMode, TrustMode,
@@ -88,6 +101,10 @@ pub use state::{
 pub use tcp::{
     TcpConnection, TcpMultiGroupNode, TcpNode, send_wire_frame, send_wire_request,
     send_wire_request_raw_response,
+};
+pub use telemetry::{
+    InMemoryTelemetrySink, JsonlTcpTelemetrySink, JsonlTcpTelemetrySinkConfig, NoopTelemetrySink,
+    TELEMETRY_SCHEMA_VERSION, TelemetryEvent, TelemetryEventKind, TelemetryHandle, TelemetrySink,
 };
 pub use wire::{
     AddressBookUpdate, EncodedFrame, FRAME_PREFIX_BYTES, HOT_WIRE_CODEC_ENV, HotDispatch,

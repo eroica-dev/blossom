@@ -19,6 +19,7 @@ clap = { version = "4.5", features = ["derive", "env"] }
 ed25519-dalek = { version = "2.2.0", features = ["batch", "hazmat", "rand_core"] }
 hex = { version = "0.4.3", features = ["serde"] }
 indextreemap = "0.2.0"
+itoa = "1.0.15"
 log = "0.4.28"
 rand_core = { version = "0.6.4", features = ["getrandom"] }
 rs_merkle = "1.5.0"
@@ -33,10 +34,17 @@ xxhash-rust = { version = "0.8.15", features = ["xxh3"], optional = true }
 criterion = "0.7.0"
 env_logger = "0.11.8"
 
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(kani)"] }
+
 [[bench]]
 name = "protocol"
 harness = false
 
 [workspace]
-members = [".", "crates/blossom-lab"]
+members = [
+    ".",
+    "crates/blossom-observer",
+    "crates/blossom-sim",
+]
 resolver = "3"

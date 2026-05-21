@@ -391,6 +391,7 @@ pub struct TempQuorum {
     pub proposals: PropCount,
     pub proposal_sent: bool,
     pub commit_senders: BTreeSet<PubKey>,
+    pub commit_true_senders: BTreeSet<PubKey>,
     pub commit_sent: bool,
     pub epoch_started_senders: BTreeSet<PubKey>,
     pub round_status: Option<u128>,
@@ -516,6 +517,11 @@ impl TempQuorum {
                     if self.verified_blocks.contains_key(sent_block_hash) {
                         continue;
                     }
+                    if block.body.last_epoch != dispatch.header.last_epoch
+                        || block.body.nonce != dispatch.header.nonce
+                    {
+                        continue;
+                    }
                     let block_ok = if verify_signatures {
                         block.verify_integrity_with_hash(*sent_block_hash).is_ok()
                     } else {
@@ -586,9 +592,12 @@ pub struct VerifCount {
 
 impl VerifCount {
     pub fn record(&mut self, verification: Verification) {
-        *self.count.entry(verification.body.blocks_hash).or_default() += 1;
-        self.verifications
-            .insert(verification.header.sender, verification);
+        let sender = verification.header.sender;
+        let blocks_hash = verification.body.blocks_hash;
+        if let Some(previous) = self.verifications.insert(sender, verification) {
+            decrement_count_u8(&mut self.count, previous.body.blocks_hash);
+        }
+        *self.count.entry(blocks_hash).or_default() += 1;
     }
 
     pub fn consensus_hash(&self) -> Option<HashType> {
@@ -607,6 +616,19 @@ pub struct PropCount {
 }
 
 impl PropCount {
+    pub fn record(&mut self, proposal: Proposal) {
+        let sender = proposal.header.sender;
+        let approved_hash = proposal.body.approved_hash;
+        if let Some(previous) = self.proposals.insert(sender, proposal) {
+            if let Some(previous_hash) = previous.body.approved_hash {
+                decrement_count_u32(&mut self.count, previous_hash);
+            }
+        }
+        if let Some(hash) = approved_hash {
+            *self.count.entry(hash).or_default() += 1;
+        }
+    }
+
     pub fn consensus(&self) -> Option<bool> {
         let len = self.proposals.len() as u32;
         if len < self.supermajority {
@@ -624,6 +646,30 @@ impl PropCount {
         }
 
         if still_possible { None } else { Some(false) }
+    }
+}
+
+fn decrement_count_u8(counts: &mut BTreeMap<HashType, u8>, hash: HashType) {
+    match counts.entry(hash) {
+        std::collections::btree_map::Entry::Occupied(mut entry) if *entry.get() > 1 => {
+            *entry.get_mut() -= 1;
+        }
+        std::collections::btree_map::Entry::Occupied(entry) => {
+            entry.remove();
+        }
+        std::collections::btree_map::Entry::Vacant(_) => {}
+    }
+}
+
+fn decrement_count_u32(counts: &mut BTreeMap<HashType, u32>, hash: HashType) {
+    match counts.entry(hash) {
+        std::collections::btree_map::Entry::Occupied(mut entry) if *entry.get() > 1 => {
+            *entry.get_mut() -= 1;
+        }
+        std::collections::btree_map::Entry::Occupied(entry) => {
+            entry.remove();
+        }
+        std::collections::btree_map::Entry::Vacant(_) => {}
     }
 }
 
@@ -773,6 +819,7 @@ pub fn init_quorum(quorum: u32, peers: &[PubKey], self_key: &PubKey) -> TempQuor
         proposals: init_proposals(quorum),
         proposal_sent: false,
         commit_senders: BTreeSet::new(),
+        commit_true_senders: BTreeSet::new(),
         commit_sent: false,
         epoch_started_senders: BTreeSet::new(),
         round_status: None,
@@ -1001,6 +1048,7 @@ mod tests {
         let dispatch = Dispatch {
             header: Header {
                 sender: keypair.public,
+                nonce: Nonce::new(1),
                 signature: Signature::default(),
                 ..Default::default()
             },
@@ -1088,6 +1136,7 @@ mod tests {
     fn quorum_verify_skips_already_verified_blocks() {
         let keypair = Keypair::generate();
         let mut block = Block::default();
+        block.body.last_epoch = HashType([2; 32]);
         block.body.nonce = Nonce::new(1);
         block.body.txs.push(Transaction::new("tx"));
         block.sign(&keypair.secret);
@@ -1096,6 +1145,8 @@ mod tests {
         let dispatch = Dispatch {
             header: Header {
                 sender: keypair.public,
+                last_epoch: HashType([2; 32]),
+                nonce: Nonce::new(1),
                 signature: Signature::default(),
                 ..Default::default()
             },
@@ -1118,6 +1169,45 @@ mod tests {
 
         assert_eq!(quorum.verified_blocks.len(), 1);
         assert_eq!(quorum.timers.verified_tx, 1);
+    }
+
+    #[test]
+    fn quorum_verify_rejects_dispatch_blocks_for_different_epoch_target() {
+        let keypair = Keypair::generate();
+        let mut block = Block::default();
+        block.body.last_epoch = HashType([2; 32]);
+        block.body.nonce = Nonce::new(2);
+        block.body.txs.push(Transaction::new("tx"));
+        block.sign(&keypair.secret);
+        let mut blocks = BTreeMap::new();
+        blocks.insert(block.hash, block);
+        let dispatch = Dispatch {
+            header: Header {
+                sender: keypair.public,
+                last_epoch: HashType([2; 32]),
+                nonce: Nonce::new(1),
+                signature: Signature::default(),
+                ..Default::default()
+            },
+            body: DispatchBody {
+                blocks_hash: blocks.hash(),
+                blocks,
+                signature_tree: SignatureTree::default(),
+                signature_tree_hash: SignatureTree::default().hash(),
+            },
+        };
+        let mut quorum = TempQuorum {
+            pending_dispatches: vec![PendingDispatch::Decoded(dispatch)],
+            ..Default::default()
+        };
+
+        quorum.verify();
+
+        assert!(quorum.verified_blocks.is_empty());
+        assert_eq!(
+            quorum.verified_blocks_hash,
+            Some(BTreeMap::<HashType, Block>::new().hash())
+        );
     }
 
     #[test]
@@ -1264,37 +1354,98 @@ mod tests {
         assert_eq!(count.consensus(), None);
 
         for index in 0..4 {
-            count.proposals.insert(
-                PubKey([index; 32]),
-                Proposal {
-                    header: Header {
-                        sender: PubKey([index; 32]),
-                        ..Default::default()
-                    },
-                    body: ProposalBody {
-                        consensus: true,
-                        approved_hash: Some(approved),
-                        ..Default::default()
-                    },
+            count.record(Proposal {
+                header: Header {
+                    sender: PubKey([index; 32]),
+                    ..Default::default()
                 },
-            );
-            *count.count.entry(approved).or_default() += 1;
+                body: ProposalBody {
+                    consensus: true,
+                    approved_hash: Some(approved),
+                    ..Default::default()
+                },
+            });
         }
         assert_eq!(count.consensus(), Some(true));
 
         let mut failed = init_proposals(6);
         for index in 0..4 {
-            failed.proposals.insert(
-                PubKey([index; 32]),
-                Proposal {
-                    header: Header {
-                        sender: PubKey([index; 32]),
-                        ..Default::default()
-                    },
-                    body: ProposalBody::default(),
+            failed.record(Proposal {
+                header: Header {
+                    sender: PubKey([index; 32]),
+                    ..Default::default()
                 },
-            );
+                body: ProposalBody::default(),
+            });
         }
         assert_eq!(failed.consensus(), Some(false));
+    }
+
+    #[test]
+    fn verification_count_replaces_duplicate_sender_vote() {
+        let mut count = init_verifications(6);
+        let first = HashType([3; 32]);
+        let second = HashType([4; 32]);
+        let sender = PubKey([1; 32]);
+
+        count.record(Verification {
+            header: Header {
+                sender,
+                ..Default::default()
+            },
+            body: VerificationBody {
+                blocks_hash: first,
+                blocks: BTreeMap::new(),
+            },
+        });
+        count.record(Verification {
+            header: Header {
+                sender,
+                ..Default::default()
+            },
+            body: VerificationBody {
+                blocks_hash: second,
+                blocks: BTreeMap::new(),
+            },
+        });
+
+        assert_eq!(count.count.get(&first), None);
+        assert_eq!(count.count.get(&second), Some(&1));
+        assert_eq!(count.verifications.len(), 1);
+    }
+
+    #[test]
+    fn proposal_count_replaces_duplicate_sender_vote() {
+        let mut count = init_proposals(6);
+        let first = HashType([3; 32]);
+        let second = HashType([4; 32]);
+        let sender = PubKey([1; 32]);
+
+        count.record(Proposal {
+            header: Header {
+                sender,
+                ..Default::default()
+            },
+            body: ProposalBody {
+                consensus: true,
+                approved_hash: Some(first),
+                ..Default::default()
+            },
+        });
+        count.record(Proposal {
+            header: Header {
+                sender,
+                ..Default::default()
+            },
+            body: ProposalBody {
+                consensus: true,
+                approved_hash: Some(second),
+                ..Default::default()
+            },
+        });
+
+        assert_eq!(count.count.get(&first), None);
+        assert_eq!(count.count.get(&second), Some(&1));
+        assert_eq!(count.proposals.len(), 1);
     }
 }

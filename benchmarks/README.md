@@ -13,11 +13,11 @@ test suite.
 | `harness-matrix` | Shell matrix over harness parameters | How does the full scenario change with node count and transaction count? |
 | `load` | Large local TCP simulation | What happens when a block carries hundreds of thousands or millions of transactions, and how many framed bytes move? |
 | `gossip` | Local TCP availability-gossip simulation | How many rounds, messages, bytes, and microseconds does filtered-payload gossip plus fetch take? |
-| `chaos` | `blossom-lab` TCP harness with fault injection | How does the wire layer behave with controlled latency, jitter, drops, and connection crashes? |
-| `epoch-chaos` | `blossom-lab` epoch convergence under transport faults | How many nodes finish on the correct epoch hash after jitter, long delays, spikes, drops, and fuzz? |
-| `lab-fuzz` | `blossom-lab` deterministic node I/O fuzzing | Do valid, malformed, truncated, oversized, and random frames leave nodes alive? |
-| `lab-sim` | `blossom-lab` hermetic simulator | Can we replay latency, node down/up, and seeded drops without kernel/socket timing? |
-| `lab-container` | VM-like container runner for `blossom-lab` | Can we run the lab in a contained process/network boundary with only results mounted out? |
+| `chaos` | `blossom-sim` TCP harness with fault injection | How does the wire layer behave with controlled latency, jitter, drops, and connection crashes? |
+| `epoch-chaos` | `blossom-sim` epoch convergence under transport faults | How many nodes finish on the correct epoch hash after jitter, long delays, spikes, drops, and fuzz? |
+| `sim-fuzz` | `blossom-sim` deterministic node I/O fuzzing | Do valid, malformed, truncated, oversized, and random frames leave nodes alive? |
+| `sim-hermetic` | `blossom-sim` hermetic simulator | Can we replay latency, node down/up, and seeded drops without kernel/socket timing? |
+| `sim-container` | VM-like container runner for `blossom-sim` | Can we run simulations in a contained process/network boundary with only results mounted out? |
 | `epoch-depth` | In-memory protocol simulation | How do paper-aligned quorum rounds behave across consecutive epochs? |
 
 ## Commands
@@ -68,7 +68,7 @@ Run deterministic failure-mode probes:
 ./benchmarks/scripts/run-gossip-failures.sh
 ```
 
-Run the enclosed TCP chaos harness from the `blossom-lab` crate:
+Run the enclosed TCP chaos harness from the `blossom-sim` crate:
 
 ```bash
 LATENCY_MS=5 JITTER_MS=2 DROP_PPM=10000 CONNECT_CRASH_PPM=5000 \
@@ -76,11 +76,11 @@ LATENCY_MS=5 JITTER_MS=2 DROP_PPM=10000 CONNECT_CRASH_PPM=5000 \
   DATA_PATTERN=splitmix ./benchmarks/scripts/run-chaos.sh
 ```
 
-Run deterministic node I/O fuzzing from the `blossom-lab` crate:
+Run deterministic node I/O fuzzing from the `blossom-sim` crate:
 
 ```bash
 CASES=512 MAX_PAYLOAD_BYTES=8192 DATA_PATTERN=splitmix \
-  ./benchmarks/scripts/run-lab-fuzz.sh
+  ./benchmarks/scripts/run-sim-fuzz.sh
 ```
 
 Run deterministic epoch convergence under TCP-like jitter, delay spikes, drops,
@@ -98,7 +98,7 @@ Run a hermetic, socket-free simulation with slow nodes and node down/up:
 
 ```bash
 SLOW_NODES=2,3 SLOW_LATENCY_MS=50 DOWN_NODES=4 DOWN_AT_MS=10 \
-  UP_AT_MS=60 REQUESTS=100 PAYLOAD_BYTES=256 ./benchmarks/scripts/run-lab-sim.sh
+  UP_AT_MS=60 REQUESTS=100 PAYLOAD_BYTES=256 ./benchmarks/scripts/run-sim-hermetic.sh
 ```
 
 Run the same scenario with deterministic auto-restart instead of an absolute
@@ -106,7 +106,7 @@ return time:
 
 ```bash
 DOWN_NODES=4 DOWN_AT_MS=10 RESTART_AFTER_MS=50 \
-  REQUESTS=100 PAYLOAD_BYTES=256 ./benchmarks/scripts/run-lab-sim.sh
+  REQUESTS=100 PAYLOAD_BYTES=256 ./benchmarks/scripts/run-sim-hermetic.sh
 ```
 
 Run the same simulation with a bug-candidate latency budget:
@@ -114,27 +114,27 @@ Run the same simulation with a bug-candidate latency budget:
 ```bash
 BUG_LATENCY_BUDGET_MS=40 SLOW_NODES=2,3 SLOW_LATENCY_MS=50 \
   DOWN_NODES=4 DOWN_AT_MS=10 UP_AT_MS=60 \
-  REQUESTS=100 PAYLOAD_BYTES=256 ./benchmarks/scripts/run-lab-sim.sh
+  REQUESTS=100 PAYLOAD_BYTES=256 ./benchmarks/scripts/run-sim-hermetic.sh
 ```
 
-Run the same lab modes inside a VM-like container boundary. The runtime
+Run the same simulation modes inside a VM-like container boundary. The runtime
 container has external networking disabled, a read-only root filesystem, all
 Linux capabilities dropped, and only `benchmarks/results/` mounted as writable
-state. When Docker is unavailable, `LAB_BACKEND=auto` falls back to the native
+state. When Docker is unavailable, `SIM_BACKEND=auto` falls back to the native
 hermetic backend for `sim`, which still has deterministic replay and no socket
 or wall-clock dependency:
 
 ```bash
 SLOW_NODES=2,3 SLOW_LATENCY_MS=50 DOWN_NODES=4 DOWN_AT_MS=10 \
   UP_AT_MS=60 REQUESTS=100 PAYLOAD_BYTES=256 \
-  ./benchmarks/scripts/run-lab-container.sh sim
+  ./benchmarks/scripts/run-sim-container.sh sim
 ```
 
 Run real TCP chaos inside that contained environment:
 
 ```bash
 MODE=chaos LATENCY_MS=5 JITTER_MS=2 DROP_PPM=10000 REQUESTS=1000 \
-  ./benchmarks/scripts/run-lab-container.sh
+  ./benchmarks/scripts/run-sim-container.sh
 ```
 
 Run a longer gossip soak. The default duration is 30 minutes:
@@ -165,6 +165,14 @@ Run a paper-aligned epoch-depth benchmark:
 ```bash
 EPOCH_DEPTH=3 NODES=36 TXS_PER_NODE=1000 TX_BYTES=32 \
   ./benchmarks/scripts/run-epoch-depth.sh
+```
+
+Run the 100-epoch latency/quorum matrix. By default this tests quorum sizes
+`3`, `4`, `5`, and `6` with `q*q` nodes, trusted and trustless paths, and both
+fixed/even and deterministic random pairwise latency:
+
+```bash
+./benchmarks/scripts/run-epoch-latency-matrix.sh
 ```
 
 Add block-header application-state load to either harness:
@@ -278,7 +286,7 @@ not throughput reporting. `run-gossip-matrix.sh` always enables the completion
 assertion, while `run-gossip-failures.sh` intentionally checks an incomplete
 blackout scenario.
 
-`run-chaos.sh` runs the separate `crates/blossom-lab` package, which depends on
+`run-chaos.sh` runs the separate `crates/blossom-sim` package, which depends on
 the public Blossom crate and wraps the simulated TCP cluster with deterministic
 fault injection. `LATENCY_MS` is applied as one-way delay before request write
 and before response read; `JITTER_MS` adds deterministic per-request jitter to
@@ -289,7 +297,7 @@ inside each node I/O request. Supported data patterns are `zero`,
 `incrementing`, `alternating`, and `splitmix`. The CSV records successes,
 failures, injected delay, dropped attempts, and connection-crash counts.
 
-`run-lab-fuzz.sh` feeds deterministic raw TCP inputs into node I/O. It cycles
+`run-sim-fuzz.sh` feeds deterministic raw TCP inputs into node I/O. It cycles
 through valid pings, random framed payloads, zero-length frames, oversized
 length prefixes, truncated payloads, and partial prefixes. The runner checks
 that the node still answers health after the fuzz corpus. `FUZZ_SEED`,
@@ -300,13 +308,19 @@ and controllable.
 real Blossom block, hash, transaction, and topology primitives, then runs
 message propagation through a TCP-like logical transport with
 `LATENCY_MS`, `JITTER_MS`, `ROUND_TIMEOUT_MS`, `DROP_PPM`, `FUZZ_PPM`,
-`SPIKE_PPM`, and `SPIKE_LATENCY_MS`. A message whose sampled latency exceeds
-the round timeout is recorded as late and ignored for that round; a fuzzed
-message is treated as corrupted and discarded. The summary CSV reports
+`SPIKE_PPM`, and `SPIKE_LATENCY_MS`. `ROUND_TIMEOUT_MS=0` is the default and
+disables the round-latency cutoff, which lets the model exercise distance
+without turning latency into packet loss. A positive `ROUND_TIMEOUT_MS` records
+messages whose sampled latency exceeds the timeout as late and ignores them for
+that round; a fuzzed message is treated as corrupted and discarded. The summary
+CSV reports
 `final_correct_nodes`, `final_incorrect_nodes`, `final_unique_epoch_hashes`,
 and final canonical epoch hash/nonce. The per-epoch CSV shows where divergence
-first appears, and the Markdown bug log records replay details and convergence
-bug candidates.
+first appears. The stage-progress CSV emits one row per modeled protocol
+checkpoint, including block formation, membership/topology selection, each
+dispatch round, recovery rounds, reconciliation rounds, and finality, so a run
+can be inspected by stage without reconstructing it from aggregate counters. The
+Markdown bug log records replay details and convergence bug candidates.
 
 `REPAIR_ROUNDS` enables restart catch-up in the epoch-chaos model. Each
 incorrect node pings `REPAIR_FANOUT` deterministic random peers, receives only
@@ -315,9 +329,17 @@ their epoch hash/nonce summary, and adopts a state only after
 network supermajority for the configured node count; a fanout value of `0`
 means all known peers. After the handshake quorum forms, the node performs one
 modeled catch-up fetch from a peer in that quorum; that fetch is also subject
-to latency, drops, fuzzing, spikes, and `REPAIR_TIMEOUT_MS`.
+to latency, drops, fuzzing, spikes, and `REPAIR_TIMEOUT_MS`. If no certified
+summary quorum exists, the model falls back to block-set reconciliation: nodes
+gather validator-signed source blocks for the contested parent and nonce across
+repair rounds, then rebuild the canonical epoch once the deterministic source
+set is available. Set `REQUIRE_RECONCILIATION=1` to make the runner fail
+nonzero unless the run exercises at least one divergent epoch, executes
+reconciliation rounds, and finishes every divergent epoch with all nodes on one
+canonical hash. Set `OBSERVER_ADDR=host:port` to export per-node stage spans to
+a running `blossom-observer` service while the epoch-chaos run executes.
 
-`run-lab-sim.sh` is the hermetic path. It does not open sockets and does not use
+`run-sim-hermetic.sh` is the hermetic path. It does not open sockets and does not use
 wall-clock sleeps. Instead it runs virtual nodes through a deterministic event
 queue with logical time. `SLOW_NODES`, `SLOW_AT_MS`, and `SLOW_LATENCY_MS`
 change inbound latency for a collection of nodes; `DOWN_NODES`, `DOWN_AT_MS`,
@@ -332,16 +354,16 @@ candidates for protocol errors, unexpected drops, unavailable nodes, accounting
 mismatches, and requests that exceed `BUG_LATENCY_BUDGET_MS` when that budget is
 set.
 
-`run-lab-container.sh` can use `LAB_BACKEND=docker`, `LAB_BACKEND=native`, or
-the default `LAB_BACKEND=auto`. The Docker backend builds
-`crates/blossom-lab/container/Dockerfile` and runs one of the same lab modes
+`run-sim-container.sh` can use `SIM_BACKEND=docker`, `SIM_BACKEND=native`, or
+the default `SIM_BACKEND=auto`. The Docker backend builds
+`crates/blossom-sim/container/Dockerfile` and runs one of the same simulation modes
 (`sim`, `chaos`, `fuzz`, or `all`) in a contained runtime. By default the
 container runs with `--network none`, `--read-only`, `--cap-drop ALL`,
 `--security-opt no-new-privileges`, and a `/tmp` tmpfs. This is not a full
-hardware VM, but it gives the lab a VM-like boundary: no external network path,
+hardware VM, but it gives the simulator a VM-like boundary: no external network path,
 no writable source tree, no ambient Linux capabilities, and a single mounted
 results directory. Set `MEMORY`, `CPUS`, or `SERVER_CPUSET` to constrain
-resources, `BLOSSOM_LAB_FEATURES` to build crate features into the image, and
+resources, `BLOSSOM_SIM_FEATURES` to build crate features into the image, and
 `DRY_RUN=1` to print the Docker commands without executing them.
 
 The native backend exists for machines where Docker is unavailable. It is

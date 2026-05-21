@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 #[cfg(feature = "availability-gossip")]
 use blossom::{
@@ -6,12 +6,12 @@ use blossom::{
     FilteredPayloadFetch, FilteredPayloadFetchBody,
 };
 use blossom::{
-    Block, BlossomBody, Commit, CommitBody, ConsensusGroupId, Dispatch, EchoReDispatch,
-    EchoRequest, EchoResponse, EchoResponseBody, EpochStarted, EpochStartedBody, EpochTarget,
-    FanOutStrategy, HashType, Header, MSGKey, MockBlockService, Msg, NodePing, Nonce,
-    OverlayRuntime, Proposal, ProposalBody, ServiceKind, Signature, SimulatedCluster,
-    TcpServiceClient, Transaction, TrustMode, Verification, VerificationBody, WireRequest,
-    WireResponse,
+    Block, BlossomBody, Commit, CommitBody, ConsensusGroupId, Dispatch, DispatchBody,
+    EchoReDispatch, EchoRequest, EchoResponse, EchoResponseBody, EpochStarted, EpochStartedBody,
+    EpochTarget, FanOutStrategy, HashType, Header, Keypair, MSGKey, MockBlockService, Msg,
+    NodePing, Nonce, OverlayRuntime, Proposal, ProposalBody, ServiceKind, Signature,
+    SimulatedCluster, TcpServiceClient, Transaction, TrustMode, Verification, VerificationBody,
+    WireRequest, WireResponse,
 };
 use blossom::{DoHash, EncodedFrame, NodeIdentity};
 
@@ -214,6 +214,61 @@ async fn block_submission_duplicate_rejection_send_block_and_dispatch_are_end_to
         WireResponse::Ok => {}
         response => panic!("expected send block ok, got {}", response.kind()),
     }
+}
+
+#[tokio::test]
+async fn all_validators_form_blocks_for_the_same_epoch_target() {
+    let cluster = SimulatedCluster::spawn(6).await.unwrap();
+    let first_target = cluster.next_target(0).await.unwrap();
+    let mut validators = BTreeSet::new();
+    let mut block_hashes = BTreeSet::new();
+
+    for index in 0..cluster.len() {
+        let target = cluster.next_target(index).await.unwrap();
+        assert_eq!(target.last_epoch, first_target.last_epoch);
+        assert_eq!(target.nonce, first_target.nonce);
+
+        let block = cluster
+            .signed_block_for(
+                index,
+                index,
+                [Transaction::new(format!("validator-{index}"))],
+            )
+            .await
+            .unwrap();
+        match cluster
+            .request(index, WireRequest::SubmitBlock(block.clone()))
+            .await
+            .unwrap()
+        {
+            WireResponse::BlockAccepted(accepted) => {
+                assert_eq!(accepted.hash, block.hash);
+                assert_eq!(accepted.nonce, first_target.nonce);
+            }
+            response => panic!("expected accepted block, got {}", response.kind()),
+        }
+
+        let dispatch = expect_dispatch(
+            cluster
+                .request(index, WireRequest::Dispatch { round: 0 })
+                .await,
+        );
+        assert_eq!(dispatch.header.last_epoch, first_target.last_epoch);
+        assert_eq!(dispatch.header.nonce, first_target.nonce);
+        assert_eq!(dispatch.body.blocks.len(), 1);
+        let dispatched_block = dispatch.body.blocks.values().next().unwrap();
+        assert_eq!(dispatched_block.body.last_epoch, first_target.last_epoch);
+        assert_eq!(dispatched_block.body.nonce, first_target.nonce);
+        assert_eq!(
+            dispatched_block.body.validator,
+            cluster.node(index).keypair.public
+        );
+        validators.insert(dispatched_block.body.validator);
+        block_hashes.insert(dispatched_block.hash);
+    }
+
+    assert_eq!(validators.len(), cluster.len());
+    assert_eq!(block_hashes.len(), cluster.len());
 }
 
 #[tokio::test]
@@ -513,19 +568,69 @@ async fn protocol_message_variants_are_accepted_over_tcp() {
         consensus: true,
         approved_blocks: Some(blocks.clone()),
         approved_hash: Some(blocks_hash),
-        verif: Some(vec![(sender.public_key(), verification.header.signature)]),
+        verif: Some(verification_proof_for_indices(
+            &cluster,
+            &dispatch,
+            &blocks,
+            &[0, 1, 2, 3],
+        )),
         signature_tree: Some(blocks.clone()),
         signature_tree_hash: Some(blocks.hash()),
     };
-    let proposal = Proposal {
-        header: signed_header(sender, &dispatch, MSGKey::Proposal, &proposal_body),
-        body: proposal_body,
+    for index in [0usize, 2, 3, 4] {
+        let proposal_sender = &cluster.node(index).identity;
+        let proposal = Proposal {
+            header: signed_header(proposal_sender, &dispatch, MSGKey::Proposal, &proposal_body),
+            body: proposal_body.clone(),
+        };
+        expect_receipt(
+            cluster
+                .request(1, WireRequest::Message(Msg::Proposal(proposal)))
+                .await,
+            "proposal",
+        );
+    }
+
+    let started_body = EpochStartedBody {};
+    let started = EpochStarted {
+        header: signed_header(sender, &dispatch, MSGKey::EpochStarted, &started_body),
+        body: started_body,
     };
     expect_receipt(
         cluster
-            .request(1, WireRequest::Message(Msg::Proposal(proposal)))
+            .request(1, WireRequest::Message(Msg::EpochStarted(started)))
             .await,
-        "proposal",
+        "epoch_started",
+    );
+
+    let echo_request = EchoRequest {
+        header: signed_header(sender, &dispatch, MSGKey::EchoRequest, &blocks),
+        requested_blocks: blocks.clone(),
+    };
+    expect_receipt(
+        cluster
+            .request(1, WireRequest::Message(Msg::EchoRequest(echo_request)))
+            .await,
+        "echo_request",
+    );
+
+    let echo_redispatch = EchoReDispatch {
+        header: signed_header(
+            sender,
+            &dispatch,
+            MSGKey::EchoReDispatch,
+            &dispatch.body.blocks,
+        ),
+        redispatched_blocks: dispatch.body.blocks.clone(),
+    };
+    expect_receipt(
+        cluster
+            .request(
+                1,
+                WireRequest::Message(Msg::EchoReDispatch(echo_redispatch)),
+            )
+            .await,
+        "echo_redispatch",
     );
 
     let commit_body = CommitBody {
@@ -543,43 +648,6 @@ async fn protocol_message_variants_are_accepted_over_tcp() {
         "commit",
     );
 
-    let started_body = EpochStartedBody {};
-    let started = EpochStarted {
-        header: signed_header(sender, &dispatch, MSGKey::EpochStarted, &started_body),
-        body: started_body,
-    };
-    expect_receipt(
-        cluster
-            .request(1, WireRequest::Message(Msg::EpochStarted(started)))
-            .await,
-        "epoch_started",
-    );
-
-    let echo_request = EchoRequest {
-        header: dispatch.header.clone(),
-        requested_blocks: blocks.clone(),
-    };
-    expect_receipt(
-        cluster
-            .request(1, WireRequest::Message(Msg::EchoRequest(echo_request)))
-            .await,
-        "echo_request",
-    );
-
-    let echo_redispatch = EchoReDispatch {
-        header: dispatch.header.clone(),
-        redispatched_blocks: dispatch.body.blocks.clone(),
-    };
-    expect_receipt(
-        cluster
-            .request(
-                1,
-                WireRequest::Message(Msg::EchoReDispatch(echo_redispatch)),
-            )
-            .await,
-        "echo_redispatch",
-    );
-
     expect_receipt(
         cluster.request(1, WireRequest::Message(Msg::Ok)).await,
         "ok",
@@ -588,6 +656,59 @@ async fn protocol_message_variants_are_accepted_over_tcp() {
         cluster.request(1, WireRequest::Message(Msg::Fail)).await,
         "fail",
     );
+}
+
+#[tokio::test]
+async fn tcp_consensus_messages_reject_wrong_round_members() {
+    let cluster = SimulatedCluster::spawn(6).await.unwrap();
+    let dispatch = local_dispatch(&cluster).await;
+    let sender = &cluster.node(0).identity;
+
+    for (label, message) in consensus_messages_for_round(sender, &dispatch, 1) {
+        expect_error_contains(
+            cluster.request(1, WireRequest::Message(message)).await,
+            "unknown sender",
+            label,
+        );
+    }
+}
+
+#[tokio::test]
+async fn tcp_consensus_messages_reject_non_members() {
+    let cluster = SimulatedCluster::spawn(6).await.unwrap();
+    let dispatch = local_dispatch(&cluster).await;
+    let unknown_keypair = Keypair::generate();
+    let unknown = NodeIdentity::new(
+        unknown_keypair.public,
+        Some(unknown_keypair.secret),
+        "tcp",
+        "127.0.0.1",
+        6553,
+        false,
+    );
+
+    for (label, message) in consensus_messages_for_round(&unknown, &dispatch, 0) {
+        expect_error_contains(
+            cluster.request(1, WireRequest::Message(message)).await,
+            "unknown sender",
+            label,
+        );
+    }
+}
+
+async fn local_dispatch(cluster: &SimulatedCluster) -> Dispatch {
+    let block = cluster
+        .signed_block_for(0, 0, [Transaction::new("admission-gate")])
+        .await
+        .unwrap();
+    assert!(matches!(
+        cluster
+            .request(0, WireRequest::SubmitBlock(block))
+            .await
+            .unwrap(),
+        WireResponse::BlockAccepted(_)
+    ));
+    expect_dispatch(cluster.request(0, WireRequest::Dispatch { round: 0 }).await)
 }
 
 fn expect_dispatch(response: blossom::Result<WireResponse>) -> Dispatch {
@@ -607,9 +728,176 @@ fn expect_receipt(response: blossom::Result<WireResponse>, kind: &str) {
     }
 }
 
+fn expect_error_contains(response: blossom::Result<WireResponse>, expected: &str, label: &str) {
+    match response.unwrap() {
+        WireResponse::Error(message) => assert!(
+            message.contains(expected),
+            "{label} error did not contain {expected:?}: {message}"
+        ),
+        response => panic!(
+            "expected {label} error containing {expected:?}, got {}",
+            response.kind()
+        ),
+    }
+}
+
+fn consensus_messages_for_round(
+    sender: &NodeIdentity,
+    dispatch: &Dispatch,
+    round: u8,
+) -> Vec<(&'static str, Msg)> {
+    let dispatch_body = DispatchBody::default();
+    let echo_body = EchoResponseBody::default();
+    let verification_body = VerificationBody::default();
+    let proposal_body = ProposalBody::default();
+    let commit_body = CommitBody::default();
+    let started_body = EpochStartedBody {};
+    let requested_blocks = BTreeMap::new();
+    let redispatched_blocks = BTreeMap::new();
+
+    vec![
+        (
+            "dispatch",
+            Msg::Dispatch(Dispatch {
+                header: signed_header_for_round(
+                    sender,
+                    dispatch,
+                    round,
+                    MSGKey::Dispatch,
+                    &dispatch_body,
+                ),
+                body: dispatch_body,
+            }),
+        ),
+        (
+            "echo_response",
+            Msg::EchoResponse(EchoResponse {
+                header: signed_header_for_round(
+                    sender,
+                    dispatch,
+                    round,
+                    MSGKey::EchoResponse,
+                    &echo_body,
+                ),
+                body: echo_body,
+            }),
+        ),
+        (
+            "verification",
+            Msg::Verification(Verification {
+                header: signed_header_for_round(
+                    sender,
+                    dispatch,
+                    round,
+                    MSGKey::Verification,
+                    &verification_body,
+                ),
+                body: verification_body,
+            }),
+        ),
+        (
+            "proposal",
+            Msg::Proposal(Proposal {
+                header: signed_header_for_round(
+                    sender,
+                    dispatch,
+                    round,
+                    MSGKey::Proposal,
+                    &proposal_body,
+                ),
+                body: proposal_body,
+            }),
+        ),
+        (
+            "commit",
+            Msg::Commit(Commit {
+                header: signed_header_for_round(
+                    sender,
+                    dispatch,
+                    round,
+                    MSGKey::Commit,
+                    &commit_body,
+                ),
+                body: commit_body,
+            }),
+        ),
+        (
+            "epoch_started",
+            Msg::EpochStarted(EpochStarted {
+                header: signed_header_for_round(
+                    sender,
+                    dispatch,
+                    round,
+                    MSGKey::EpochStarted,
+                    &started_body,
+                ),
+                body: started_body,
+            }),
+        ),
+        (
+            "echo_request",
+            Msg::EchoRequest(EchoRequest {
+                header: signed_header_for_round(
+                    sender,
+                    dispatch,
+                    round,
+                    MSGKey::EchoRequest,
+                    &requested_blocks,
+                ),
+                requested_blocks,
+            }),
+        ),
+        (
+            "echo_redispatch",
+            Msg::EchoReDispatch(EchoReDispatch {
+                header: signed_header_for_round(
+                    sender,
+                    dispatch,
+                    round,
+                    MSGKey::EchoReDispatch,
+                    &redispatched_blocks,
+                ),
+                redispatched_blocks,
+            }),
+        ),
+    ]
+}
+
+fn verification_proof_for_indices(
+    cluster: &SimulatedCluster,
+    dispatch: &Dispatch,
+    blocks: &BTreeMap<HashType, ()>,
+    signers: &[usize],
+) -> Vec<(blossom::PubKey, Signature)> {
+    let body = VerificationBody {
+        blocks_hash: blocks.hash(),
+        blocks: blocks.clone(),
+    };
+    signers
+        .iter()
+        .map(|index| {
+            let node = &cluster.node(*index).identity;
+            (
+                node.public_key(),
+                signed_header(node, dispatch, MSGKey::Verification, &body).signature,
+            )
+        })
+        .collect()
+}
+
 fn signed_header<T: BlossomBody>(
     sender: &NodeIdentity,
     dispatch: &Dispatch,
+    kind: MSGKey,
+    body: &T,
+) -> Header {
+    signed_header_for_round(sender, dispatch, dispatch.header.round, kind, body)
+}
+
+fn signed_header_for_round<T: BlossomBody>(
+    sender: &NodeIdentity,
+    dispatch: &Dispatch,
+    round: u8,
     kind: MSGKey,
     body: &T,
 ) -> Header {
@@ -617,7 +905,7 @@ fn signed_header<T: BlossomBody>(
         &sender.public_key(),
         &dispatch.header.last_epoch,
         dispatch.header.nonce,
-        dispatch.header.round,
+        round,
         kind,
         body,
     );
@@ -625,7 +913,7 @@ fn signed_header<T: BlossomBody>(
         sender: sender.public_key(),
         last_epoch: dispatch.header.last_epoch,
         nonce: dispatch.header.nonce,
-        round: dispatch.header.round,
+        round,
         signature: sender
             .sign(message_hash.as_ref())
             .unwrap_or_else(|_| Signature::default()),

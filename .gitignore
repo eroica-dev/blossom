@@ -2,6 +2,12 @@
 /benchmarks/results
 .DS_Store
 
+# Formal verification backend outputs
+_apalache-out/
+verification/creusot/thresholds/target/
+verification/creusot/thresholds/verif/
+verification/creusot/thresholds/.why3find/
+
 # LaTeX build outputs
 *.aux
 *.bbl

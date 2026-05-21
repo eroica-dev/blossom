@@ -35,7 +35,7 @@ if [[ "${TRUSTED:-0}" == "1" || "${TRUSTED:-false}" == "true" ]]; then
   trusted_arg=(--trusted)
 fi
 
-pinned_exec cargo run --release -p blossom-lab --bin blossom-lab-chaos -- \
+pinned_exec cargo run --release -p blossom-sim --bin blossom-sim-chaos -- \
   --nodes "${NODES:-6}" \
   --requests "${REQUESTS:-1000}" \
   --payload-bytes "${PAYLOAD_BYTES:-0}" \

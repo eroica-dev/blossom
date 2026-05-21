@@ -148,6 +148,12 @@ Before cutting into hot code paths, add a whitepaper-aligned epoch harness. The
 current hotspots are real for the current transport stress test, but optimizing
 them first risks improving a workload that the protocol is not supposed to run.
 
+The stage-by-stage closure plan now lives in
+`docs/protocol-stage-checklist.md`. Use that checklist as the implementation
+gate for protocol work: each stage needs a written spec, proof sketch, unit
+tests, runtime tests, TCP tests where applicable, and model tests before it is
+considered complete.
+
 The first version of that gate is `src/bin/blossom-epoch-bench.rs`. It adds
 `--epoch-depth` and `--target-transactions` so we can measure consecutive
 paper-shaped epochs instead of one oversized single-node dispatch. It is
