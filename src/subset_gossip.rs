@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use crate::algorithm::supermajority_order_statistic;
 use crate::availability::{
@@ -26,6 +26,23 @@ impl SubsetLatencyDistribution {
         match self {
             Self::Even => "even",
             Self::Random => "random",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SubsetPrefillMode {
+    None,
+    Random,
+    Scheduled,
+}
+
+impl SubsetPrefillMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Random => "random",
+            Self::Scheduled => "scheduled",
         }
     }
 }
@@ -89,6 +106,10 @@ pub struct SubsetGossipConfig {
     pub trusted: bool,
     pub shuffle: bool,
     pub repair_missing: bool,
+    pub prefill_mode: SubsetPrefillMode,
+    pub prefill_fanout: usize,
+    pub hash_advertise: bool,
+    pub drop_round0_dispatch: bool,
     pub latency: SubsetLatencyProfile,
 }
 
@@ -105,6 +126,10 @@ impl Default for SubsetGossipConfig {
             trusted: false,
             shuffle: false,
             repair_missing: true,
+            prefill_mode: SubsetPrefillMode::None,
+            prefill_fanout: 0,
+            hash_advertise: false,
+            drop_round0_dispatch: false,
             latency: SubsetLatencyProfile::default(),
         }
     }
@@ -157,6 +182,10 @@ pub struct SubsetGossipEpochRow {
     pub trusted: bool,
     pub shuffle: bool,
     pub repair_missing: bool,
+    pub prefill_mode: SubsetPrefillMode,
+    pub prefill_fanout: usize,
+    pub hash_advertise: bool,
+    pub drop_round0_dispatch: bool,
     pub latency_distribution: SubsetLatencyDistribution,
     pub latency_ms: u64,
     pub latency_min_ms: u64,
@@ -177,6 +206,14 @@ pub struct SubsetGossipEpochRow {
     pub subset_repair_batches: usize,
     pub subset_repair_bytes: usize,
     pub subset_repair_latency_ms: u64,
+    pub prefill_recipients: usize,
+    pub prefill_expected_hashes: usize,
+    pub prefill_bytes: usize,
+    pub hash_advertise_messages: usize,
+    pub hash_advertise_bytes: usize,
+    pub duplicate_suppressed_blocks: usize,
+    pub modeled_prefill_latency_ms: u64,
+    pub modeled_hash_advertise_latency_ms: u64,
     pub modeled_finality_latency_ms: u64,
     pub modeled_dispatch_latency_ms: u64,
     pub modeled_control_latency_ms: u64,
@@ -263,6 +300,28 @@ impl NodeSubsetState {
     ) -> usize {
         match self.blocks.get_mut(owner) {
             Some(Some(existing)) => existing.or_intersection_assign_count(sender_full, target_mask),
+            Some(slot @ None) => {
+                let (incoming, count) =
+                    PayloadMask::intersection_with_count(sender_full, target_mask);
+                if count > 0 {
+                    *slot = Some(incoming);
+                }
+                count
+            }
+            None => 0,
+        }
+    }
+
+    fn merge_missing_targeted_payloads(
+        &mut self,
+        owner: usize,
+        sender_full: &PayloadMask,
+        target_mask: &PayloadMask,
+    ) -> usize {
+        match self.blocks.get_mut(owner) {
+            Some(Some(existing)) => {
+                existing.or_missing_intersection_assign_count(sender_full, target_mask)
+            }
             Some(slot @ None) => {
                 let (incoming, count) =
                     PayloadMask::intersection_with_count(sender_full, target_mask);
@@ -394,6 +453,20 @@ impl PayloadMask {
         count
     }
 
+    fn or_missing_intersection_assign_count(&mut self, left: &Self, right: &Self) -> usize {
+        debug_assert_eq!(self.len, left.len);
+        debug_assert_eq!(left.len, right.len);
+        let mut count = 0usize;
+        for ((target, left_word), right_word) in
+            self.words.iter_mut().zip(&left.words).zip(&right.words)
+        {
+            let word = left_word & right_word & !*target;
+            count += word.count_ones() as usize;
+            *target |= word;
+        }
+        count
+    }
+
     fn indices(&self) -> impl Iterator<Item = usize> + '_ {
         self.words
             .iter()
@@ -425,15 +498,27 @@ impl PayloadMask {
 
 #[derive(Debug, Clone, Copy, Default)]
 struct EpochByteTotals {
+    prefill_bytes: usize,
     full_dispatch_bytes: usize,
     subset_dispatch_bytes: usize,
+    hash_advertise_bytes: usize,
     control_bytes: usize,
+    hash_advertise_messages: usize,
+    duplicate_suppressed_blocks: usize,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
 struct EpochLatencyTotals {
+    prefill_ms: u64,
     dispatch_ms: u64,
+    hash_advertise_ms: u64,
     control_ms: u64,
+}
+
+#[derive(Debug, Clone, Default)]
+struct PrefillPlan {
+    recipients_by_sender: Vec<Vec<usize>>,
+    expected_by_node: HashMap<PubKey, BTreeSet<HashType>>,
 }
 
 pub fn run_subset_gossip(config: SubsetGossipConfig) -> Result<SubsetGossipReport> {
@@ -493,12 +578,25 @@ fn run_subset_epoch(
     let signature_tree_len = encoded_len(&SignatureTree::default())?;
     let mut byte_totals = EpochByteTotals::default();
     let mut latency_totals = EpochLatencyTotals::default();
+    let prefill_plan = build_prefill_plan(epoch, config, nodes, &blocks, &topology);
+    apply_prefill(
+        config,
+        nodes,
+        &blocks,
+        &prefill_plan,
+        header_len,
+        signature_tree_len,
+        &mut subset_states,
+        &mut byte_totals,
+        &mut latency_totals,
+    )?;
 
     for (round, quorums) in topology.iter().enumerate() {
         let before_full = full_known.clone();
         let before_subset = subset_states.clone();
         let mut next_full = full_known.clone();
         let mut next_subset = subset_states.clone();
+        let drop_dispatch_round = config.drop_round0_dispatch && round == 0;
         let full_dispatch_len_by_sender = before_full
             .iter()
             .map(|known_blocks| {
@@ -520,8 +618,14 @@ fn run_subset_epoch(
             .collect::<Result<Vec<_>>>()?;
 
         for quorum in quorums {
+            if drop_dispatch_round {
+                continue;
+            }
             let stage_latency = quorum_stage_finality_latency_ms(quorum, config.latency);
             latency_totals.dispatch_ms += stage_latency;
+            if config.hash_advertise {
+                latency_totals.hash_advertise_ms += stage_latency;
+            }
             if !config.trusted {
                 latency_totals.control_ms += stage_latency * 4;
                 byte_totals.control_bytes += control_bytes_for_quorum(
@@ -542,6 +646,13 @@ fn run_subset_epoch(
                     }
 
                     byte_totals.full_dispatch_bytes += full_dispatch_len_by_sender[*sender];
+                    if config.hash_advertise {
+                        byte_totals.hash_advertise_messages += 1;
+                        byte_totals.hash_advertise_bytes += hash_advertise_len_for_block_count(
+                            header_len,
+                            before_subset[*sender].known_block_count(),
+                        )?;
+                    }
 
                     let mut subset_block_count = 0usize;
                     let mut subset_block_bytes = 0usize;
@@ -550,13 +661,27 @@ fn run_subset_epoch(
                         else {
                             continue;
                         };
-                        subset_block_count += 1;
                         let target_mask = &block.target_masks[*recipient];
-                        let full_count = next_subset[*recipient].merge_targeted_payloads(
-                            block.owner,
-                            sender_full,
-                            target_mask,
-                        );
+                        let recipient_had_metadata =
+                            before_subset[*recipient].blocks[block.owner].is_some();
+                        let full_count = if config.hash_advertise {
+                            next_subset[*recipient].merge_missing_targeted_payloads(
+                                block.owner,
+                                sender_full,
+                                target_mask,
+                            )
+                        } else {
+                            next_subset[*recipient].merge_targeted_payloads(
+                                block.owner,
+                                sender_full,
+                                target_mask,
+                            )
+                        };
+                        if config.hash_advertise && recipient_had_metadata && full_count == 0 {
+                            byte_totals.duplicate_suppressed_blocks += 1;
+                            continue;
+                        }
+                        subset_block_count += 1;
                         subset_block_bytes +=
                             block.tombstone_block_len + (full_count * config.command_bytes);
                         if full_count == 0
@@ -617,10 +742,16 @@ fn run_subset_epoch(
     let metadata_converged = metadata_converged_nodes == config.nodes;
 
     let modeled_finality_latency_ms = latency_totals.dispatch_ms + latency_totals.control_ms;
-    let subset_payload_ready_latency_ms = modeled_finality_latency_ms + subset_repair_latency_ms;
+    let subset_payload_ready_latency_ms = modeled_finality_latency_ms
+        + latency_totals.prefill_ms
+        + latency_totals.hash_advertise_ms
+        + subset_repair_latency_ms;
     let full_wire_bytes = byte_totals.full_dispatch_bytes + byte_totals.control_bytes;
-    let subset_wire_bytes =
-        byte_totals.subset_dispatch_bytes + byte_totals.control_bytes + subset_repair_bytes;
+    let subset_wire_bytes = byte_totals.prefill_bytes
+        + byte_totals.subset_dispatch_bytes
+        + byte_totals.hash_advertise_bytes
+        + byte_totals.control_bytes
+        + subset_repair_bytes;
     let total_commands = config.nodes * config.commands_per_node;
 
     let epoch_hash = epoch_hash(
@@ -644,6 +775,10 @@ fn run_subset_epoch(
             trusted: config.trusted,
             shuffle: config.shuffle,
             repair_missing: config.repair_missing,
+            prefill_mode: config.prefill_mode,
+            prefill_fanout: effective_prefill_fanout(config),
+            hash_advertise: config.hash_advertise,
+            drop_round0_dispatch: config.drop_round0_dispatch,
             latency_distribution: config.latency.distribution,
             latency_ms: config.latency.latency_ms,
             latency_min_ms: config.latency.min_ms,
@@ -664,6 +799,18 @@ fn run_subset_epoch(
             subset_repair_batches,
             subset_repair_bytes,
             subset_repair_latency_ms,
+            prefill_recipients: prefill_plan.recipients_by_sender.iter().map(Vec::len).sum(),
+            prefill_expected_hashes: prefill_plan
+                .expected_by_node
+                .values()
+                .map(BTreeSet::len)
+                .sum(),
+            prefill_bytes: byte_totals.prefill_bytes,
+            hash_advertise_messages: byte_totals.hash_advertise_messages,
+            hash_advertise_bytes: byte_totals.hash_advertise_bytes,
+            duplicate_suppressed_blocks: byte_totals.duplicate_suppressed_blocks,
+            modeled_prefill_latency_ms: latency_totals.prefill_ms,
+            modeled_hash_advertise_latency_ms: latency_totals.hash_advertise_ms,
             modeled_finality_latency_ms,
             modeled_dispatch_latency_ms: latency_totals.dispatch_ms,
             modeled_control_latency_ms: latency_totals.control_ms,
@@ -783,6 +930,109 @@ fn build_block_meta(
         target_payload_deliveries,
         slots,
     })
+}
+
+fn effective_prefill_fanout(config: &SubsetGossipConfig) -> usize {
+    let requested = if config.prefill_fanout == 0 {
+        config.quorum_size
+    } else {
+        config.prefill_fanout
+    };
+    requested.min(config.nodes.saturating_sub(1))
+}
+
+fn build_prefill_plan(
+    epoch: usize,
+    config: &SubsetGossipConfig,
+    nodes: &[BenchNode],
+    blocks: &[BlockMeta],
+    topology: &[Vec<Vec<usize>>],
+) -> PrefillPlan {
+    let mut recipients_by_sender = vec![Vec::new(); config.nodes];
+    match config.prefill_mode {
+        SubsetPrefillMode::None => {}
+        SubsetPrefillMode::Random => {
+            let fanout = effective_prefill_fanout(config);
+            for (sender, recipients) in recipients_by_sender.iter_mut().enumerate() {
+                let mut state = config.seed
+                    ^ (epoch as u64).wrapping_mul(0x98a2_c64f_15b8_3d21)
+                    ^ (sender as u64).wrapping_mul(0xd6e8_feb8_6659_fd93);
+                while recipients.len() < fanout {
+                    state = splitmix64(state);
+                    let recipient = (state as usize) % config.nodes;
+                    if recipient != sender && !recipients.contains(&recipient) {
+                        recipients.push(recipient);
+                    }
+                }
+                recipients.sort_unstable();
+            }
+        }
+        SubsetPrefillMode::Scheduled => {
+            let mut recipient_sets = vec![BTreeSet::new(); config.nodes];
+            for quorums in topology {
+                for quorum in quorums {
+                    for sender in quorum {
+                        for recipient in quorum {
+                            if recipient != sender {
+                                recipient_sets[*sender].insert(*recipient);
+                            }
+                        }
+                    }
+                }
+            }
+            recipients_by_sender = recipient_sets
+                .into_iter()
+                .map(|recipients| recipients.into_iter().collect())
+                .collect();
+        }
+    }
+
+    let mut expected_by_node: HashMap<PubKey, BTreeSet<HashType>> = nodes
+        .iter()
+        .map(|node| (node.keypair.public, BTreeSet::new()))
+        .collect();
+    for (owner, block) in blocks.iter().enumerate() {
+        if let Some(expected) = expected_by_node.get_mut(&nodes[owner].keypair.public) {
+            expected.insert(block.hash);
+        }
+        for recipient in &recipients_by_sender[owner] {
+            if let Some(expected) = expected_by_node.get_mut(&nodes[*recipient].keypair.public) {
+                expected.insert(block.hash);
+            }
+        }
+    }
+
+    PrefillPlan {
+        recipients_by_sender,
+        expected_by_node,
+    }
+}
+
+fn apply_prefill(
+    config: &SubsetGossipConfig,
+    nodes: &[BenchNode],
+    blocks: &[BlockMeta],
+    plan: &PrefillPlan,
+    header_len: usize,
+    signature_tree_len: usize,
+    states: &mut [NodeSubsetState],
+    byte_totals: &mut EpochByteTotals,
+    latency_totals: &mut EpochLatencyTotals,
+) -> Result<()> {
+    for (sender, recipients) in plan.recipients_by_sender.iter().enumerate() {
+        let block = &blocks[sender];
+        let prefill_len =
+            dispatch_len_for_block_stats(header_len, signature_tree_len, 1, block.full_block_len)?;
+        for recipient in recipients {
+            states[*recipient].merge_block(sender, PayloadMask::full(config.commands_per_node));
+            byte_totals.prefill_bytes += prefill_len;
+            latency_totals.prefill_ms = latency_totals
+                .prefill_ms
+                .max(config.latency.edge_latency_ms(sender, *recipient));
+        }
+    }
+    debug_assert_eq!(nodes.len(), states.len());
+    Ok(())
 }
 
 fn targets_for_command(
@@ -924,6 +1174,18 @@ fn dispatch_len_for_block_stats(
         return Ok(len);
     }
     Ok(len)
+}
+
+fn hash_advertise_len_for_block_count(header_len: usize, block_count: usize) -> Result<usize> {
+    const BORSH_ENUM_TAG_BYTES: usize = 1;
+    const BORSH_VEC_LEN_BYTES: usize = 4;
+    const HASH_BYTES: usize = 32;
+
+    let hashes_len = block_count
+        .checked_mul(HASH_BYTES)
+        .and_then(|sum| sum.checked_add(BORSH_VEC_LEN_BYTES))
+        .ok_or_else(|| BlossomError::WireProtocol("hash advertise length overflow".to_string()))?;
+    Ok(FRAME_PREFIX_BYTES + BORSH_ENUM_TAG_BYTES + header_len + hashes_len)
 }
 
 fn control_bytes_for_quorum(
@@ -1415,5 +1677,113 @@ mod tests {
         assert!(row.metadata_converged);
         assert!(row.subset_missing_payloads_before_repair > 0);
         assert!(!row.subset_payloads_complete_after_repair);
+    }
+
+    #[test]
+    fn random_prefill_replicates_each_local_block_to_configured_fanout() {
+        let config = SubsetGossipConfig {
+            nodes: 12,
+            epochs: 1,
+            quorum_size: 3,
+            commands_per_node: 8,
+            command_bytes: 64,
+            targets_per_command: 2,
+            prefill_mode: SubsetPrefillMode::Random,
+            prefill_fanout: 3,
+            repair_missing: true,
+            ..SubsetGossipConfig::default()
+        };
+
+        let report = run_subset_gossip(config).unwrap();
+        let row = &report.rows[0];
+
+        assert_eq!(row.prefill_mode, SubsetPrefillMode::Random);
+        assert_eq!(row.prefill_recipients, row.nodes * row.prefill_fanout);
+        assert!(row.prefill_expected_hashes > row.nodes);
+        assert!(row.prefill_bytes > 0);
+        assert_eq!(row.subset_missing_payloads_after_repair, 0);
+    }
+
+    #[test]
+    fn scheduled_prefill_hash_advertise_suppresses_duplicate_blocks() {
+        let config = SubsetGossipConfig {
+            nodes: 36,
+            epochs: 1,
+            quorum_size: 6,
+            commands_per_node: 16,
+            command_bytes: 128,
+            targets_per_command: 3,
+            prefill_mode: SubsetPrefillMode::Scheduled,
+            hash_advertise: true,
+            repair_missing: true,
+            ..SubsetGossipConfig::default()
+        };
+
+        let report = run_subset_gossip(config).unwrap();
+        let row = &report.rows[0];
+
+        assert_eq!(row.prefill_mode, SubsetPrefillMode::Scheduled);
+        assert!(row.prefill_recipients > 0);
+        assert!(row.hash_advertise_messages > 0);
+        assert!(row.hash_advertise_bytes > 0);
+        assert!(row.duplicate_suppressed_blocks > 0);
+        assert!(row.metadata_converged);
+        assert_eq!(row.subset_missing_payloads_after_repair, 0);
+    }
+
+    #[test]
+    fn random_prefill_reduces_round0_drop_payload_loss() {
+        let baseline = SubsetGossipConfig {
+            nodes: 36,
+            epochs: 1,
+            quorum_size: 6,
+            commands_per_node: 16,
+            command_bytes: 128,
+            targets_per_command: 3,
+            repair_missing: false,
+            drop_round0_dispatch: true,
+            ..SubsetGossipConfig::default()
+        };
+        let random_prefill = SubsetGossipConfig {
+            prefill_mode: SubsetPrefillMode::Random,
+            prefill_fanout: 6,
+            ..baseline.clone()
+        };
+
+        let baseline_row = run_subset_gossip(baseline).unwrap().rows.remove(0);
+        let random_row = run_subset_gossip(random_prefill).unwrap().rows.remove(0);
+
+        assert!(baseline_row.subset_missing_payloads_before_repair > 0);
+        assert!(
+            random_row.subset_missing_payloads_before_repair
+                < baseline_row.subset_missing_payloads_before_repair
+        );
+        assert!(random_row.prefill_bytes > 0);
+    }
+
+    #[test]
+    fn scheduled_prefill_covers_round0_drop_without_repair() {
+        let config = SubsetGossipConfig {
+            nodes: 36,
+            epochs: 1,
+            quorum_size: 6,
+            commands_per_node: 16,
+            command_bytes: 128,
+            targets_per_command: 3,
+            repair_missing: false,
+            drop_round0_dispatch: true,
+            prefill_mode: SubsetPrefillMode::Scheduled,
+            hash_advertise: true,
+            ..SubsetGossipConfig::default()
+        };
+
+        let row = run_subset_gossip(config).unwrap().rows.remove(0);
+
+        assert!(row.metadata_converged);
+        assert!(row.subset_payloads_complete_before_repair);
+        assert!(row.subset_payloads_complete_after_repair);
+        assert_eq!(row.subset_missing_payloads_before_repair, 0);
+        assert!(row.prefill_recipients > row.nodes);
+        assert!(row.duplicate_suppressed_blocks > 0);
     }
 }

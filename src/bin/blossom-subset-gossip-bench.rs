@@ -12,7 +12,7 @@ mod bench {
 
     use blossom::{
         SubsetGossipConfig, SubsetGossipEpochRow, SubsetLatencyDistribution, SubsetLatencyProfile,
-        run_subset_gossip,
+        SubsetPrefillMode, run_subset_gossip,
     };
     use clap::{Parser, ValueEnum};
 
@@ -44,8 +44,16 @@ mod bench {
         trusted: bool,
         #[arg(long, default_value_t = false)]
         shuffle: bool,
-        #[arg(long, default_value_t = true)]
+        #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
         repair_missing: bool,
+        #[arg(long, value_enum, default_value_t = PrefillModeArg::None)]
+        prefill_mode: PrefillModeArg,
+        #[arg(long, default_value_t = 0)]
+        prefill_fanout: usize,
+        #[arg(long, default_value_t = false)]
+        hash_advertise: bool,
+        #[arg(long, default_value_t = false)]
+        drop_round0_dispatch: bool,
         #[arg(long, value_enum, default_value_t = LatencyDistributionArg::Even)]
         latency_distribution: LatencyDistributionArg,
         #[arg(long, default_value_t = 150)]
@@ -72,11 +80,28 @@ mod bench {
         Random,
     }
 
+    #[derive(Debug, Clone, Copy, ValueEnum)]
+    enum PrefillModeArg {
+        None,
+        Random,
+        Scheduled,
+    }
+
     impl From<LatencyDistributionArg> for SubsetLatencyDistribution {
         fn from(value: LatencyDistributionArg) -> Self {
             match value {
                 LatencyDistributionArg::Even => Self::Even,
                 LatencyDistributionArg::Random => Self::Random,
+            }
+        }
+    }
+
+    impl From<PrefillModeArg> for SubsetPrefillMode {
+        fn from(value: PrefillModeArg) -> Self {
+            match value {
+                PrefillModeArg::None => Self::None,
+                PrefillModeArg::Random => Self::Random,
+                PrefillModeArg::Scheduled => Self::Scheduled,
             }
         }
     }
@@ -94,6 +119,10 @@ mod bench {
             trusted: args.trusted,
             shuffle: args.shuffle,
             repair_missing: args.repair_missing,
+            prefill_mode: args.prefill_mode.into(),
+            prefill_fanout: args.prefill_fanout,
+            hash_advertise: args.hash_advertise,
+            drop_round0_dispatch: args.drop_round0_dispatch,
             latency: SubsetLatencyProfile {
                 distribution: args.latency_distribution.into(),
                 latency_ms: args.latency_ms,
@@ -162,7 +191,7 @@ mod bench {
         if write_header {
             writeln!(
                 file,
-                "scenario,repeat,epoch,epoch_depth,nodes,quorum_size,rounds,quorums,trusted,shuffle,repair_missing,latency_distribution,latency_ms,latency_min_ms,latency_max_ms,commands_per_node,command_bytes,targets_per_command,total_commands,target_payload_deliveries,metadata_converged_nodes,metadata_converged,subset_payloads_complete_before_repair,subset_payloads_complete_after_repair,subset_missing_payloads_before_repair,subset_missing_payloads_after_repair,subset_delivered_payloads_before_repair,subset_delivered_payloads_after_repair,subset_repair_batches,subset_repair_bytes,subset_repair_latency_ms,modeled_finality_latency_ms,modeled_dispatch_latency_ms,modeled_control_latency_ms,subset_payload_ready_latency_ms,full_block_bytes,full_dispatch_bytes,subset_dispatch_bytes,control_bytes,full_wire_bytes,subset_wire_bytes,full_amplification,subset_amplification,subset_savings_pct,full_tps,subset_payload_ready_tps,full_total_gbps,subset_total_gbps,full_per_node_gbps,subset_per_node_gbps"
+                "scenario,repeat,epoch,epoch_depth,nodes,quorum_size,rounds,quorums,trusted,shuffle,repair_missing,prefill_mode,prefill_fanout,hash_advertise,drop_round0_dispatch,latency_distribution,latency_ms,latency_min_ms,latency_max_ms,commands_per_node,command_bytes,targets_per_command,total_commands,target_payload_deliveries,metadata_converged_nodes,metadata_converged,subset_payloads_complete_before_repair,subset_payloads_complete_after_repair,subset_missing_payloads_before_repair,subset_missing_payloads_after_repair,subset_delivered_payloads_before_repair,subset_delivered_payloads_after_repair,subset_repair_batches,subset_repair_bytes,subset_repair_latency_ms,prefill_recipients,prefill_expected_hashes,prefill_bytes,hash_advertise_messages,hash_advertise_bytes,duplicate_suppressed_blocks,modeled_prefill_latency_ms,modeled_hash_advertise_latency_ms,modeled_finality_latency_ms,modeled_dispatch_latency_ms,modeled_control_latency_ms,subset_payload_ready_latency_ms,full_block_bytes,full_dispatch_bytes,subset_dispatch_bytes,control_bytes,full_wire_bytes,subset_wire_bytes,full_amplification,subset_amplification,subset_savings_pct,full_tps,subset_payload_ready_tps,full_total_gbps,subset_total_gbps,full_per_node_gbps,subset_per_node_gbps"
             )?;
         }
         for row in rows {
@@ -172,59 +201,71 @@ mod bench {
     }
 
     fn row_to_csv(scenario: &str, repeat: usize, row: &SubsetGossipEpochRow) -> String {
-        format!(
-            "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6}",
-            scenario,
-            repeat,
-            row.epoch,
-            row.epoch_depth,
-            row.nodes,
-            row.quorum_size,
-            row.rounds,
-            row.quorums,
-            row.trusted,
-            row.shuffle,
-            row.repair_missing,
-            row.latency_distribution.as_str(),
-            row.latency_ms,
-            row.latency_min_ms,
-            row.latency_max_ms,
-            row.commands_per_node,
-            row.command_bytes,
-            row.targets_per_command,
-            row.total_commands,
-            row.target_payload_deliveries,
-            row.metadata_converged_nodes,
-            row.metadata_converged,
-            row.subset_payloads_complete_before_repair,
-            row.subset_payloads_complete_after_repair,
-            row.subset_missing_payloads_before_repair,
-            row.subset_missing_payloads_after_repair,
-            row.subset_delivered_payloads_before_repair,
-            row.subset_delivered_payloads_after_repair,
-            row.subset_repair_batches,
-            row.subset_repair_bytes,
-            row.subset_repair_latency_ms,
-            row.modeled_finality_latency_ms,
-            row.modeled_dispatch_latency_ms,
-            row.modeled_control_latency_ms,
-            row.subset_payload_ready_latency_ms,
-            row.full_block_bytes,
-            row.full_dispatch_bytes,
-            row.subset_dispatch_bytes,
-            row.control_bytes,
-            row.full_wire_bytes,
-            row.subset_wire_bytes,
-            row.full_amplification,
-            row.subset_amplification,
-            row.subset_savings_pct,
-            row.full_tps,
-            row.subset_payload_ready_tps,
-            row.full_total_gbps,
-            row.subset_total_gbps,
-            row.full_per_node_gbps,
-            row.subset_per_node_gbps
-        )
+        [
+            scenario.to_string(),
+            repeat.to_string(),
+            row.epoch.to_string(),
+            row.epoch_depth.to_string(),
+            row.nodes.to_string(),
+            row.quorum_size.to_string(),
+            row.rounds.to_string(),
+            row.quorums.to_string(),
+            row.trusted.to_string(),
+            row.shuffle.to_string(),
+            row.repair_missing.to_string(),
+            row.prefill_mode.as_str().to_string(),
+            row.prefill_fanout.to_string(),
+            row.hash_advertise.to_string(),
+            row.drop_round0_dispatch.to_string(),
+            row.latency_distribution.as_str().to_string(),
+            row.latency_ms.to_string(),
+            row.latency_min_ms.to_string(),
+            row.latency_max_ms.to_string(),
+            row.commands_per_node.to_string(),
+            row.command_bytes.to_string(),
+            row.targets_per_command.to_string(),
+            row.total_commands.to_string(),
+            row.target_payload_deliveries.to_string(),
+            row.metadata_converged_nodes.to_string(),
+            row.metadata_converged.to_string(),
+            row.subset_payloads_complete_before_repair.to_string(),
+            row.subset_payloads_complete_after_repair.to_string(),
+            row.subset_missing_payloads_before_repair.to_string(),
+            row.subset_missing_payloads_after_repair.to_string(),
+            row.subset_delivered_payloads_before_repair.to_string(),
+            row.subset_delivered_payloads_after_repair.to_string(),
+            row.subset_repair_batches.to_string(),
+            row.subset_repair_bytes.to_string(),
+            row.subset_repair_latency_ms.to_string(),
+            row.prefill_recipients.to_string(),
+            row.prefill_expected_hashes.to_string(),
+            row.prefill_bytes.to_string(),
+            row.hash_advertise_messages.to_string(),
+            row.hash_advertise_bytes.to_string(),
+            row.duplicate_suppressed_blocks.to_string(),
+            row.modeled_prefill_latency_ms.to_string(),
+            row.modeled_hash_advertise_latency_ms.to_string(),
+            row.modeled_finality_latency_ms.to_string(),
+            row.modeled_dispatch_latency_ms.to_string(),
+            row.modeled_control_latency_ms.to_string(),
+            row.subset_payload_ready_latency_ms.to_string(),
+            row.full_block_bytes.to_string(),
+            row.full_dispatch_bytes.to_string(),
+            row.subset_dispatch_bytes.to_string(),
+            row.control_bytes.to_string(),
+            row.full_wire_bytes.to_string(),
+            row.subset_wire_bytes.to_string(),
+            format!("{:.6}", row.full_amplification),
+            format!("{:.6}", row.subset_amplification),
+            format!("{:.6}", row.subset_savings_pct),
+            format!("{:.6}", row.full_tps),
+            format!("{:.6}", row.subset_payload_ready_tps),
+            format!("{:.6}", row.full_total_gbps),
+            format!("{:.6}", row.subset_total_gbps),
+            format!("{:.6}", row.full_per_node_gbps),
+            format!("{:.6}", row.subset_per_node_gbps),
+        ]
+        .join(",")
     }
 }
 

@@ -103,7 +103,7 @@ pub use state::{
 #[cfg(feature = "availability-gossip")]
 pub use subset_gossip::{
     SubsetGossipConfig, SubsetGossipEpochRow, SubsetGossipReport, SubsetLatencyDistribution,
-    SubsetLatencyProfile, run_subset_gossip,
+    SubsetLatencyProfile, SubsetPrefillMode, run_subset_gossip,
 };
 pub use tcp::{
     TcpConnection, TcpMultiGroupNode, TcpNode, send_wire_frame, send_wire_request,
