@@ -29,6 +29,8 @@ pub mod round_skip;
 pub mod runtime;
 pub mod service_client;
 pub mod state;
+#[cfg(feature = "availability-gossip")]
+pub mod subset_gossip;
 pub mod tcp;
 pub mod telemetry;
 pub mod wire;
@@ -97,6 +99,11 @@ pub use state::{
     MAX_PENDING_RAW_DISPATCH_BYTES_PER_SENDER_ENV, PendingDispatch, TempConsensus, TempQuorum,
     configured_max_pending_raw_dispatch_bytes,
     configured_max_pending_raw_dispatch_bytes_per_sender,
+};
+#[cfg(feature = "availability-gossip")]
+pub use subset_gossip::{
+    SubsetGossipConfig, SubsetGossipEpochRow, SubsetGossipReport, SubsetLatencyDistribution,
+    SubsetLatencyProfile, run_subset_gossip,
 };
 pub use tcp::{
     TcpConnection, TcpMultiGroupNode, TcpNode, send_wire_frame, send_wire_request,

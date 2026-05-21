@@ -1,6 +1,7 @@
 /target
 /benchmarks/results
 .DS_Store
+__pycache__/
 
 # Formal verification backend outputs
 _apalache-out/

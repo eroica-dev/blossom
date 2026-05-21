@@ -211,6 +211,29 @@ Expected failure edge:
 - If the network drops below the liveness threshold, the protocol may stall but
   should not violate safety.
 
+## Algorithm: Subset Block Gossip Availability
+
+```text
+for each command in each block:
+  commit canonical command metadata to the block hash
+  keep full payload at the holder
+  send full payload only to recipients in the command target set
+  send tombstones/commitments to non-target recipients
+
+after metadata convergence:
+  for every command target:
+    require the target to hold the full payload
+    if missing, fetch from a full holder before marking data available
+```
+
+Expected failure edge:
+
+- Metadata convergence is not sufficient for subset propagation correctness.
+- Inline subset gossip can leave target payloads missing when the target only
+  hears tombstone views.
+- Correctness requires either a deterministic full-payload route to every
+  target or an explicit pull-repair phase.
+
 ## Algorithm: Reconnect Admission
 
 ```text
@@ -272,6 +295,8 @@ Executable tests and models pin these boundaries:
 - `deterministic_epoch_vulnerability_scenarios_run_sequentially`
 - `byzantine_churn_under_threshold_preserves_epoch_progress`
 - `healed_full_partition_reconciles_pending_epoch_before_resuming`
+- `subset_gossip::tests::subset_gossip_converges_metadata_and_repairs_payloads`
+- `subset_gossip::tests::sparse_inline_subset_can_need_repair`
 
 Formal threshold models live in:
 
@@ -280,3 +305,10 @@ Formal threshold models live in:
 - `verification/tla/BlossomThresholds.tla`
 - `verification/verus/thresholds.rs`
 
+Long-run empirical validation of these edges lives in
+[`docs/proofs/failure-boundary-validation.tex`](failure-boundary-validation.tex).
+The raw 2,000-epoch run data used for the current validation note was generated
+under `benchmarks/results/proof_validation_20260521_022227`.
+
+Recipient-filtered block propagation validation lives in
+[`docs/proofs/subset-block-gossip.md`](subset-block-gossip.md).
