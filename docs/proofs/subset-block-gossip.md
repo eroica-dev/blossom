@@ -241,10 +241,9 @@ completeness, and reconciliation should treat missing target payloads as a
 repairable availability gap rather than a successful epoch.
 
 The first-round prefill optimization is specified separately in
-[`future-contact-prefill.md`](future-contact-prefill.md). That proof replaces
-the experimental "random quorum" wording with deterministic future-contact
-placement: one prefill stage materializes the first data frontier, then
-consensus starts one layer later.
+[`prefill-dispatch.md`](prefill-dispatch.md). That proof defines deterministic
+prefill dispatch placement: one prefill stage materializes the first data
+frontier, then consensus starts one layer later.
 
 ## Reproducibility
 

@@ -34,8 +34,7 @@ impl SubsetLatencyDistribution {
 pub enum SubsetPrefillMode {
     None,
     Random,
-    FutureContact,
-    RandomQuorum,
+    PrefillDispatch,
     Scheduled,
 }
 
@@ -44,8 +43,7 @@ impl SubsetPrefillMode {
         match self {
             Self::None => "none",
             Self::Random => "random",
-            Self::FutureContact => "future-contact",
-            Self::RandomQuorum => "random-quorum",
+            Self::PrefillDispatch => "prefill-dispatch",
             Self::Scheduled => "scheduled",
         }
     }
@@ -177,13 +175,11 @@ impl SubsetGossipConfig {
                 "prefill replicas per quorum must be greater than zero".to_string(),
             ));
         }
-        if matches!(
-            self.prefill_mode,
-            SubsetPrefillMode::FutureContact | SubsetPrefillMode::RandomQuorum
-        ) && self.prefill_skip_rounds > 1
+        if matches!(self.prefill_mode, SubsetPrefillMode::PrefillDispatch)
+            && self.prefill_skip_rounds > 1
         {
             return Err(BlossomError::WireProtocol(
-                "future-contact prefill can skip at most one consensus round".to_string(),
+                "prefill-dispatch can skip at most one consensus round".to_string(),
             ));
         }
         self.latency.validate()
@@ -1063,10 +1059,7 @@ fn build_block_meta(
 }
 
 fn consensus_start_round(config: &SubsetGossipConfig, topology_rounds: usize) -> usize {
-    if matches!(
-        config.prefill_mode,
-        SubsetPrefillMode::FutureContact | SubsetPrefillMode::RandomQuorum
-    ) {
+    if matches!(config.prefill_mode, SubsetPrefillMode::PrefillDispatch) {
         let requested = config.prefill_skip_rounds.max(1);
         return requested.min(topology_rounds.saturating_sub(1));
     }
@@ -1075,14 +1068,11 @@ fn consensus_start_round(config: &SubsetGossipConfig, topology_rounds: usize) ->
 }
 
 fn prefill_inventory_is_precomputed(config: &SubsetGossipConfig) -> bool {
-    matches!(
-        config.prefill_mode,
-        SubsetPrefillMode::FutureContact | SubsetPrefillMode::RandomQuorum
-    )
+    matches!(config.prefill_mode, SubsetPrefillMode::PrefillDispatch)
 }
 
 fn prefill_routes_full_blocks(config: &SubsetGossipConfig) -> bool {
-    matches!(config.prefill_mode, SubsetPrefillMode::FutureContact)
+    matches!(config.prefill_mode, SubsetPrefillMode::PrefillDispatch)
 }
 
 fn effective_prefill_fanout(config: &SubsetGossipConfig) -> usize {
@@ -1094,7 +1084,7 @@ fn effective_prefill_fanout(config: &SubsetGossipConfig) -> usize {
     requested.min(config.nodes.saturating_sub(1))
 }
 
-fn future_contact_prefill_fanout(config: &SubsetGossipConfig, topology_rounds: usize) -> usize {
+fn prefill_dispatch_fanout(config: &SubsetGossipConfig, topology_rounds: usize) -> usize {
     if topology_rounds == 0 {
         return 0;
     }
@@ -1140,12 +1130,11 @@ fn build_prefill_plan(
                 recipients.sort_unstable();
             }
         }
-        SubsetPrefillMode::FutureContact | SubsetPrefillMode::RandomQuorum => {
+        SubsetPrefillMode::PrefillDispatch => {
             let mut recipient_sets = vec![BTreeSet::new(); config.nodes];
-            let fanout = future_contact_prefill_fanout(config, topology.len());
+            let fanout = prefill_dispatch_fanout(config, topology.len());
             for (sender, recipients) in recipient_sets.iter_mut().enumerate() {
-                *recipients =
-                    future_contact_prefill_recipients(epoch, config, topology, sender, fanout);
+                *recipients = prefill_dispatch_recipients(epoch, config, topology, sender, fanout);
             }
             recipients_by_sender = recipient_sets
                 .into_iter()
@@ -1193,7 +1182,7 @@ fn build_prefill_plan(
     }
 }
 
-fn future_contact_prefill_recipients(
+fn prefill_dispatch_recipients(
     epoch: usize,
     config: &SubsetGossipConfig,
     topology: &[Vec<Vec<usize>>],
@@ -1252,7 +1241,7 @@ fn future_contact_prefill_recipients(
                 .filter(|candidate| *candidate != sender && !recipients.contains(candidate))
                 .collect::<Vec<_>>();
             candidates.sort_by_key(|candidate| {
-                future_contact_score(config.seed, epoch, sender, round, *branch_rep, *candidate)
+                prefill_dispatch_score(config.seed, epoch, sender, round, *branch_rep, *candidate)
             });
 
             let mut added = 0usize;
@@ -1285,7 +1274,7 @@ fn quorum_containing_member(quorums: &[Vec<usize>], member: usize) -> Option<&[u
         .map(Vec::as_slice)
 }
 
-fn future_contact_score(
+fn prefill_dispatch_score(
     seed: u64,
     epoch: usize,
     sender: usize,
@@ -2226,7 +2215,7 @@ mod tests {
     }
 
     #[test]
-    fn random_quorum_prefill_replaces_first_consensus_round() {
+    fn prefill_dispatch_replaces_first_consensus_round() {
         let config = SubsetGossipConfig {
             nodes: 36,
             epochs: 1,
@@ -2235,14 +2224,14 @@ mod tests {
             command_bytes: 128,
             targets_per_command: 3,
             repair_missing: false,
-            prefill_mode: SubsetPrefillMode::RandomQuorum,
+            prefill_mode: SubsetPrefillMode::PrefillDispatch,
             prefill_replicas_per_quorum: 2,
             ..SubsetGossipConfig::default()
         };
 
         let row = run_subset_gossip(config).unwrap().rows.remove(0);
 
-        assert_eq!(row.prefill_mode, SubsetPrefillMode::RandomQuorum);
+        assert_eq!(row.prefill_mode, SubsetPrefillMode::PrefillDispatch);
         assert_eq!(row.prefill_skip_rounds, 1);
         assert_eq!(row.rounds, 1);
         assert_eq!(row.prefill_fanout, 11);
@@ -2260,11 +2249,11 @@ mod tests {
     }
 
     #[test]
-    fn future_contact_prefill_fanout_scales_with_log_rounds() {
+    fn prefill_dispatch_fanout_scales_with_log_rounds() {
         let config = SubsetGossipConfig {
             nodes: 1000,
             quorum_size: 6,
-            prefill_mode: SubsetPrefillMode::FutureContact,
+            prefill_mode: SubsetPrefillMode::PrefillDispatch,
             prefill_replicas_per_quorum: 2,
             ..SubsetGossipConfig::default()
         };
@@ -2272,11 +2261,11 @@ mod tests {
         let (_, rounds) = find_round_number(config.nodes, config.quorum_size);
 
         assert_eq!(rounds, 4);
-        assert_eq!(future_contact_prefill_fanout(&config, rounds), 23);
+        assert_eq!(prefill_dispatch_fanout(&config, rounds), 23);
     }
 
     #[test]
-    fn future_contact_prefill_routes_subtree_payloads_without_repair() {
+    fn prefill_dispatch_routes_subtree_payloads_without_repair() {
         let config = SubsetGossipConfig {
             nodes: 72,
             epochs: 1,
@@ -2285,7 +2274,7 @@ mod tests {
             command_bytes: 128,
             targets_per_command: 3,
             repair_missing: false,
-            prefill_mode: SubsetPrefillMode::FutureContact,
+            prefill_mode: SubsetPrefillMode::PrefillDispatch,
             prefill_replicas_per_quorum: 2,
             ..SubsetGossipConfig::default()
         };
@@ -2299,7 +2288,7 @@ mod tests {
     }
 
     #[test]
-    fn future_contact_prefill_survives_one_byzantine_route_withholder() {
+    fn prefill_dispatch_survives_one_byzantine_route_withholder() {
         let config = SubsetGossipConfig {
             nodes: 72,
             epochs: 1,
@@ -2308,7 +2297,7 @@ mod tests {
             command_bytes: 128,
             targets_per_command: 3,
             repair_missing: false,
-            prefill_mode: SubsetPrefillMode::FutureContact,
+            prefill_mode: SubsetPrefillMode::PrefillDispatch,
             prefill_replicas_per_quorum: 2,
             prefill_byzantine_withholders_per_branch: 1,
             ..SubsetGossipConfig::default()
@@ -2321,9 +2310,9 @@ mod tests {
     }
 
     #[test]
-    fn random_quorum_prefill_start_is_always_one_round() {
+    fn prefill_dispatch_start_is_always_one_round() {
         let config = SubsetGossipConfig {
-            prefill_mode: SubsetPrefillMode::RandomQuorum,
+            prefill_mode: SubsetPrefillMode::PrefillDispatch,
             ..SubsetGossipConfig::default()
         };
 
@@ -2335,9 +2324,9 @@ mod tests {
     }
 
     #[test]
-    fn random_quorum_prefill_rejects_multi_round_skip_override() {
+    fn prefill_dispatch_rejects_multi_round_skip_override() {
         let config = SubsetGossipConfig {
-            prefill_mode: SubsetPrefillMode::RandomQuorum,
+            prefill_mode: SubsetPrefillMode::PrefillDispatch,
             prefill_skip_rounds: 2,
             ..SubsetGossipConfig::default()
         };
@@ -2403,7 +2392,7 @@ mod tests {
             command_bytes: 128,
             targets_per_command: 3,
             repair_missing: false,
-            prefill_mode: SubsetPrefillMode::RandomQuorum,
+            prefill_mode: SubsetPrefillMode::PrefillDispatch,
             prefill_replicas_per_quorum: 1,
             prefill_byzantine_withholders_per_branch: 1,
             ..SubsetGossipConfig::default()
@@ -2425,7 +2414,7 @@ mod tests {
             command_bytes: 128,
             targets_per_command: 3,
             repair_missing: false,
-            prefill_mode: SubsetPrefillMode::RandomQuorum,
+            prefill_mode: SubsetPrefillMode::PrefillDispatch,
             prefill_replicas_per_quorum: 2,
             prefill_byzantine_withholders_per_branch: 1,
             ..SubsetGossipConfig::default()

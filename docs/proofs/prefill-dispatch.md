@@ -1,9 +1,9 @@
-# Future-Contact Prefill Proof
+# Prefill Dispatch Proof
 
-This note defines the prefill round as a deterministic future-contact data
-placement step. It is not a random quorum. The prefill sender computes the
-future contacts for its local block from the public quorum schedule and sends
-the block to those contacts before trustless consensus begins.
+This note defines the prefill round as deterministic prefill dispatch. The
+sender computes the future contacts for its local block from the public quorum
+schedule and sends the needed payloads to those contacts before trustless
+consensus begins.
 
 The purpose is to replace the first data-spreading consensus round with one
 non-consensus availability round while adding enough initial redundancy to avoid
@@ -36,10 +36,10 @@ dissemination frontier:
 F_i = Hold_old(B_i, 1)
 ```
 
-The future-contact prefill path computes a deterministic contact set:
+The prefill-dispatch path computes a deterministic contact set:
 
 ```text
-C_i = future_contacts(i, B_i, schedule)
+C_i = prefill_dispatch_contacts(i, B_i, schedule)
 ```
 
 The prefill stage replaces only old consensus round `0`. It does not replace
@@ -191,7 +191,7 @@ smaller later holder set under the same delivery assumptions.
 
 ## Theorem 1: One Fewer Consensus Round
 
-If the future-contact prefill set satisfies `F_i subset C_i` for every correct
+If the prefill-dispatch contact set satisfies `F_i subset C_i` for every correct
 owner `i`, then the prefill protocol can skip consensus round `0` and execute:
 
 ```text
@@ -263,7 +263,7 @@ The maximum-redundancy version sets `h_i(A)` to the number of future contacts
 in that branch. If the branch is a quorum of size `q`, and all quorum members
 are contacts, then the branch can lose up to `q - 1` prefilled holders before
 data availability for that block is lost. The implemented default is more
-bandwidth-conscious: it uses a small deterministic future-contact set and then
+bandwidth-conscious: it uses a small deterministic prefill contact set and then
 relies on subtree payload routing in the remaining consensus rounds.
 
 ## Optimization Math
@@ -278,7 +278,7 @@ rho   = extra future contact per live branch per later consensus layer
 d     = per-block prefill fanout
 ```
 
-The implemented future-contact prefill fanout is:
+The implemented prefill-dispatch fanout is:
 
 ```text
 d(rho) = (q - 1) + rho * q * (R - 1)
@@ -382,14 +382,14 @@ Current simulator checks for `q = 6` show:
 | Scenario | `n` | commands/node | fanout | rounds | total wire/epoch | payload complete before repair |
 |---|---:|---:|---:|---:|---:|---|
 | standard subset + repair | 72 | 16 | 0 | 3 | 64.3 MB | no |
-| future-contact prefill | 72 | 16 | 17 | 2 | 11.5 MB | yes |
+| prefill dispatch | 72 | 16 | 17 | 2 | 11.5 MB | yes |
 | standard subset + repair | 1000 | 1 | 0 | 4 | 1797.4 MB | no |
-| future-contact prefill | 1000 | 1 | 23 | 3 | 182.2 MB | yes |
+| prefill dispatch | 1000 | 1 | 23 | 3 | 182.2 MB | yes |
 
 This gives the main optimization conclusion:
 
 - one prefill stage reliably removes one consensus layer from the latency path;
-- future-contact prefill plus subtree payload routing can reduce total wire and
+- prefill dispatch plus subtree payload routing can reduce total wire and
   complete without a repair phase;
 - full-block forwarding is correct but expensive, so later rounds should route
   only payloads needed by the recipient's remaining subtree;
@@ -409,13 +409,13 @@ k > f_A
 ```
 
 For `q = 6`, the simulator uses `f_A = 1`. The older branch-holder boundary
-and the future-contact route-withholding check behave as expected:
+and the prefill-dispatch route-withholding check behave as expected:
 
 | Scenario | `k` | Byzantine withholders per branch | Expected result |
 |---|---:|---:|---|
 | unsafe prefill | 1 | 1 | missing payloads remain |
 | BFT prefill | 2 | 1 | payloads complete before repair |
-| future-contact prefill | route redundancy enabled | 1 | payloads complete before repair |
+| prefill dispatch | route redundancy enabled | 1 | payloads complete before repair |
 
 This is deliberately stronger than a happy-path redundancy check. It verifies
 that the pushed holder set contains enough validated recipients before the
@@ -425,7 +425,7 @@ branch needs the data.
 
 The proof does not hold if any of these are false:
 
-- honest nodes do not agree on the future-contact schedule;
+- honest nodes do not agree on the prefill-dispatch schedule;
 - prefill messages are not authenticated by owner identity, epoch, and nonce;
 - recipients accept blocks whose hashes or payload commitments do not validate;
 - every prefilled holder for a block in a future branch is Byzantine or
@@ -442,17 +442,15 @@ simulation scenarios.
 
 ## Code Mapping
 
-The simulator exposes `SubsetPrefillMode::FutureContact`. The older
-`SubsetPrefillMode::RandomQuorum` name remains as a compatibility alias for
-the first experiment, but the protocol design should use the future-contact
-name.
+The simulator exposes `SubsetPrefillMode::PrefillDispatch`. The CLI value is
+`prefill-dispatch`.
 
 Relevant simulator hooks:
 
 - `consensus_start_round` caps the prefill replacement to one skipped consensus
   layer.
 - `build_prefill_plan` computes the initial holder map.
-- `future_contact_prefill_fanout` sets the default fanout to `qR - 1`.
+- `prefill_dispatch_fanout` sets the default fanout to `qR - 1`.
 - `apply_prefill` sends the local block's needed subtree payloads to the
   planned holders in one modeled network stage.
 - `build_future_reachability` computes each recipient's remaining subtree.
@@ -463,12 +461,12 @@ Relevant simulator hooks:
 
 The current branch exercises the proof obligations with:
 
-- `random_quorum_prefill_replaces_first_consensus_round`;
-- `future_contact_prefill_fanout_scales_with_log_rounds`;
-- `future_contact_prefill_routes_subtree_payloads_without_repair`;
-- `future_contact_prefill_survives_one_byzantine_route_withholder`;
-- `random_quorum_prefill_start_is_always_one_round`;
-- `random_quorum_prefill_rejects_multi_round_skip_override`;
+- `prefill_dispatch_replaces_first_consensus_round`;
+- `prefill_dispatch_fanout_scales_with_log_rounds`;
+- `prefill_dispatch_routes_subtree_payloads_without_repair`;
+- `prefill_dispatch_survives_one_byzantine_route_withholder`;
+- `prefill_dispatch_start_is_always_one_round`;
+- `prefill_dispatch_rejects_multi_round_skip_override`;
 - `precomputed_inventory_routes_pick_one_holder_for_missing_payloads`;
 - `single_prefill_holder_is_not_byzantine_resilient`;
 - `bft_prefill_survives_one_byzantine_withholder_per_branch`;

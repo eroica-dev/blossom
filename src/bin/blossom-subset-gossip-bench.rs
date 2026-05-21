@@ -90,8 +90,7 @@ mod bench {
     enum PrefillModeArg {
         None,
         Random,
-        FutureContact,
-        RandomQuorum,
+        PrefillDispatch,
         Scheduled,
     }
 
@@ -109,8 +108,7 @@ mod bench {
             match value {
                 PrefillModeArg::None => Self::None,
                 PrefillModeArg::Random => Self::Random,
-                PrefillModeArg::FutureContact => Self::FutureContact,
-                PrefillModeArg::RandomQuorum => Self::RandomQuorum,
+                PrefillModeArg::PrefillDispatch => Self::PrefillDispatch,
                 PrefillModeArg::Scheduled => Self::Scheduled,
             }
         }
