@@ -57,6 +57,8 @@ validation logic. The simulator imports the same decision function for
 skipped-round workloads, so the model no longer has a private copy of this
 rule. The proof sketch lives in
 [`docs/proofs/round-skip-carry-forward.md`](proofs/round-skip-carry-forward.md).
+The expected crash, halt, and fail-closed edges are collected in
+[`docs/proofs/failure-boundaries.md`](proofs/failure-boundaries.md).
 
 **Implemented checks:**
 

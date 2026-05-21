@@ -5,6 +5,9 @@ threshold algorithms. The normal Rust test suite remains the first line of
 feedback; these proofs are optional layers that can be run when the matching
 toolchain is installed.
 
+The protocol-level fail-closed algorithms and expected halt/crash boundaries
+are summarized in `docs/proofs/failure-boundaries.md`.
+
 To run every available verifier and continue through partial failures:
 
 ```sh
