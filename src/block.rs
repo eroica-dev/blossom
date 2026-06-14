@@ -2,6 +2,7 @@ use borsh::{BorshDeserialize, BorshSerialize};
 use serde::{Deserialize, Serialize};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use crate::admission::NodeAdmission;
 use crate::crypto::{PubKey, SecKey, SecretSigner, Signature};
 use crate::encounter::EncounterRecord;
 use crate::error::{BlossomError, Result};
@@ -214,23 +215,15 @@ impl FilteredTransactionSlot {
     }
 
     pub fn encoded_len(&self) -> usize {
-        FILTERED_TRANSACTION_SLOT_DOMAIN.len()
-            + 32
-            + 2
-            + 4
-            + (self.canonical_targets().len() * 32)
-            + 32
-            + 8
-            + 1
+        FILTERED_TRANSACTION_SLOT_DOMAIN.len() + 32 + 2 + 4 + (self.targets.len() * 32) + 32 + 8 + 1
     }
 
     pub fn append_bytes_to(&self, bytes: &mut Vec<u8>) {
         bytes.extend_from_slice(FILTERED_TRANSACTION_SLOT_DOMAIN);
         bytes.extend_from_slice(self.key_hash.as_ref());
         bytes.extend_from_slice(&self.kind.to_le_bytes());
-        let targets = self.canonical_targets();
-        bytes.extend_from_slice(&(targets.len() as u32).to_le_bytes());
-        for target in targets {
+        bytes.extend_from_slice(&(self.targets.len() as u32).to_le_bytes());
+        for target in &self.targets {
             bytes.extend_from_slice(target.as_ref());
         }
         bytes.extend_from_slice(self.payload_commitment.as_ref());
@@ -242,9 +235,8 @@ impl FilteredTransactionSlot {
         hasher.update(FILTERED_TRANSACTION_SLOT_DOMAIN);
         hasher.update(self.key_hash.as_ref());
         hasher.update(self.kind.to_le_bytes());
-        let targets = self.canonical_targets();
-        hasher.update((targets.len() as u32).to_le_bytes());
-        for target in targets {
+        hasher.update((self.targets.len() as u32).to_le_bytes());
+        for target in &self.targets {
             hasher.update(target.as_ref());
         }
         hasher.update(self.payload_commitment.as_ref());
@@ -258,15 +250,14 @@ impl FilteredTransactionSlot {
                 "filtered transaction target set cannot be empty".to_string(),
             ));
         }
-        let canonical = self.canonical_targets();
-        if canonical.len() != self.targets.len() {
-            return Err(BlossomError::WireProtocol(
-                "filtered transaction targets must be unique".to_string(),
-            ));
-        }
-        if canonical != self.targets {
+        if !self.targets_are_sorted() {
             return Err(BlossomError::WireProtocol(
                 "filtered transaction targets must be sorted".to_string(),
+            ));
+        }
+        if !self.targets_are_unique() {
+            return Err(BlossomError::WireProtocol(
+                "filtered transaction targets must be unique".to_string(),
             ));
         }
         Ok(())
@@ -281,11 +272,12 @@ impl FilteredTransactionSlot {
         self.targets.dedup();
     }
 
-    fn canonical_targets(&self) -> Vec<PubKey> {
-        let mut targets = self.targets.clone();
-        targets.sort();
-        targets.dedup();
-        targets
+    fn targets_are_sorted(&self) -> bool {
+        self.targets.windows(2).all(|window| window[0] <= window[1])
+    }
+
+    fn targets_are_unique(&self) -> bool {
+        self.targets.windows(2).all(|window| window[0] != window[1])
     }
 }
 
@@ -545,9 +537,8 @@ impl Transaction {
     #[inline]
     fn canonical_payload_encoded_len(&self) -> usize {
         #[cfg(feature = "filtered-transactions")]
-        match &self.filtered_slot {
-            Some(slot) => return slot.encoded_len(),
-            None => {}
+        if let Some(slot) = &self.filtered_slot {
+            return slot.encoded_len();
         }
 
         self.payload.bytes.len()
@@ -560,12 +551,9 @@ impl Transaction {
 
     fn append_canonical_payload_to(&self, bytes: &mut Vec<u8>) {
         #[cfg(feature = "filtered-transactions")]
-        match &self.filtered_slot {
-            Some(slot) => {
-                slot.append_bytes_to(bytes);
-                return;
-            }
-            None => {}
+        if let Some(slot) = &self.filtered_slot {
+            slot.append_bytes_to(bytes);
+            return;
         }
 
         bytes.extend_from_slice(self.payload.bytes.as_slice());
@@ -573,12 +561,9 @@ impl Transaction {
 
     fn update_canonical_payload_hash(&self, hasher: &mut ProtocolHasher) {
         #[cfg(feature = "filtered-transactions")]
-        match &self.filtered_slot {
-            Some(slot) => {
-                slot.update_hash(hasher);
-                return;
-            }
-            None => {}
+        if let Some(slot) = &self.filtered_slot {
+            slot.update_hash(hasher);
+            return;
         }
 
         hasher.update(self.payload.bytes.as_slice());
@@ -705,6 +690,7 @@ impl Block {
     pub fn verify_unsigned_integrity_with_hash(&self, expected_hash: HashType) -> Result<()> {
         self.body.application_state.validate()?;
         self.body.validate_encounter_records()?;
+        self.body.validate_node_admissions()?;
         self.body.validate_transactions()?;
         let (body_hash, merkle_root) = self.body.hash_and_merkle_root();
         if self.hash != expected_hash || body_hash != expected_hash {
@@ -751,6 +737,7 @@ pub struct BlockBody {
     pub merkle_root: HashType,
     pub application_state: BlockApplicationState,
     pub encounter_records: Vec<EncounterRecord>,
+    pub node_admissions: Vec<NodeAdmission>,
     pub txs: Vec<Transaction>,
 }
 
@@ -765,6 +752,7 @@ impl Default for BlockBody {
             merkle_root: HashType::default(),
             application_state: BlockApplicationState::default(),
             encounter_records: Vec::new(),
+            node_admissions: Vec::new(),
             txs: Vec::new(),
         }
     }
@@ -846,6 +834,11 @@ impl BlockBody {
         for record in &self.encounter_records {
             record.append_bytes_to(bytes);
         }
+        bytes.extend_from_slice(&(self.node_admissions.len() as u64).to_le_bytes());
+        for admission in &self.node_admissions {
+            admission.body.append_bytes_to(bytes);
+            bytes.extend_from_slice(admission.signature.as_ref());
+        }
         for tx in &self.txs {
             bytes.extend_from_slice(tx.hash.as_ref());
             bytes.extend_from_slice(&(tx.canonical_payload_encoded_len() as u64).to_le_bytes());
@@ -867,6 +860,12 @@ impl BlockBody {
                 .iter()
                 .map(EncounterRecord::encoded_len)
                 .sum::<usize>()
+            + 8
+            + self
+                .node_admissions
+                .iter()
+                .map(|admission| admission.body.encoded_len() + admission.signature.as_ref().len())
+                .sum::<usize>()
             + self
                 .txs
                 .iter()
@@ -887,6 +886,11 @@ impl BlockBody {
         hasher.update((self.encounter_records.len() as u64).to_le_bytes());
         for record in &self.encounter_records {
             record.update_hash(&mut hasher);
+        }
+        hasher.update((self.node_admissions.len() as u64).to_le_bytes());
+        for admission in &self.node_admissions {
+            admission.body.update_hash(&mut hasher);
+            hasher.update(admission.signature.as_ref());
         }
         for tx in &self.txs {
             hasher.update(tx.hash.as_ref());
@@ -911,6 +915,11 @@ impl BlockBody {
         for record in &self.encounter_records {
             record.update_hash(&mut body_hasher);
         }
+        body_hasher.update((self.node_admissions.len() as u64).to_le_bytes());
+        for admission in &self.node_admissions {
+            admission.body.update_hash(&mut body_hasher);
+            body_hasher.update(admission.signature.as_ref());
+        }
         for tx in &self.txs {
             body_hasher.update(tx.hash.as_ref());
             body_hasher.update((tx.canonical_payload_encoded_len() as u64).to_le_bytes());
@@ -930,6 +939,13 @@ impl BlockBody {
                 return Err(BlossomError::UnknownSender);
             }
             record.verify()?;
+        }
+        Ok(())
+    }
+
+    fn validate_node_admissions(&self) -> Result<()> {
+        for admission in &self.node_admissions {
+            admission.verify()?;
         }
         Ok(())
     }

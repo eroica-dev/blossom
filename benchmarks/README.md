@@ -17,6 +17,7 @@ test suite.
 | `epoch-chaos` | `blossom-sim` epoch convergence under transport faults | How many nodes finish on the correct epoch hash after jitter, long delays, spikes, drops, and fuzz? |
 | `sim-fuzz` | `blossom-sim` deterministic node I/O fuzzing | Do valid, malformed, truncated, oversized, and random frames leave nodes alive? |
 | `sim-hermetic` | `blossom-sim` hermetic simulator | Can we replay latency, node down/up, and seeded drops without kernel/socket timing? |
+| `profile-matrix` | Hermetic simulator with node profiling | Which nodes saturate CPU, queue work, or show high handler cost under replayable network and hardware conditions? |
 | `sim-container` | VM-like container runner for `blossom-sim` | Can we run simulations in a contained process/network boundary with only results mounted out? |
 | `epoch-depth` | In-memory protocol simulation | How do paper-aligned quorum rounds behave across consecutive epochs? |
 
@@ -117,6 +118,17 @@ BUG_LATENCY_BUDGET_MS=40 SLOW_NODES=2,3 SLOW_LATENCY_MS=50 \
   REQUESTS=100 PAYLOAD_BYTES=256 ./benchmarks/scripts/run-sim-hermetic.sh
 ```
 
+Run a deterministic profile matrix. This emits summary, event, perf, profile,
+and bug-candidate files for each scenario. `TARGET_NODE` isolates a single hot
+node, while `CPU_NODES`, CPU delay/stall knobs, and hardware fault knobs let the
+same network workload be replayed with controlled resource pressure:
+
+```bash
+TRUST_MODES="verified trusted" NODES_LIST="16 64" LATENCIES="0 25 100" \
+  CPU_DELAYS="0 1 5" REQUESTS=10000 PAYLOAD_BYTES=1024 \
+  ./benchmarks/scripts/run-profile-matrix.sh
+```
+
 Run the same simulation modes inside a VM-like container boundary. The runtime
 container has external networking disabled, a read-only root filesystem, all
 Linux capabilities dropped, and only `benchmarks/results/` mounted as writable
@@ -160,6 +172,25 @@ BLOSSOM_HOT_WIRE_CODEC=1 BLOSSOM_MAX_FRAME_SIZE=1073741824 \
   --delivery-mode first-accepted --trusted --external-transaction-hashes
 ```
 
+Run the focused transport optimization matrix. This compares trustless SHA,
+trusted SHA, trusted XXH3, and trusted XXH3 with application-supplied
+transaction identifiers, and can also sweep bounded write chunk sizes:
+
+```bash
+NODE_COUNTS="6" TRANSACTION_COUNTS="200000" TX_BYTES_LIST="1024" \
+  WRITE_CHUNK_BYTES_LIST="0 65536 1048576" \
+  ./benchmarks/scripts/run-transport-optimization-matrix.sh
+```
+
+Propagation policies are split out behind feature gates so latency and
+bandwidth optimizations do not silently change trustless safety assumptions.
+`propagation-push` exposes the full-block push policy, `propagation-inventory`
+exposes inventory-then-missing policy validation, and `propagation-adaptive`
+enables the cost model that chooses between them. Trustless inventory plans must
+use authenticated manifests and enough redundant holders to survive configured
+Byzantine withholding; otherwise validation rejects the plan before the
+simulator or runtime can use it.
+
 Run a paper-aligned epoch-depth benchmark:
 
 ```bash
@@ -174,6 +205,15 @@ fixed/even and deterministic random pairwise latency:
 ```bash
 ./benchmarks/scripts/run-epoch-latency-matrix.sh
 ```
+
+Subset-gossip CSV rows include both application throughput and protocol request
+pressure. `full_tps` and `subset_payload_ready_tps` report modeled application
+commands per second; `full_req_per_sec` and
+`subset_payload_ready_req_per_sec` report modeled Blossom wire request-equivalents
+per second using the same latency denominator. Component counters such as
+`prefill_requests`, `full_dispatch_requests`, `subset_dispatch_requests`,
+`control_requests`, and `subset_repair_requests` show which stage creates the
+request load.
 
 Add block-header application-state load to either harness:
 
@@ -248,13 +288,32 @@ benchmark or node process.
 dispatch frames into the experimental BLSM v1 codec. Decoders accept both Borsh
 and BLSM frames so mixed read-side tests stay compatible. Dispatch receivers can
 authenticate the header and keep the block payload raw until consensus
-verification actually needs it; submit/send-block still materialize owned blocks
-after parsing, but avoid Borsh's generic collection overhead on large payloads.
+verification actually needs it. In trusted mode the receiver now scans raw
+dispatch payloads to validate block hashes, Merkle roots, epoch targeting, and
+the signature-tree commitment without materializing owned block objects.
+Submit/send-block still materialize owned blocks after parsing, but avoid
+Borsh's generic collection overhead on large payloads.
 
 The hot encoder preallocates exact frame sizes with checked length calculators
 before writing payload bytes. That avoids large buffer growth copies during
 million-transaction dispatches while preserving the same configured frame-size
 limit.
+
+`blossom-harness-bench` defaults to Tokio's multi-thread runtime. Use
+`--runtime-flavor current-thread` to isolate the single-core path, or
+`--runtime-worker-threads N` with the default multi-thread runtime to test a
+fixed worker count. This is useful when separating protocol CPU cost from
+scheduler churn in local TCP load profiles.
+
+TCP client and server streams set `TCP_NODELAY` by default, which keeps small
+control-plane responses from sitting behind Nagle delays while the hot wire path
+is moving large frames.
+
+`BLOSSOM_FRAME_WRITE_CHUNK_BYTES=N` makes encoded-frame writes use bounded
+write slices without changing the wire format. The default writes the whole
+frame slice and remains the compatibility baseline. Use this knob to profile
+whether a host benefits from smaller write calls before adopting a true chunked
+wire format.
 
 Raw hot dispatches are still resource-bounded after authentication. The quorum
 state rejects duplicate pending dispatches from the same `(sender, signature)`

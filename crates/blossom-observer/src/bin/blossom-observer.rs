@@ -61,9 +61,8 @@ async fn serve(bind: String, output: Option<PathBuf>, ui_bind: Option<String>) -
     };
     let output = match output {
         Some(path) => {
-            match path.parent() {
-                Some(parent) => std::fs::create_dir_all(parent)?,
-                None => {}
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent)?;
             }
             Some(Arc::new(std::sync::Mutex::new(std::io::BufWriter::new(
                 std::fs::OpenOptions::new()
@@ -110,9 +109,8 @@ async fn serve(bind: String, output: Option<PathBuf>, ui_bind: Option<String>) -
         }
     }
 
-    match ui_task {
-        Some(ui_task) => ui_task.abort(),
-        None => {}
+    if let Some(ui_task) = ui_task {
+        ui_task.abort();
     }
 
     Ok(())
@@ -127,20 +125,16 @@ async fn handle_connection(
     let mut output_batch = Vec::with_capacity(OUTPUT_BATCH_BYTES);
     while let Some(line) = lines.next_line().await? {
         collector.ingest_json_line(&line)?;
-        match output.as_ref() {
-            Some(output) => {
-                output_batch.extend_from_slice(line.as_bytes());
-                output_batch.push(b'\n');
-                if output_batch.len() >= OUTPUT_BATCH_BYTES {
-                    flush_output_batch(output, &mut output_batch)?;
-                }
+        if let Some(output) = output.as_ref() {
+            output_batch.extend_from_slice(line.as_bytes());
+            output_batch.push(b'\n');
+            if output_batch.len() >= OUTPUT_BATCH_BYTES {
+                flush_output_batch(output, &mut output_batch)?;
             }
-            None => {}
         }
     }
-    match output.as_ref() {
-        Some(output) => flush_output_batch(output, &mut output_batch)?,
-        None => {}
+    if let Some(output) = output.as_ref() {
+        flush_output_batch(output, &mut output_batch)?;
     }
     Ok(())
 }

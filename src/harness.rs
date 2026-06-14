@@ -12,7 +12,8 @@ use crate::node::NodeIdentity;
 use crate::nonce::Nonce;
 use crate::runtime::{EpochTarget, RuntimeConfig, TrustMode, genesis_epoch};
 use crate::tcp::{
-    TcpConnection, TcpNode, send_wire_frame, send_wire_request, send_wire_request_raw_response,
+    TcpConnection, TcpNode, TcpNodeMetrics, TcpNodeMetricsSnapshot, send_wire_frame,
+    send_wire_request, send_wire_request_raw_response,
 };
 use crate::wire::{
     EncodedFrame, WireRequest, WireResponse, read_wire_request, write_wire_response,
@@ -26,6 +27,7 @@ pub struct SimulatedNode {
     pub identity: NodeIdentity,
     pub service: Service,
     pub keypair: Keypair,
+    pub metrics: TcpNodeMetrics,
     handle: JoinHandle<()>,
 }
 
@@ -98,7 +100,8 @@ impl SimulatedCluster {
             config.genesis = Some(genesis.clone());
             config.trust_mode = trust_mode;
             let runtime = crate::NodeRuntime::new(config);
-            let node = TcpNode::new(runtime);
+            let metrics = TcpNodeMetrics::default();
+            let node = TcpNode::with_metrics(runtime, metrics.clone());
             let handle = tokio::spawn(async move {
                 if let Err(err) = node.serve(listener).await {
                     log::error!("simulated node {index} failed: {err}");
@@ -115,6 +118,7 @@ impl SimulatedCluster {
                 identity,
                 service,
                 keypair,
+                metrics,
                 handle,
             });
         }
@@ -136,6 +140,13 @@ impl SimulatedCluster {
 
     pub fn is_empty(&self) -> bool {
         self.nodes.is_empty()
+    }
+
+    pub fn node_metrics(&self) -> Vec<TcpNodeMetricsSnapshot> {
+        self.nodes
+            .iter()
+            .map(|node| node.metrics.snapshot())
+            .collect()
     }
 
     pub async fn request(&self, index: usize, request: WireRequest) -> Result<WireResponse> {
@@ -354,16 +365,15 @@ fn handle_mock_block_request(
                 .push(block);
             WireResponse::Ok
         }
-        WireRequest::Health => WireResponse::Health(crate::wire::NodeHealth {
-            status: "ok".to_string(),
-            public_key: crate::PubKey::default(),
-        }),
-        WireRequest::Ping(ping) => WireResponse::Pong(crate::wire::NodePong {
-            group_id: crate::ConsensusGroupId::root(),
-            public_key: crate::PubKey::default(),
-            nonce: ping.nonce,
-            payload: ping.payload,
-        }),
+        WireRequest::Health => {
+            WireResponse::Health(crate::wire::NodeHealth::new("ok", crate::PubKey::default()))
+        }
+        WireRequest::Ping(ping) => WireResponse::Pong(crate::wire::NodePong::new(
+            crate::ConsensusGroupId::root(),
+            crate::PubKey::default(),
+            ping.nonce,
+            ping.payload,
+        )),
         request => WireResponse::Error(format!(
             "unsupported mock block request {}",
             request_kind(&request)
@@ -439,6 +449,25 @@ mod tests {
         let cluster = SimulatedCluster::spawn_trusted(2).await.unwrap();
 
         assert_eq!(cluster.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn simulated_cluster_records_per_node_tcp_metrics() {
+        let cluster = SimulatedCluster::spawn(2).await.unwrap();
+
+        cluster
+            .request(1, WireRequest::Ping(crate::NodePing::new(7)))
+            .await
+            .unwrap();
+
+        let metrics = cluster.node_metrics();
+        assert_eq!(metrics.len(), 2);
+        assert_eq!(metrics[0].requests, 0);
+        assert_eq!(metrics[1].connections, 1);
+        assert_eq!(metrics[1].requests, 1);
+        assert_eq!(metrics[1].responses, 1);
+        assert_eq!(metrics[1].errors, 0);
+        assert!(metrics[1].handler_nanos > 0);
     }
 
     #[tokio::test]

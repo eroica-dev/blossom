@@ -5,8 +5,9 @@ use std::path::PathBuf;
 
 use blossom::{BlossomError, NodePing, TrustMode, WireRequest};
 use blossom_sim::{
-    DataPattern, DeterministicData, HermeticActionRecord, HermeticEventLog, HermeticOutcome,
-    HermeticPlan, HermeticSimConfig, run_plan,
+    ClusterProfile, CpuProfile, DataPattern, DeterministicData, HardwareFaultConfig,
+    HermeticActionRecord, HermeticEventLog, HermeticOutcome, HermeticPerfReport, HermeticPlan,
+    HermeticSimConfig, NodeProfile, run_plan_with_perf,
 };
 use clap::Parser;
 
@@ -51,9 +52,35 @@ struct Args {
     #[arg(long)]
     restart_after_ms: Option<u64>,
     #[arg(long)]
+    target_node: Option<usize>,
+    #[arg(long, value_delimiter = ',')]
+    cpu_nodes: Vec<usize>,
+    #[arg(long, default_value_t = 0)]
+    cpu_at_ms: u64,
+    #[arg(long, default_value_t = 0)]
+    cpu_delay_ms: u64,
+    #[arg(long, default_value_t = 0)]
+    cpu_jitter_ms: u64,
+    #[arg(long, default_value_t = 0)]
+    cpu_stall_ppm: u32,
+    #[arg(long, value_delimiter = ',')]
+    hardware_fault_nodes: Vec<usize>,
+    #[arg(long, default_value_t = 0)]
+    hardware_fault_at_ms: u64,
+    #[arg(long, default_value_t = 0)]
+    hardware_crash_ppm: u32,
+    #[arg(long, default_value_t = 0)]
+    hardware_io_error_ppm: u32,
+    #[arg(long, default_value_t = 0)]
+    hardware_memory_error_ppm: u32,
+    #[arg(long)]
     csv: Option<PathBuf>,
     #[arg(long)]
     event_log: Option<PathBuf>,
+    #[arg(long)]
+    perf_csv: Option<PathBuf>,
+    #[arg(long)]
+    profile_csv: Option<PathBuf>,
     #[arg(long)]
     bug_log: Option<PathBuf>,
     #[arg(long)]
@@ -71,36 +98,49 @@ async fn main() -> MainResult<()> {
     }
 
     let plan = build_plan(&args)?;
-    let log = run_plan(&plan).await?;
-    let summary = SimSummary::from_log(&args, &log);
+    let report = run_plan_with_perf(&plan).await?;
+    let summary = SimSummary::from_log(&args, &report.log);
     println!("{}", summary.to_csv());
 
-    match args.csv.as_ref() {
-        Some(path) => {
-            write_summary(path, &summary)?;
-            eprintln!("wrote {}", path.display());
-        }
-        None => {}
+    if let Some(path) = args.csv.as_ref() {
+        write_summary(path, &summary)?;
+        eprintln!("wrote {}", path.display());
     }
-    match args.event_log.as_ref() {
-        Some(path) => {
-            write_event_log(path, &log)?;
-            eprintln!("wrote {}", path.display());
-        }
-        None => {}
+    if let Some(path) = args.event_log.as_ref() {
+        write_event_log(path, &report.log)?;
+        eprintln!("wrote {}", path.display());
     }
-    match args.bug_log.as_ref() {
-        Some(path) => {
-            write_bug_log(path, &args, &summary, &log)?;
-            eprintln!("wrote {}", path.display());
-        }
-        None => {}
+    if let Some(path) = args.perf_csv.as_ref() {
+        write_perf_csv(path, &report.perf)?;
+        eprintln!("wrote {}", path.display());
+    }
+    if let Some(path) = args.profile_csv.as_ref() {
+        write_profile_csv(
+            path,
+            &ClusterProfile::from_perf_report(summary.final_time_ms, &report.perf.nodes),
+        )?;
+        eprintln!("wrote {}", path.display());
+    }
+    if let Some(path) = args.bug_log.as_ref() {
+        write_bug_log(path, &args, &summary, &report.log)?;
+        eprintln!("wrote {}", path.display());
     }
 
     Ok(())
 }
 
 fn build_plan(args: &Args) -> MainResult<HermeticPlan> {
+    match args.target_node {
+        Some(target_node) if target_node >= args.nodes => {
+            return Err(BlossomError::WireProtocol(format!(
+                "target-node {target_node} is outside node_count {}",
+                args.nodes
+            ))
+            .into());
+        }
+        _ => {}
+    }
+
     let mut plan = HermeticPlan::new(
         args.nodes,
         if args.trusted {
@@ -124,24 +164,50 @@ fn build_plan(args: &Args) -> MainResult<HermeticPlan> {
         );
     }
 
+    if !args.cpu_nodes.is_empty() {
+        plan.set_cpu(
+            args.cpu_at_ms,
+            args.cpu_nodes.iter().copied(),
+            CpuProfile {
+                processing_delay_ms: args.cpu_delay_ms,
+                jitter_ms: args.cpu_jitter_ms,
+                stall_ppm: args.cpu_stall_ppm,
+            },
+        );
+    }
+
+    if !args.hardware_fault_nodes.is_empty() {
+        plan.set_hardware_faults(
+            args.hardware_fault_at_ms,
+            args.hardware_fault_nodes.iter().copied(),
+            HardwareFaultConfig {
+                crash_ppm: args.hardware_crash_ppm,
+                io_error_ppm: args.hardware_io_error_ppm,
+                memory_error_ppm: args.hardware_memory_error_ppm,
+            },
+        );
+    }
+
     for node in &args.down_nodes {
         plan.node_down(args.down_at_ms, *node);
-        match args.up_at_ms.or_else(|| {
+        if let Some(up_at_ms) = args.up_at_ms.or_else(|| {
             args.restart_after_ms
                 .map(|restart_after_ms| args.down_at_ms.saturating_add(restart_after_ms))
         }) {
-            Some(up_at_ms) => {
-                plan.node_up(up_at_ms, *node);
-            }
-            None => {}
+            plan.node_up(up_at_ms, *node);
         }
     }
 
     let data = DeterministicData::new(args.seed, args.data_pattern);
     for request_index in 0..args.requests {
         let source = 0usize;
-        let target = (request_index % args.nodes.saturating_sub(1).max(1)) + 1;
-        let target = target.min(args.nodes - 1);
+        let target = match args.target_node {
+            Some(target_node) => target_node,
+            None => {
+                let target = (request_index % args.nodes.saturating_sub(1).max(1)) + 1;
+                target.min(args.nodes - 1)
+            }
+        };
         let payload = data.bytes(args.payload_bytes, target as u64, request_index as u64);
         plan.request(
             request_index as u64,
@@ -180,6 +246,7 @@ impl SimSummary {
         for record in &log.records {
             match record.outcome {
                 HermeticOutcome::Error { .. } => errors += 1,
+                HermeticOutcome::CpuStalled | HermeticOutcome::HardwareFault { .. } => errors += 1,
                 HermeticOutcome::Applied => applied_faults += 1,
                 _ => {}
             }
@@ -232,9 +299,8 @@ impl SimSummary {
 }
 
 fn write_summary(path: &PathBuf, summary: &SimSummary) -> MainResult<()> {
-    match path.parent() {
-        Some(parent) => create_dir_all(parent)?,
-        None => {}
+    if let Some(parent) = path.parent() {
+        create_dir_all(parent)?;
     }
     let mut file = OpenOptions::new()
         .create(true)
@@ -250,9 +316,8 @@ fn write_summary(path: &PathBuf, summary: &SimSummary) -> MainResult<()> {
 }
 
 fn write_event_log(path: &PathBuf, log: &HermeticEventLog) -> MainResult<()> {
-    match path.parent() {
-        Some(parent) => create_dir_all(parent)?,
-        None => {}
+    if let Some(parent) = path.parent() {
+        create_dir_all(parent)?;
     }
     let mut file = OpenOptions::new()
         .create(true)
@@ -269,15 +334,97 @@ fn write_event_log(path: &PathBuf, log: &HermeticEventLog) -> MainResult<()> {
     Ok(())
 }
 
+fn write_perf_csv(path: &PathBuf, perf: &HermeticPerfReport) -> MainResult<()> {
+    if let Some(parent) = path.parent() {
+        create_dir_all(parent)?;
+    }
+    let mut file = OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(path)?;
+    writeln!(
+        file,
+        "node,delivered_requests,handled_requests,responses,handler_errors,dropped,unavailable,cpu_stalled,hardware_faults,simulated_cpu_ms,simulated_cpu_wait_ms,observed_handler_nanos,observed_handler_nanos_per_handled"
+    )?;
+    for node in &perf.nodes {
+        let nanos_per_handled = if node.handled_requests == 0 {
+            0
+        } else {
+            node.observed_handler_nanos / node.handled_requests as u128
+        };
+        writeln!(
+            file,
+            "{},{},{},{},{},{},{},{},{},{},{},{},{}",
+            node.node,
+            node.delivered_requests,
+            node.handled_requests,
+            node.responses,
+            node.handler_errors,
+            node.dropped,
+            node.unavailable,
+            node.cpu_stalled,
+            node.hardware_faults,
+            node.simulated_cpu_ms,
+            node.simulated_cpu_wait_ms,
+            node.observed_handler_nanos,
+            nanos_per_handled
+        )?;
+    }
+    Ok(())
+}
+
+fn write_profile_csv(path: &PathBuf, profile: &ClusterProfile) -> MainResult<()> {
+    if let Some(parent) = path.parent() {
+        create_dir_all(parent)?;
+    }
+    let mut file = OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(path)?;
+    writeln!(
+        file,
+        "final_time_ms,node,delivered_requests,handled_requests,responses,handler_errors,dropped,unavailable,cpu_stalled,hardware_faults,simulated_cpu_ms,simulated_cpu_wait_ms,simulated_cpu_utilization_ppm,simulated_cpu_utilization_percent,observed_handler_nanos,observed_handler_nanos_per_handled,observed_cpu_ppm,observed_cpu_percent"
+    )?;
+    for node in &profile.nodes {
+        writeln!(file, "{}", profile_record_csv(profile.final_time_ms, node))?;
+    }
+    Ok(())
+}
+
+fn profile_record_csv(final_time_ms: u64, node: &NodeProfile) -> String {
+    format!(
+        "{},{},{},{},{},{},{},{},{},{},{},{},{},{:.3},{},{},{},{:.3}",
+        final_time_ms,
+        node.node,
+        node.delivered_requests,
+        node.handled_requests,
+        node.responses,
+        node.handler_errors,
+        node.dropped,
+        node.unavailable,
+        node.cpu_stalled,
+        node.hardware_faults,
+        node.simulated_cpu_ms,
+        node.simulated_cpu_wait_ms,
+        node.simulated_cpu_utilization_ppm,
+        node.simulated_cpu_utilization_percent(),
+        node.observed_handler_nanos,
+        node.observed_handler_nanos_per_handled,
+        node.observed_cpu_ppm,
+        node.observed_cpu_percent()
+    )
+}
+
 fn write_bug_log(
     path: &PathBuf,
     args: &Args,
     summary: &SimSummary,
     log: &HermeticEventLog,
 ) -> MainResult<()> {
-    match path.parent() {
-        Some(parent) => create_dir_all(parent)?,
-        None => {}
+    if let Some(parent) = path.parent() {
+        create_dir_all(parent)?;
     }
 
     let mut file = OpenOptions::new()
@@ -341,6 +488,39 @@ fn write_bug_log(
         args.restart_after_ms
             .map(|value| value.to_string())
             .unwrap_or_else(|| "disabled".to_string())
+    )?;
+    writeln!(
+        file,
+        "- target_node: {}",
+        args.target_node
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "round-robin".to_string())
+    )?;
+    writeln!(file, "- cpu_nodes: {}", format_node_list(&args.cpu_nodes))?;
+    writeln!(file, "- cpu_at_ms: {}", args.cpu_at_ms)?;
+    writeln!(file, "- cpu_delay_ms: {}", args.cpu_delay_ms)?;
+    writeln!(file, "- cpu_jitter_ms: {}", args.cpu_jitter_ms)?;
+    writeln!(file, "- cpu_stall_ppm: {}", args.cpu_stall_ppm)?;
+    writeln!(
+        file,
+        "- hardware_fault_nodes: {}",
+        format_node_list(&args.hardware_fault_nodes)
+    )?;
+    writeln!(
+        file,
+        "- hardware_fault_at_ms: {}",
+        args.hardware_fault_at_ms
+    )?;
+    writeln!(file, "- hardware_crash_ppm: {}", args.hardware_crash_ppm)?;
+    writeln!(
+        file,
+        "- hardware_io_error_ppm: {}",
+        args.hardware_io_error_ppm
+    )?;
+    writeln!(
+        file,
+        "- hardware_memory_error_ppm: {}",
+        args.hardware_memory_error_ppm
     )?;
     writeln!(
         file,
@@ -431,6 +611,35 @@ fn event_record_csv(record: &blossom_sim::HermeticEventRecord) -> String {
             latency_ms.to_string(),
             String::new(),
         ),
+        HermeticActionRecord::SetCpu { nodes, profile } => (
+            "set_cpu",
+            String::new(),
+            String::new(),
+            String::new(),
+            nodes
+                .iter()
+                .map(usize::to_string)
+                .collect::<Vec<_>>()
+                .join("|"),
+            profile.processing_delay_ms.to_string(),
+            format!("stall_ppm={}", profile.stall_ppm),
+        ),
+        HermeticActionRecord::SetHardwareFaults { nodes, faults } => (
+            "set_hardware_faults",
+            String::new(),
+            String::new(),
+            String::new(),
+            nodes
+                .iter()
+                .map(usize::to_string)
+                .collect::<Vec<_>>()
+                .join("|"),
+            String::new(),
+            format!(
+                "crash_ppm={};io_error_ppm={};memory_error_ppm={}",
+                faults.crash_ppm, faults.io_error_ppm, faults.memory_error_ppm
+            ),
+        ),
     };
     let (outcome, response_kind, message) = match &record.outcome {
         HermeticOutcome::Response { response_kind } => {
@@ -439,6 +648,10 @@ fn event_record_csv(record: &blossom_sim::HermeticEventRecord) -> String {
         HermeticOutcome::Error { message } => ("error", String::new(), sanitize_csv(message)),
         HermeticOutcome::Dropped => ("dropped", String::new(), String::new()),
         HermeticOutcome::NodeUnavailable => ("node_unavailable", String::new(), String::new()),
+        HermeticOutcome::CpuStalled => ("cpu_stalled", String::new(), String::new()),
+        HermeticOutcome::HardwareFault { kind } => {
+            ("hardware_fault", String::new(), kind.as_str().to_string())
+        }
         HermeticOutcome::Applied => ("applied", String::new(), String::new()),
     };
 
@@ -509,6 +722,23 @@ fn collect_incidents(args: &Args, log: &HermeticEventLog) -> Vec<BugIncident> {
         });
     }
 
+    let resource_fault_records = records_with(log, |record| {
+        matches!(
+            record.outcome,
+            HermeticOutcome::CpuStalled | HermeticOutcome::HardwareFault { .. }
+        )
+    });
+    if !resource_fault_records.is_empty() {
+        incidents.push(BugIncident {
+            severity: "info",
+            title: "CPU or hardware faults were injected".to_string(),
+            count: resource_fault_records.len(),
+            expected_under_faults: true,
+            event_ids: sample_event_ids(&resource_fault_records),
+            note: "These failures come from deterministic resource fault controls. Use the event log to correlate with node and request timing.".to_string(),
+        });
+    }
+
     let unavailable_by_node = unavailable_by_target(log);
     for (node, records) in unavailable_by_node {
         incidents.push(BugIncident {
@@ -525,25 +755,22 @@ fn collect_incidents(args: &Args, log: &HermeticEventLog) -> Vec<BugIncident> {
         });
     }
 
-    match args.bug_latency_budget_ms {
-        Some(budget_ms) => {
-            let slow_records = records_with(log, |record| {
-                matches!(record.action, HermeticActionRecord::Request { .. })
-                    && matches!(record.outcome, HermeticOutcome::Response { .. })
-                    && record.delivered_at_ms.saturating_sub(record.planned_at_ms) > budget_ms
+    if let Some(budget_ms) = args.bug_latency_budget_ms {
+        let slow_records = records_with(log, |record| {
+            matches!(record.action, HermeticActionRecord::Request { .. })
+                && matches!(record.outcome, HermeticOutcome::Response { .. })
+                && record.delivered_at_ms.saturating_sub(record.planned_at_ms) > budget_ms
+        });
+        if !slow_records.is_empty() {
+            incidents.push(BugIncident {
+                severity: "medium",
+                title: format!("Requests exceeded {budget_ms}ms latency budget"),
+                count: slow_records.len(),
+                expected_under_faults: !args.slow_nodes.is_empty(),
+                event_ids: sample_event_ids(&slow_records),
+                note: "Latency budget is caller-defined. Use the event log to inspect the target nodes and injected latency rules.".to_string(),
             });
-            if !slow_records.is_empty() {
-                incidents.push(BugIncident {
-                    severity: "medium",
-                    title: format!("Requests exceeded {budget_ms}ms latency budget"),
-                    count: slow_records.len(),
-                    expected_under_faults: !args.slow_nodes.is_empty(),
-                    event_ids: sample_event_ids(&slow_records),
-                    note: "Latency budget is caller-defined. Use the event log to inspect the target nodes and injected latency rules.".to_string(),
-                });
-            }
         }
-        None => {}
     }
 
     let request_records = log
@@ -652,9 +879,41 @@ fn replay_command(args: &Args) -> String {
             (None, None) => {}
         }
     }
-    match args.bug_latency_budget_ms {
-        Some(budget_ms) => push_arg_value(&mut parts, "--bug-latency-budget-ms", budget_ms),
-        None => {}
+    if let Some(target_node) = args.target_node {
+        push_arg_value(&mut parts, "--target-node", target_node);
+    }
+    if !args.cpu_nodes.is_empty() {
+        push_arg_value(&mut parts, "--cpu-nodes", join_nodes(&args.cpu_nodes));
+        push_arg_value(&mut parts, "--cpu-at-ms", args.cpu_at_ms);
+        push_arg_value(&mut parts, "--cpu-delay-ms", args.cpu_delay_ms);
+        push_arg_value(&mut parts, "--cpu-jitter-ms", args.cpu_jitter_ms);
+        push_arg_value(&mut parts, "--cpu-stall-ppm", args.cpu_stall_ppm);
+    }
+    if !args.hardware_fault_nodes.is_empty() {
+        push_arg_value(
+            &mut parts,
+            "--hardware-fault-nodes",
+            join_nodes(&args.hardware_fault_nodes),
+        );
+        push_arg_value(
+            &mut parts,
+            "--hardware-fault-at-ms",
+            args.hardware_fault_at_ms,
+        );
+        push_arg_value(&mut parts, "--hardware-crash-ppm", args.hardware_crash_ppm);
+        push_arg_value(
+            &mut parts,
+            "--hardware-io-error-ppm",
+            args.hardware_io_error_ppm,
+        );
+        push_arg_value(
+            &mut parts,
+            "--hardware-memory-error-ppm",
+            args.hardware_memory_error_ppm,
+        );
+    }
+    if let Some(budget_ms) = args.bug_latency_budget_ms {
+        push_arg_value(&mut parts, "--bug-latency-budget-ms", budget_ms);
     }
     parts.join(" ")
 }

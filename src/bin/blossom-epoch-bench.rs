@@ -297,12 +297,9 @@ async fn main() -> MainResult<()> {
         rows.push(row);
     }
 
-    match args.csv {
-        Some(path) => {
-            write_csv(&path, args.append, &rows)?;
-            eprintln!("wrote {}", path.display());
-        }
-        None => {}
+    if let Some(path) = args.csv {
+        write_csv(&path, args.append, &rows)?;
+        eprintln!("wrote {}", path.display());
     }
 
     Ok(())
@@ -1219,9 +1216,8 @@ fn epoch_hash(last_epoch: HashType, nonce: Nonce, blocks_hash: HashType) -> Hash
 }
 
 fn write_csv(path: &PathBuf, append: bool, rows: &[EpochBenchRow]) -> MainResult<()> {
-    match path.parent() {
-        Some(parent) => create_dir_all(parent)?,
-        None => {}
+    if let Some(parent) = path.parent() {
+        create_dir_all(parent)?;
     }
 
     let write_header = !append || !path.exists() || path.metadata()?.len() == 0;

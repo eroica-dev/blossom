@@ -6,6 +6,7 @@
 //! without carrying the rest of Eden's database or actor stack.
 
 pub mod address_book;
+pub mod admission;
 pub mod algorithm;
 #[cfg(feature = "availability-gossip")]
 pub mod availability;
@@ -35,7 +36,15 @@ pub mod tcp;
 pub mod telemetry;
 pub mod wire;
 
+#[cfg(any(
+    feature = "propagation-adaptive",
+    feature = "propagation-inventory",
+    feature = "propagation-push"
+))]
+pub use blossom_propagation as propagation;
+
 pub use address_book::{AddressBook, Service, ServiceKind};
+pub use admission::{NODE_ADMISSION_DOMAIN, NodeAdmission, NodeAdmissionBody};
 pub use algorithm::{
     QUORUM_SIZE, SUPERMAJORITY, byzantine_fault_bound, distinct_current_validator_count,
     has_distinct_supermajority, has_supermajority, max_liveness_omissions,
@@ -68,13 +77,17 @@ pub use encounter::{
 pub use error::{BlossomError, Result};
 pub use group::ConsensusGroupId;
 pub use harness::{MockBlockService, SimulatedCluster, SimulatedNode, signed_block};
-pub use hash::{DoHash, HashType};
+pub use hash::{
+    DoHash, HashType, SHA256_PROTOCOL_HASH_ALGORITHM, XXH3_PROTOCOL_HASH_ALGORITHM,
+    protocol_hash_algorithm, protocol_hash_algorithm_is_compatible,
+};
 pub use indextreemap::{IndexTreeMap, SharedIndexTreeMap};
 pub use local_block::LocalBlock;
 pub use membership::{
-    ConsensusNodeRemovalDecision, ConsensusNodeRemovalPlan, ConsensusNodeRemovalPolicy,
+    ConsensusNodeAdmissionPlan, ConsensusNodeRemovalDecision, ConsensusNodeRemovalPlan,
+    ConsensusNodeRemovalPolicy, apply_consensus_node_admission_plan,
     apply_consensus_node_removal_plan, apply_epoch_membership_transition,
-    derive_consensus_node_removal_plan,
+    derive_consensus_node_admission_plan, derive_consensus_node_removal_plan,
 };
 pub use messages::{MSGKey, Msg};
 pub use node::{NodeIdentity, NodeType};
@@ -107,18 +120,20 @@ pub use subset_gossip::{
     run_subset_gossip_v1, run_subset_gossip_v2,
 };
 pub use tcp::{
-    TcpConnection, TcpMultiGroupNode, TcpNode, send_wire_frame, send_wire_request,
-    send_wire_request_raw_response,
+    TcpConnection, TcpMultiGroupNode, TcpNode, TcpNodeMetrics, TcpNodeMetricsSnapshot,
+    send_wire_frame, send_wire_request, send_wire_request_raw_response,
 };
 pub use telemetry::{
     InMemoryTelemetrySink, JsonlTcpTelemetrySink, JsonlTcpTelemetrySinkConfig, NoopTelemetrySink,
     TELEMETRY_SCHEMA_VERSION, TelemetryEvent, TelemetryEventKind, TelemetryHandle, TelemetrySink,
 };
 pub use wire::{
-    AddressBookUpdate, EncodedFrame, FRAME_PREFIX_BYTES, HOT_WIRE_CODEC_ENV, HotDispatch,
-    NodeHealth, NodePing, NodePong, WireRequest, WireRequestFrame, WireResponse,
+    AddressBookUpdate, EncodedFrame, FRAME_PREFIX_BYTES, FRAME_WRITE_CHUNK_BYTES_ENV,
+    HOT_WIRE_CODEC_ENV, HotDispatch, NodeHealth, NodePing, NodePong, ServiceRegistration,
+    WireRequest, WireRequestFrame, WireResponse, configured_frame_write_chunk_bytes,
     configured_max_frame_size, decode_wire_request_frame, decode_wire_request_payload,
-    decode_wire_response_payload, encoded_len, framed_len, hot_dispatch_response_to_request_frame,
+    decode_wire_response_payload, encoded_len, framed_len,
+    hot_dispatch_response_into_request_frame, hot_dispatch_response_to_request_frame,
     hot_wire_codec_enabled, hot_wire_request_framed_len, hot_wire_response_framed_len,
     read_encoded_frame, read_frame, read_wire_request, read_wire_request_frame,
     read_wire_request_frame_optional, read_wire_response, wire_request_framed_len,

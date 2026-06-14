@@ -42,7 +42,7 @@ async fn main() -> MainResult<()> {
         cluster
             .request(
                 0,
-                WireRequest::RegisterService(block_service.service.clone()),
+                WireRequest::RegisterService(block_service.service.clone().into()),
             )
             .await?,
         "address-book update",

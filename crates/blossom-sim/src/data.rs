@@ -1,6 +1,8 @@
 use std::fmt;
 use std::str::FromStr;
 
+pub use deterministic_test_env::splitmix64;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DataPattern {
     Zero,
@@ -95,14 +97,6 @@ impl DeterministicData {
             }
         }
     }
-}
-
-pub fn splitmix64(mut value: u64) -> u64 {
-    value = value.wrapping_add(0x9e37_79b9_7f4a_7c15);
-    let mut z = value;
-    z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
-    z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
-    z ^ (z >> 31)
 }
 
 #[cfg(test)]

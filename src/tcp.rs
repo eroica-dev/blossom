@@ -1,3 +1,7 @@
+use std::sync::Arc;
+use std::time::Instant;
+
+use fast_telemetry::Counter;
 use tokio::net::{TcpListener, TcpStream};
 
 use crate::address_book::ServiceKind;
@@ -18,6 +22,7 @@ use crate::wire::{
 pub struct TcpNode {
     pub runtime: NodeRuntime,
     pub services: TcpServiceClient,
+    metrics: Option<TcpNodeMetrics>,
 }
 
 impl TcpNode {
@@ -25,11 +30,28 @@ impl TcpNode {
         Self {
             runtime,
             services: TcpServiceClient::new(),
+            metrics: None,
         }
     }
 
     pub fn with_services(runtime: NodeRuntime, services: TcpServiceClient) -> Self {
-        Self { runtime, services }
+        Self {
+            runtime,
+            services,
+            metrics: None,
+        }
+    }
+
+    pub fn with_metrics(runtime: NodeRuntime, metrics: TcpNodeMetrics) -> Self {
+        Self {
+            runtime,
+            services: TcpServiceClient::new(),
+            metrics: Some(metrics),
+        }
+    }
+
+    pub fn metrics(&self) -> Option<TcpNodeMetricsSnapshot> {
+        self.metrics.as_ref().map(TcpNodeMetrics::snapshot)
     }
 
     pub async fn serve(self, listener: TcpListener) -> Result<()> {
@@ -39,6 +61,9 @@ impl TcpNode {
                 .await
                 .map_err(|err| BlossomError::Io(err.to_string()))?;
             let node = self.clone();
+            if let Some(metrics) = &node.metrics {
+                metrics.record_connection();
+            }
             tokio::spawn(async move {
                 if let Err(err) = node.handle_connection(stream).await {
                     log::error!("connection failed: {err}");
@@ -48,8 +73,14 @@ impl TcpNode {
     }
 
     pub async fn handle_connection(&self, mut stream: TcpStream) -> Result<()> {
+        configure_tcp_stream(&stream)?;
         while let Some(request) = read_wire_request_frame_optional(&mut stream).await? {
-            let response = match self.handle_request_frame(request).await {
+            let started = Instant::now();
+            let result = self.handle_request_frame(request).await;
+            if let Some(metrics) = &self.metrics {
+                metrics.record_request(started.elapsed().as_nanos(), result.is_ok());
+            }
+            let response = match result {
                 Ok(response) => response,
                 Err(err) => WireResponse::Error(err.to_string()),
             };
@@ -78,6 +109,73 @@ impl TcpNode {
             request => handle_runtime_request(&self.runtime, &self.services, request).await,
         }
     }
+}
+
+#[derive(Clone, Default)]
+pub struct TcpNodeMetrics {
+    inner: Arc<TcpNodeMetricsInner>,
+}
+
+struct TcpNodeMetricsInner {
+    connections: Counter,
+    requests: Counter,
+    responses: Counter,
+    errors: Counter,
+    handler_nanos: Counter,
+}
+
+impl Default for TcpNodeMetricsInner {
+    fn default() -> Self {
+        Self {
+            connections: Counter::new(64),
+            requests: Counter::new(64),
+            responses: Counter::new(64),
+            errors: Counter::new(64),
+            handler_nanos: Counter::new(64),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TcpNodeMetricsSnapshot {
+    pub connections: u64,
+    pub requests: u64,
+    pub responses: u64,
+    pub errors: u64,
+    pub handler_nanos: u64,
+}
+
+impl TcpNodeMetrics {
+    pub fn snapshot(&self) -> TcpNodeMetricsSnapshot {
+        TcpNodeMetricsSnapshot {
+            connections: counter_sum_u64(&self.inner.connections),
+            requests: counter_sum_u64(&self.inner.requests),
+            responses: counter_sum_u64(&self.inner.responses),
+            errors: counter_sum_u64(&self.inner.errors),
+            handler_nanos: counter_sum_u64(&self.inner.handler_nanos),
+        }
+    }
+
+    fn record_connection(&self) {
+        self.inner.connections.inc();
+    }
+
+    fn record_request(&self, nanos: u128, success: bool) {
+        self.inner.requests.inc();
+        match success {
+            true => self.inner.responses.inc(),
+            false => self.inner.errors.inc(),
+        };
+        counter_add_u128(&self.inner.handler_nanos, nanos);
+    }
+}
+
+fn counter_sum_u64(counter: &Counter) -> u64 {
+    u64::try_from(counter.sum()).unwrap_or_default()
+}
+
+fn counter_add_u128(counter: &Counter, value: u128) {
+    counter.add(isize::try_from(value).unwrap_or(isize::MAX));
 }
 
 #[derive(Clone)]
@@ -114,6 +212,7 @@ impl TcpMultiGroupNode {
     }
 
     pub async fn handle_connection(&self, mut stream: TcpStream) -> Result<()> {
+        configure_tcp_stream(&stream)?;
         while let Some(request) = read_wire_request_frame_optional(&mut stream).await? {
             let response = match self.handle_request_frame(request).await {
                 Ok(response) => response,
@@ -162,16 +261,16 @@ async fn handle_runtime_request(
     request: WireRequest,
 ) -> Result<WireResponse> {
     match request {
-        WireRequest::Health => Ok(WireResponse::Health(NodeHealth {
-            status: "ok".to_string(),
-            public_key: runtime.self_node().public_key(),
-        })),
-        WireRequest::Ping(ping) => Ok(WireResponse::Pong(NodePong {
-            group_id: runtime.group_id(),
-            public_key: runtime.self_node().public_key(),
-            nonce: ping.nonce,
-            payload: ping.payload,
-        })),
+        WireRequest::Health => Ok(WireResponse::Health(NodeHealth::new(
+            "ok",
+            runtime.self_node().public_key(),
+        ))),
+        WireRequest::Ping(ping) => Ok(WireResponse::Pong(NodePong::new(
+            runtime.group_id(),
+            runtime.self_node().public_key(),
+            ping.nonce,
+            ping.payload,
+        ))),
         #[cfg(feature = "availability-gossip")]
         WireRequest::AvailabilityGossip(gossip) => Ok(WireResponse::AvailabilityReceipt(
             runtime.receive_availability_gossip(gossip)?,
@@ -203,8 +302,13 @@ async fn handle_runtime_request(
         )),
         WireRequest::State => Ok(WireResponse::State(runtime.status()?)),
         WireRequest::AddressBook => Ok(WireResponse::AddressBook(runtime.address_book())),
-        WireRequest::RegisterService(service) => {
+        WireRequest::RegisterService(registration) => {
+            let (service, admission) = registration.into_parts();
             let previous = runtime.register_service(service.clone());
+            let admitted_node = match admission {
+                Some(admission) => runtime.stage_node_admission(admission)?,
+                None => None,
+            };
             let nonce_announced = if service.kind == ServiceKind::Block {
                 let target = runtime.next_epoch_target()?;
                 services.send_nonce(&service, target.nonce).await?;
@@ -216,6 +320,7 @@ async fn handle_runtime_request(
                 service,
                 previous,
                 nonce_announced,
+                admitted_node,
             }))
         }
         WireRequest::NextNonce => Ok(WireResponse::NextNonce(runtime.next_epoch_target()?)),
@@ -259,6 +364,7 @@ impl TcpConnection {
         let stream = TcpStream::connect(addr.as_ref())
             .await
             .map_err(|err| BlossomError::Io(err.to_string()))?;
+        configure_tcp_stream(&stream)?;
         Ok(Self { stream })
     }
 
@@ -276,6 +382,12 @@ impl TcpConnection {
         write_wire_request(&mut self.stream, request).await?;
         read_encoded_frame(&mut self.stream).await
     }
+}
+
+fn configure_tcp_stream(stream: &TcpStream) -> Result<()> {
+    stream
+        .set_nodelay(true)
+        .map_err(|err| BlossomError::Io(err.to_string()))
 }
 
 pub async fn send_wire_request(
@@ -330,7 +442,10 @@ mod tests {
         let (node, keypair) = tcp_node();
 
         match node.handle_request(WireRequest::Health).await.unwrap() {
-            WireResponse::Health(health) => assert_eq!(health.public_key, keypair.public),
+            WireResponse::Health(health) => {
+                assert_eq!(health.public_key, keypair.public);
+                assert!(health.protocol_hash_compatible());
+            }
             response => panic!("expected health, got {}", response.kind()),
         }
 
@@ -353,6 +468,7 @@ mod tests {
             WireResponse::Pong(pong) => {
                 assert_eq!(pong.group_id, ConsensusGroupId::root());
                 assert_eq!(pong.public_key, keypair.public);
+                assert!(pong.protocol_hash_compatible());
                 assert_eq!(pong.nonce, 42);
                 assert_eq!(pong.payload, b"hello-peer");
             }

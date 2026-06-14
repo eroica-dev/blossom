@@ -107,6 +107,10 @@ impl AddressBook {
         Self::default()
     }
 
+    /// Adds or replaces a service endpoint keyed by `(kind, public_key)`.
+    ///
+    /// The address book is local reachability metadata. It does not prove key
+    /// ownership or change consensus verifier membership.
     pub fn add(&mut self, service: Service) -> Option<Service> {
         self.services
             .insert((service.kind, service.public_key), service)

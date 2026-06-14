@@ -143,6 +143,17 @@ approvals rejoin the active set. Successful joins emit
 `membership_reconnect/node_reconnected` with `outcome=reconnected`, including
 the ping response count, catch-up proof count, and approval count.
 
+The production/runtime boundary for this lifecycle is documented in
+[`docs/node-lifecycle.md`](node-lifecycle.md): plain address-book registration is
+reachability metadata, signed public-node admission is committed through
+validator supermajorities, and dropped-node reconnect still needs production
+catch-up proof wiring before public trustless deployment.
+
+Runtime counters on the TCP and JSONL export hot paths use `fast-telemetry`
+`0.5.1` sharded counters. Blossom still emits its stable JSONL event schema to
+the observer, but local request/error/drop accounting no longer relies on one
+shared atomic per counter.
+
 The simulator now makes the trusted/trustless split explicit. Trusted mode is
 for operational environments where nodes may be faulty, partitioned, or stale,
 but are not intentionally Byzantine; it permits smaller repair-oriented

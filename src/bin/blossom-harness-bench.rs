@@ -4,12 +4,13 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 use clap::{Parser, ValueEnum};
+use tokio::runtime::Builder as TokioRuntimeBuilder;
 
 use blossom::{
     Block, BlossomError, EncodedFrame, FRAME_PREFIX_BYTES, MockBlockService, Msg, SimulatedCluster,
-    Transaction, WireRequest, WireResponse, decode_wire_response_payload, encoded_len, framed_len,
-    hot_dispatch_response_to_request_frame, hot_wire_codec_enabled, signed_block,
-    wire_request_framed_len, wire_response_framed_len,
+    TcpNodeMetricsSnapshot, Transaction, WireRequest, WireResponse, decode_wire_response_payload,
+    encoded_len, framed_len, hot_dispatch_response_into_request_frame, hot_wire_codec_enabled,
+    signed_block, wire_request_framed_len, wire_response_framed_len,
 };
 
 type MainResult<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
@@ -41,6 +42,14 @@ struct Args {
     #[arg(long)]
     csv: Option<PathBuf>,
     #[arg(long)]
+    node_perf_csv: Option<PathBuf>,
+    #[arg(long)]
+    focus_node: Option<usize>,
+    #[arg(long, value_enum, default_value = "multi-thread")]
+    runtime_flavor: RuntimeFlavor,
+    #[arg(long)]
+    runtime_worker_threads: Option<usize>,
+    #[arg(long)]
     append: bool,
 }
 
@@ -53,12 +62,45 @@ struct IterationConfig {
     delivery_mode: DeliveryMode,
     trusted: bool,
     external_transaction_hashes: bool,
+    focus_node: Option<usize>,
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
 enum DeliveryMode {
     FirstAccepted,
     AllPeers,
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
+enum RuntimeFlavor {
+    MultiThread,
+    CurrentThread,
+}
+
+impl RuntimeFlavor {
+    fn build(self, worker_threads: Option<usize>) -> MainResult<tokio::runtime::Runtime> {
+        match self {
+            Self::MultiThread => {
+                let mut builder = TokioRuntimeBuilder::new_multi_thread();
+                if let Some(worker_threads) = worker_threads {
+                    builder.worker_threads(worker_threads);
+                }
+                Ok(builder.enable_all().build()?)
+            }
+            Self::CurrentThread => {
+                if worker_threads.is_some() {
+                    return Err(BlossomError::WireProtocol(
+                        "--runtime-worker-threads is only valid with --runtime-flavor multi-thread"
+                            .to_string(),
+                    )
+                    .into());
+                }
+                Ok(TokioRuntimeBuilder::new_current_thread()
+                    .enable_all()
+                    .build()?)
+            }
+        }
+    }
 }
 
 impl DeliveryMode {
@@ -105,9 +147,31 @@ struct HarnessBenchRow {
     delivered: bool,
 }
 
-#[tokio::main]
-async fn main() -> MainResult<()> {
+#[derive(Debug, Clone)]
+struct HarnessBenchIteration {
+    row: HarnessBenchRow,
+    node_rows: Vec<NodePerfBenchRow>,
+}
+
+#[derive(Debug, Clone)]
+struct NodePerfBenchRow {
+    iteration: usize,
+    node: usize,
+    focus: bool,
+    connections: u64,
+    requests: u64,
+    responses: u64,
+    errors: u64,
+    handler_nanos: u64,
+}
+
+fn main() -> MainResult<()> {
     let args = Args::parse();
+    let runtime = args.runtime_flavor.build(args.runtime_worker_threads)?;
+    runtime.block_on(run(args))
+}
+
+async fn run(args: Args) -> MainResult<()> {
     if args.external_transaction_hashes && !cfg!(feature = "external-transaction-hashes") {
         return Err(BlossomError::WireProtocol(
             "--external-transaction-hashes requires the external-transaction-hashes feature"
@@ -124,6 +188,7 @@ async fn main() -> MainResult<()> {
         delivery_mode: args.delivery_mode,
         trusted: args.trusted,
         external_transaction_hashes: args.external_transaction_hashes,
+        focus_node: args.focus_node,
     };
 
     for _ in 0..args.warmup {
@@ -131,23 +196,31 @@ async fn main() -> MainResult<()> {
     }
 
     for iteration in 0..args.iterations {
-        let row = run_iteration(iteration, config).await?;
-        println!("{}", row.to_csv());
-        rows.push(row);
+        let iteration = run_iteration(iteration, config).await?;
+        println!("{}", iteration.row.to_csv());
+        write_node_perf_csv_incremental(
+            args.node_perf_csv.as_ref(),
+            args.append,
+            &iteration.node_rows,
+        )?;
+        rows.push(iteration.row);
     }
 
-    match args.csv {
-        Some(path) => {
-            write_csv(&path, args.append, &rows)?;
-            eprintln!("wrote {}", path.display());
-        }
-        None => {}
+    if let Some(path) = args.csv {
+        write_csv(&path, args.append, &rows)?;
+        eprintln!("wrote {}", path.display());
+    }
+    if let Some(path) = args.node_perf_csv.as_ref() {
+        eprintln!("wrote {}", path.display());
     }
 
     Ok(())
 }
 
-async fn run_iteration(iteration: usize, config: IterationConfig) -> MainResult<HarnessBenchRow> {
+async fn run_iteration(
+    iteration: usize,
+    config: IterationConfig,
+) -> MainResult<HarnessBenchIteration> {
     let total_start = Instant::now();
     let mut total_wire_bytes = 0usize;
 
@@ -162,7 +235,7 @@ async fn run_iteration(iteration: usize, config: IterationConfig) -> MainResult<
     let spawn_us = spawn_start.elapsed().as_micros();
 
     let register_start = Instant::now();
-    let register_request = WireRequest::RegisterService(block_service.service.clone());
+    let register_request = WireRequest::RegisterService(block_service.service.clone().into());
     let register_request_bytes = framed_len(&register_request)?;
     let register_response = node0.request(&register_request).await?;
     let register_response_bytes = framed_len(&register_response)?;
@@ -240,8 +313,14 @@ async fn run_iteration(iteration: usize, config: IterationConfig) -> MainResult<
     let (deliver_frame, blocks_dispatched, dispatch_response_bytes) = if hot_wire_codec_enabled() {
         let dispatch_response_frame = node0.request_raw_response(&dispatch_request).await?;
         let dispatch_response_bytes = dispatch_response_frame.framed_len();
-        match hot_dispatch_response_to_request_frame(&dispatch_response_frame)? {
-            Some((frame, blocks_dispatched)) => (frame, blocks_dispatched, dispatch_response_bytes),
+        let (dispatch_response_frame, blocks_dispatched) =
+            hot_dispatch_response_into_request_frame(dispatch_response_frame)?;
+        match blocks_dispatched {
+            Some(blocks_dispatched) => (
+                dispatch_response_frame,
+                blocks_dispatched,
+                dispatch_response_bytes,
+            ),
             None => {
                 let dispatch_response = decode_wire_response_payload(
                     &dispatch_response_frame.as_bytes()[FRAME_PREFIX_BYTES..],
@@ -296,7 +375,16 @@ async fn run_iteration(iteration: usize, config: IterationConfig) -> MainResult<
     let deliver_us = deliver_start.elapsed().as_micros();
     total_wire_bytes += deliver_wire_bytes;
 
-    Ok(HarnessBenchRow {
+    let node_rows = cluster
+        .node_metrics()
+        .into_iter()
+        .enumerate()
+        .map(|(node, snapshot)| {
+            NodePerfBenchRow::from_snapshot(iteration, node, config.focus_node, snapshot)
+        })
+        .collect();
+
+    let row = HarnessBenchRow {
         iteration,
         nodes: config.nodes,
         transactions: config.transactions,
@@ -328,7 +416,9 @@ async fn run_iteration(iteration: usize, config: IterationConfig) -> MainResult<
         deliveries_accepted,
         nonce_announced,
         delivered,
-    })
+    };
+
+    Ok(HarnessBenchIteration { row, node_rows })
 }
 
 fn build_transactions(
@@ -444,9 +534,8 @@ fn deliver_frame_from_dispatch_response(
 }
 
 fn write_csv(path: &PathBuf, append: bool, rows: &[HarnessBenchRow]) -> MainResult<()> {
-    match path.parent() {
-        Some(parent) => create_dir_all(parent)?,
-        None => {}
+    if let Some(parent) = path.parent() {
+        create_dir_all(parent)?;
     }
 
     let write_header = !append || !path.exists() || path.metadata()?.len() == 0;
@@ -461,6 +550,42 @@ fn write_csv(path: &PathBuf, append: bool, rows: &[HarnessBenchRow]) -> MainResu
         writeln!(
             file,
             "iteration,nodes,transactions,transaction_bytes,application_state_bytes,delivery_mode,trusted,external_transaction_hashes,tx_payload_bytes,accepted_application_state_bytes,block_bytes,register_wire_bytes,next_nonce_wire_bytes,submit_wire_bytes,dispatch_wire_bytes,deliver_wire_bytes,total_wire_bytes,spawn_us,tx_build_us,block_sign_us,register_us,next_nonce_us,submit_us,dispatch_us,deliver_us,total_us,blocks_dispatched,deliveries_attempted,deliveries_accepted,nonce_announced,delivered"
+        )?;
+    }
+    for row in rows {
+        writeln!(file, "{}", row.to_csv())?;
+    }
+    Ok(())
+}
+
+fn write_node_perf_csv_incremental(
+    path: Option<&PathBuf>,
+    append: bool,
+    rows: &[NodePerfBenchRow],
+) -> MainResult<()> {
+    match path {
+        Some(path) => write_node_perf_csv(path, append || rows[0].iteration > 0, rows),
+        None => Ok(()),
+    }
+}
+
+fn write_node_perf_csv(path: &PathBuf, append: bool, rows: &[NodePerfBenchRow]) -> MainResult<()> {
+    if let Some(parent) = path.parent() {
+        create_dir_all(parent)?;
+    }
+
+    let write_header = !append || !path.exists() || path.metadata()?.len() == 0;
+    let mut file = OpenOptions::new()
+        .create(true)
+        .append(append)
+        .write(true)
+        .truncate(!append)
+        .open(path)?;
+
+    if write_header {
+        writeln!(
+            file,
+            "iteration,node,focus,connections,requests,responses,errors,handler_nanos,handler_nanos_per_request"
         )?;
     }
     for row in rows {
@@ -504,6 +629,45 @@ impl HarnessBenchRow {
             self.deliveries_accepted,
             self.nonce_announced,
             self.delivered
+        )
+    }
+}
+
+impl NodePerfBenchRow {
+    fn from_snapshot(
+        iteration: usize,
+        node: usize,
+        focus_node: Option<usize>,
+        snapshot: TcpNodeMetricsSnapshot,
+    ) -> Self {
+        Self {
+            iteration,
+            node,
+            focus: focus_node == Some(node),
+            connections: snapshot.connections,
+            requests: snapshot.requests,
+            responses: snapshot.responses,
+            errors: snapshot.errors,
+            handler_nanos: snapshot.handler_nanos,
+        }
+    }
+
+    fn to_csv(&self) -> String {
+        let nanos_per_request = match self.requests {
+            0 => 0,
+            requests => self.handler_nanos / requests,
+        };
+        format!(
+            "{},{},{},{},{},{},{},{},{}",
+            self.iteration,
+            self.node,
+            self.focus,
+            self.connections,
+            self.requests,
+            self.responses,
+            self.errors,
+            self.handler_nanos,
+            nanos_per_request,
         )
     }
 }

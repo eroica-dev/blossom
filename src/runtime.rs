@@ -7,6 +7,7 @@ use indextreemap::IndexTreeMap;
 use serde::{Deserialize, Serialize};
 
 use crate::address_book::{AddressBook, Service, ServiceKind};
+use crate::admission::NodeAdmission;
 #[cfg(feature = "availability-gossip")]
 use crate::availability::{
     AvailabilityEntry, AvailabilityGossip, AvailabilityGossipBody, AvailabilityReceipt,
@@ -294,12 +295,60 @@ impl NodeRuntime {
             .into_services()
     }
 
+    pub fn current_verifiers(&self) -> Vec<NodeIdentity> {
+        let state = self.inner.state.read().expect("state lock poisoned");
+        state
+            .epochchain
+            .epochchain
+            .last()
+            .map(|epoch| {
+                epoch
+                    .body
+                    .verifiers
+                    .values()
+                    .cloned()
+                    .map(|mut node| {
+                        node.secret_key = None;
+                        node
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Registers or replaces a local service endpoint in this node's address book.
+    ///
+    /// This is reachability metadata only. It does not admit `service.public_key`
+    /// into the epoch verifier set or bypass consensus-message membership checks.
     pub fn register_service(&self, service: Service) -> Option<Service> {
         self.inner
             .address_book
             .write()
             .expect("address book lock poisoned")
             .add(service)
+    }
+
+    /// Stages a signed public-node admission into this node's next local block.
+    ///
+    /// The admission enters verifier membership only if that block is committed
+    /// into the next epoch by consensus.
+    pub fn stage_node_admission(&self, admission: NodeAdmission) -> Result<Option<NodeIdentity>> {
+        self.ensure_consensus_mode("stage node admission")?;
+        admission.verify()?;
+        let target = self.next_epoch_target()?;
+        if admission.body.last_epoch != target.last_epoch || admission.body.nonce != target.nonce {
+            return Err(BlossomError::InvalidEpochNonce);
+        }
+        let node = admission.body.node.clone();
+        if self.is_current_verifier(&node.public_key()) {
+            return Ok(None);
+        }
+        self.inner
+            .local_blocks
+            .write()
+            .expect("block lock poisoned")
+            .add_node_admission(admission)?;
+        Ok(Some(node))
     }
 
     /// Sets the opaque application state that will be piggy-backed onto this
@@ -739,14 +788,13 @@ impl NodeRuntime {
                 .read()
                 .expect("availability lock poisoned");
             for request in &fetch.body.requests {
-                match availability.get_local_payload(
+                if let Some(payload) = availability.get_local_payload(
                     self.inner.group_id,
                     &request.slot_hash,
                     &request.payload_commitment,
                     &fetch.body.requester,
                 )? {
-                    Some(payload) => items.push(payload.delivery_item()),
-                    None => {}
+                    items.push(payload.delivery_item());
                 }
             }
         }
@@ -981,7 +1029,7 @@ impl NodeRuntime {
             let self_node = self.self_node();
             let block_service = self.block_service();
 
-            let (maybe_block, application_state, encounter_records) = {
+            let (maybe_block, application_state, encounter_records, node_admissions) = {
                 let mut local_blocks = self
                     .inner
                     .local_blocks
@@ -998,18 +1046,28 @@ impl NodeRuntime {
                 } else {
                     Vec::new()
                 };
+                let node_admissions = if maybe_block.is_none() {
+                    local_blocks.take_node_admissions()
+                } else {
+                    Vec::new()
+                };
                 (
                     maybe_block,
                     local_blocks.application_state().clone(),
                     encounter_records,
+                    node_admissions,
                 )
             };
 
             let block = match maybe_block {
                 Some(block) => block,
-                None => {
-                    self.empty_block(&self_node, &target, application_state, encounter_records)?
-                }
+                None => self.empty_block(
+                    &self_node,
+                    &target,
+                    application_state,
+                    encounter_records,
+                    node_admissions,
+                )?,
             };
             #[cfg(feature = "availability-gossip")]
             self.store_filtered_payloads_from_block(&block)?;
@@ -1108,6 +1166,33 @@ impl NodeRuntime {
                 return Err(BlossomError::UnknownSender);
             }
             drop(state);
+            if self.inner.trust_mode.is_trusted() {
+                let scan = message.scan_trusted()?;
+                let mut state = self.inner.state.write().expect("state lock poisoned");
+                let sender = message.header.sender;
+                let quorum = state.get_mut_quorum(
+                    &message.header.last_epoch,
+                    message.header.nonce,
+                    message.header.round,
+                );
+                if quorum.received_dispatches.contains(&sender) {
+                    return Err(BlossomError::WireProtocol(format!(
+                        "duplicate dispatch from {sender}"
+                    )));
+                }
+                quorum.try_push_pending_dispatch(
+                    PendingDispatch::Hot(message),
+                    configured_max_pending_raw_dispatch_bytes(),
+                    configured_max_pending_raw_dispatch_bytes_per_sender(),
+                )?;
+                quorum.msg_matrix.update_dispatch_received(true, sender);
+                quorum.timers.verified_tx = quorum
+                    .timers
+                    .verified_tx
+                    .saturating_add(scan.transaction_count);
+                quorum.received_dispatches.push(sender);
+                return Ok(MessageReceipt::accepted("dispatch"));
+            }
             let decoded_message = message.to_dispatch()?;
             self.verify_dispatch_payload(&decoded_message.header, &decoded_message.body)?;
             let mut state = self.inner.state.write().expect("state lock poisoned");
@@ -1127,10 +1212,8 @@ impl NodeRuntime {
                 configured_max_pending_raw_dispatch_bytes(),
                 configured_max_pending_raw_dispatch_bytes_per_sender(),
             )?;
-            let verified_blocks = decoded_message.body.blocks.clone();
-            quorum
-                .msg_matrix
-                .update(true, Msg::Dispatch(decoded_message));
+            quorum.msg_matrix.update_dispatch_received(true, sender);
+            let verified_blocks = decoded_message.body.blocks;
             record_verified_dispatch_blocks(quorum, verified_blocks);
             quorum.received_dispatches.push(sender);
             Ok(MessageReceipt::accepted("dispatch"))
@@ -1361,8 +1444,7 @@ impl NodeRuntime {
             .cloned()
     }
 
-    #[cfg(feature = "availability-gossip")]
-    fn is_known_member(&self, public_key: &PubKey) -> bool {
+    fn is_current_verifier(&self, public_key: &PubKey) -> bool {
         let state = self.inner.state.read().expect("state lock poisoned");
         state
             .epochchain
@@ -1371,18 +1453,25 @@ impl NodeRuntime {
             .is_some_and(|epoch| epoch.body.verifiers.keys().any(|key| key == public_key))
     }
 
+    #[cfg(feature = "availability-gossip")]
+    fn is_known_member(&self, public_key: &PubKey) -> bool {
+        self.is_current_verifier(public_key)
+    }
+
     fn empty_block(
         &self,
         self_node: &NodeIdentity,
         target: &EpochTarget,
         application_state: BlockApplicationState,
         encounter_records: Vec<EncounterRecord>,
+        node_admissions: Vec<NodeAdmission>,
     ) -> Result<Block> {
         let mut block = Block::default();
         block.body.last_epoch = target.last_epoch;
         block.body.nonce = target.nonce;
         block.body.application_state = application_state;
         block.body.encounter_records = encounter_records;
+        block.body.node_admissions = node_admissions;
         if self.inner.trust_mode.is_trusted() {
             block.seal_unsigned(self_node.public_key());
             return Ok(block);
@@ -1933,9 +2022,8 @@ mod tests {
         let mut config = RuntimeConfig::new(nodes[0].clone());
         config.genesis = Some(genesis.clone());
         config.trust_mode = trust_mode;
-        match telemetry {
-            Some(telemetry) => config.telemetry = telemetry,
-            None => {}
+        if let Some(telemetry) = telemetry {
+            config.telemetry = telemetry;
         }
         let runtime = NodeRuntime::new(config);
         let target = EpochTarget {
@@ -3611,6 +3699,94 @@ mod tests {
             targets
                 .iter()
                 .all(|service| service.public_key != keypairs[0].public)
+        );
+    }
+
+    #[test]
+    fn staged_node_admission_is_committed_at_epoch_boundary() {
+        let (runtime, keypairs, target) = runtime_with_peers();
+        let joiner = Keypair::generate();
+        let service = Service::new(
+            ServiceKind::Consensus,
+            joiner.public,
+            "tcp",
+            "127.0.0.1",
+            9100,
+        );
+        let admission = NodeAdmission::signed_for_consensus_service(
+            service,
+            target.last_epoch,
+            target.nonce,
+            &joiner.signer(),
+        )
+        .unwrap();
+
+        let staged = runtime.stage_node_admission(admission).unwrap();
+        assert_eq!(staged.map(|node| node.public_key()), Some(joiner.public));
+
+        let dispatch = runtime.dispatch_local_block(0).unwrap();
+        let local_admission = dispatch
+            .body
+            .blocks
+            .values()
+            .flat_map(|block| block.body.node_admissions.iter())
+            .next()
+            .cloned()
+            .expect("local dispatch should carry staged admission");
+        assert!(
+            dispatch
+                .body
+                .blocks
+                .values()
+                .any(|block| block.body.node_admissions.len() == 1)
+        );
+
+        {
+            let mut state = runtime.inner.state.write().expect("state lock poisoned");
+            {
+                let quorum = state.get_mut_quorum(&target.last_epoch, target.nonce, 0);
+                for signer in &keypairs[1..4] {
+                    let mut block = Block::default();
+                    block.body.last_epoch = target.last_epoch;
+                    block.body.nonce = target.nonce;
+                    block.body.node_admissions.push(local_admission.clone());
+                    block.sign(&signer.secret);
+                    quorum.verified_blocks.insert(block.hash, block);
+                }
+            }
+            assert!(state.advance_epoch(&target.last_epoch, target.nonce, 0, true));
+        }
+
+        assert!(
+            runtime
+                .current_verifiers()
+                .iter()
+                .any(|node| node.public_key() == joiner.public)
+        );
+    }
+
+    #[test]
+    fn stage_node_admission_rejects_stale_target() {
+        let (runtime, _keypairs, target) = runtime_with_peers();
+        let joiner = Keypair::generate();
+        let service = Service::new(
+            ServiceKind::Consensus,
+            joiner.public,
+            "tcp",
+            "127.0.0.1",
+            9100,
+        );
+        let admission = NodeAdmission::signed_for_consensus_service(
+            service,
+            target.last_epoch,
+            target.nonce.new_next(),
+            &joiner.signer(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            runtime.stage_node_admission(admission),
+            Err(BlossomError::InvalidEpochNonce)
         );
     }
 

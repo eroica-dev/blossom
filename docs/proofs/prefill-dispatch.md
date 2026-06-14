@@ -71,7 +71,8 @@ for every future branch A:
   |C_i intersect A| >= f_A + 1
 ```
 
-The simulator default for `q = 6` and one Byzantine route withholder uses:
+The simulator fast profile for `q = 6` and no declared Byzantine withholding
+uses:
 
 ```text
 |C_i| ~= (q * R) - 1
@@ -259,12 +260,12 @@ h_i(A) >= f_A + 1
 where `f_A` is the maximum Byzantine or unavailable holder count allowed for
 branch `A`.
 
-The maximum-redundancy version sets `h_i(A)` to the number of future contacts
-in that branch. If the branch is a quorum of size `q`, and all quorum members
-are contacts, then the branch can lose up to `q - 1` prefilled holders before
-data availability for that block is lost. The implemented default is more
-bandwidth-conscious: it uses a small deterministic prefill contact set and then
-relies on subtree payload routing in the remaining consensus rounds.
+The implemented version sets prefill contacts from the sender's deterministic
+future route frontier. In other words, the sender preplaces its block at the
+first-round quorum members, then at a route-width set of deterministic next
+holders for each active route frontier in each later round. Quorum size,
+topology depth, and the declared Byzantine-withholder assumption determine the
+contact set.
 
 ## Optimization Math
 
@@ -272,29 +273,35 @@ Let:
 
 ```text
 R     = ceil(log_q(n))
+f     = declared Byzantine withholders per branch
+w     = route width, equal to 1 with no declared withholders and f + 1 otherwise
 sigma = modeled dispatch-stage latency for one consensus layer
 delta = modeled prefill edge latency
-rho   = extra future contact per live branch per later consensus layer
 d     = per-block prefill fanout
 ```
 
 The implemented prefill-dispatch fanout is:
 
 ```text
-d(rho) = (q - 1) + rho * q * (R - 1)
+d = (q - 1) + q * w * (R - 1)
 ```
 
-The default BFT route-withholding setting uses `rho = 1`:
+When `f = 0`, this reduces to `qR - 1`. When trustless withholding is declared,
+the route width becomes `f + 1`, so each active future route frontier has enough
+pushed holders to leave one live holder after `f` Byzantine withholders. This is
+still derived behavior, not a tunable per-quorum multiplier.
 
-```text
-d = (q * R) - 1
-```
+When the trustless simulator is configured to tolerate branch withholders, it
+also validates that the quorum can tolerate that fault assumption and models
+full-payload prefill on the selected future-route contacts so a malicious holder
+cannot orphan a payload slice.
 
 For `q = 6`:
 
 ```text
-n = 36 or 72: R = 2 or 3, d = 11 or 17
-n ~= 1000:    R = 4,       d = 23
+n = 36 or 72, no withholders: R = 2 or 3, d = 11 or 17
+n = 64, one withholder:       R = 3, w = 2, d = 29
+n ~= 1000, no withholders:    R = 4,       d = 23
 ```
 
 This is the important change from the older branch-holder experiment. The
@@ -450,7 +457,7 @@ Relevant simulator hooks:
 - `consensus_start_round` caps the prefill replacement to one skipped consensus
   layer.
 - `build_prefill_plan` computes the initial holder map.
-- `prefill_dispatch_fanout` sets the default fanout to `qR - 1`.
+- `prefill_dispatch_fanout` sets the contact budget to `qR - 1`.
 - `apply_prefill` sends the local block's needed subtree payloads to the
   planned holders in one modeled network stage.
 - `build_future_reachability` computes each recipient's remaining subtree.
@@ -463,13 +470,26 @@ The current branch exercises the proof obligations with:
 
 - `prefill_dispatch_replaces_first_consensus_round`;
 - `prefill_dispatch_fanout_scales_with_log_rounds`;
+- `prefill_dispatch_fanout_uses_ceil_depth_for_non_ideal_networks`;
+- `prefill_dispatch_fanout_is_derived_from_quorum_schedule`;
+- `prefill_dispatch_boundary_sizes_use_ceil_log_depth`;
+- `prefill_dispatch_non_ideal_boundary_sizes_complete_without_repair`;
+- `prefill_expected_hashes_reject_stale_epoch_replay`;
+- `prefill_expected_hashes_reject_equivocated_payload_commitment`;
+- `prefill_dispatch_fanout_widens_route_for_declared_withholders`;
 - `prefill_dispatch_routes_subtree_payloads_without_repair`;
 - `prefill_dispatch_survives_one_byzantine_route_withholder`;
+- `prefill_dispatch_survives_two_byzantine_route_withholders_for_q8`;
+- `prefill_dispatch_survives_three_byzantine_route_withholders_for_q12`;
+- `prefill_dispatch_survives_one_withholder_for_non_ideal_network_size`;
 - `prefill_dispatch_start_is_always_one_round`;
 - `prefill_dispatch_rejects_multi_round_skip_override`;
 - `precomputed_inventory_routes_pick_one_holder_for_missing_payloads`;
-- `single_prefill_holder_is_not_byzantine_resilient`;
+- `precomputed_inventory_routes_ignore_metadata_only_false_holders`;
 - `bft_prefill_survives_one_byzantine_withholder_per_branch`;
+- `benchmarks/scripts/run-prefill-frontier-targeted.sh`, which repeats q5, q6,
+  q8, and q12 withholder frontiers under even and random latency and includes
+  expected-fail controls;
 - full `cargo test --features availability-gossip`;
 - large smoke simulations such as `n=1296, q=6`, which verify one prefill stage
   plus `R - 1` active consensus rounds.

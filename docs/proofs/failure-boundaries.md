@@ -297,6 +297,34 @@ Executable tests and models pin these boundaries:
 - `healed_full_partition_reconciles_pending_epoch_before_resuming`
 - `subset_gossip::tests::subset_gossip_converges_metadata_and_repairs_payloads`
 - `subset_gossip::tests::sparse_inline_subset_can_need_repair`
+- `subset_gossip::tests::prefill_dispatch_boundary_sizes_use_ceil_log_depth`
+- `subset_gossip::tests::prefill_dispatch_non_ideal_boundary_sizes_complete_without_repair`
+- `subset_gossip::tests::prefill_expected_hashes_reject_stale_epoch_replay`
+- `subset_gossip::tests::prefill_expected_hashes_reject_equivocated_payload_commitment`
+- `subset_gossip::tests::prefill_dispatch_survives_two_byzantine_route_withholders_for_q8`
+- `subset_gossip::tests::prefill_dispatch_survives_three_byzantine_route_withholders_for_q12`
+- `subset_gossip::tests::precomputed_inventory_routes_ignore_metadata_only_false_holders`
+
+The table below maps the main vulnerability classes to executable coverage.
+
+| Boundary | Primary coverage |
+| --- | --- |
+| Byzantine admission abuse | `byzantine_admission_abuse_cannot_approve_stale_node`, `deterministic_epoch_vulnerability_scenarios_run_sequentially` |
+| Replay reconnect evidence | `byzantine_replayed_reconnect_evidence_does_not_satisfy_ping_quorum`, `replay_evidence_blocked` scenario |
+| Duplicate voting | `byzantine_duplicate_reconnect_votes_are_deduplicated`, `byzantine_duplicate_votes_deduped` scenario |
+| Partition plus merge | `partitioned_reconnect_waits_until_merge`, `healed_full_partition_reconciles_pending_epoch_before_resuming` |
+| Simultaneous churn | `simultaneous_drop_and_reconnect_under_load_remains_consistent`, `byzantine_churn_under_threshold_preserves_epoch_progress` |
+| Reconnect DoS pressure | `many_dropped_nodes_reconnect_are_rate_limited`, `dos_reconnect_pressure_rate_limited` scenario |
+| Quorum misconfiguration | `trustless_repair_quorum_threshold_boundary_is_enforced`, `trustless_reconnect_quorum_threshold_boundary_is_enforced`, expected-fail cases in `run-proof-validation-matrix.sh` |
+| State proof validation | `byzantine_admission_abuse_cannot_approve_stale_node`, `reconnect_rejects_sybil_identity_attempts`, `reconciliation_rebuilds_epoch_when_summary_quorum_is_unavailable` |
+| Identity/Sybil controls | `reconnect_rejects_sybil_identity_attempts`, `sybil_identity_blocked` scenario |
+| Adversarial Byzantine placement | `byzantine_nodes_are_assigned_deterministically_and_reported`, `prefill_dispatch_survives_two_byzantine_route_withholders_for_q8`, `prefill_dispatch_survives_three_byzantine_route_withholders_for_q12` |
+| Network-size boundaries | `trustless_byzantine_threshold_accepts_max_and_rejects_next`, `prefill_dispatch_boundary_sizes_use_ceil_log_depth`, `prefill_dispatch_non_ideal_boundary_sizes_complete_without_repair` |
+| Latency tails/asymmetry | `partial_synchrony_progress_recovers_after_late_messages`, `zero_round_timeout_disables_late_message_cutoff`, random-latency rows in `run-proof-validation-matrix.sh` and `run-prefill-frontier-targeted.sh` |
+| Prefill replay/equivocation | `prefill_expected_hashes_reject_stale_epoch_replay`, `prefill_expected_hashes_reject_equivocated_payload_commitment` |
+| Prefill false inventory | `precomputed_inventory_routes_ignore_metadata_only_false_holders` |
+| Expected-fail validation | `trusted_mode_rejects_byzantine_attack_knobs`, `trustless_mode_rejects_byzantine_tolerance_excess`, expected-fail matrix rows |
+| CPU and hardware pressure | `benchmarks/scripts/run-node-core-matrix.sh`, `benchmarks/scripts/run-profile-matrix.sh`, and the deterministic CPU/hardware fault hooks in `crates/deterministic-test-env` |
 
 Formal threshold models live in:
 

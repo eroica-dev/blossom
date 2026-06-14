@@ -11,6 +11,25 @@ use xxhash_rust::xxh3::Xxh3;
 
 use crate::error::{BlossomError, Result};
 
+pub const SHA256_PROTOCOL_HASH_ALGORITHM: &str = "sha256";
+pub const XXH3_PROTOCOL_HASH_ALGORITHM: &str = "xxh3-128x2";
+
+pub fn protocol_hash_algorithm() -> &'static str {
+    #[cfg(feature = "insecure-fast-hash")]
+    {
+        XXH3_PROTOCOL_HASH_ALGORITHM
+    }
+
+    #[cfg(not(feature = "insecure-fast-hash"))]
+    {
+        SHA256_PROTOCOL_HASH_ALGORITHM
+    }
+}
+
+pub fn protocol_hash_algorithm_is_compatible(peer: &str) -> bool {
+    peer == protocol_hash_algorithm()
+}
+
 #[derive(
     Debug,
     Clone,

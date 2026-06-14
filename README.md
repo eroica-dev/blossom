@@ -1,9 +1,9 @@
 # blossom
 
-`blossom` is a focused Rust library and node binary for the Eden Blossom
-consensus protocol. It was extracted from `eden-mdbs/consensus_service`
-and cross-checked against the earlier `eden-dev-inc/eden-poc`
-implementation.
+`blossom` is a focused Rust library, node binary, simulator, and observer for
+the Eden Blossom consensus protocol. It was extracted from
+`eden-mdbs/consensus_service` and cross-checked against the earlier
+`eden-dev-inc/eden-poc` implementation.
 
 The repo contains the reusable protocol layer plus the first deployable
 node surface:
@@ -33,16 +33,22 @@ node surface:
   payload availability and serving target-authorized payload fetches.
 - Optional `insecure-fast-hash` build feature for trusted/performance
   experiments that swaps protocol SHA-256 commitments for XXH3.
+- Optional propagation policy feature gates for full-block push,
+  inventory-then-missing, and adaptive selection with trustless safety checks.
 - A raw TCP `blossom-node` binary with a length-prefixed Borsh wire protocol for health, state, address book, block intake, dispatch, and message handling.
 - Reusable encoded wire frames for cached broadcast/fan-out sends.
+- `blossom-sim` and `deterministic-test-env` for reproducible latency, fault,
+  Byzantine, hardware-pressure, and profiling scenarios.
+- `blossom-observer` for collecting node telemetry and analyzing distributed
+  stage/span health.
 - Minimal cryptographic and block primitives needed for the protocol to compile independently.
 - Unit tests for signing, block verification, quorum selection, address-book behavior, block queueing, message matrix behavior, and runtime block dispatch.
 
-It does not yet include Eden's old database adapters, metrics service,
-Kubernetes files, or application-specific ledger logic. The TCP node
-runtime is intentionally smaller than the original actor stack, but keeps
-the deploy-time interfaces needed to start wiring nodes and external
-block/engine services together.
+It does not yet include Eden's old database adapters, Kubernetes files, or
+application-specific ledger logic. The deployable TCP runtime accepts and
+validates protocol messages, but the current crate should be treated as a
+protocol core plus simulation/benchmark environment rather than a complete
+production node that autonomously drives every consensus stage end to end.
 
 ## Layout
 
@@ -67,13 +73,22 @@ block/engine services together.
 - `src/tcp.rs`: reusable TCP node server and request client.
 - `src/service_client.rs`: TCP client helpers for block and engine service interactions.
 - `src/harness.rs`: in-process simulation cluster and mock block service.
+- `src/subset_gossip.rs`: availability-gated v1/v2 subset block propagation
+  simulator and prefill-dispatch model.
 - `src/bin/blossom-node.rs`: raw TCP node process.
 - `src/bin/blossom-harness.rs`: local node-behavior simulation runner.
 - `src/bin/blossom-harness-bench.rs`: CSV-emitting full harness benchmark driver.
+- `crates/blossom-propagation/`: feature-gated propagation policy primitives.
+- `crates/blossom-sim/`: deterministic Blossom simulation environment.
+- `crates/blossom-observer/`: telemetry collector and analyzer.
+- `crates/deterministic-test-env/`: generic deterministic network, CPU, and
+  hardware-fault harness primitives.
 - `tests/e2e_tcp.rs`: TCP end-to-end coverage for node and service behavior.
 - `benches/protocol.rs`: Criterion microbenchmarks for protocol primitives and runtime paths.
 - `benchmarks/`: shell-script benchmark runners and ignored CSV result directory.
 - `paper/`: LaTeX protocol paper source and figure assets used as the architecture reference.
+- `docs/node-lifecycle.md`: service registration, verifier membership,
+  node dropping, and simulated reconnect admission.
 - `docs/architecture.md`: paper-informed architecture map for the extracted crate.
 - `docs/source-map.md`: source files used for the extraction.
 - `docs/testing.md`: end-to-end testing and harness guide.
@@ -88,6 +103,13 @@ The node generates a keypair if `BLOSSOM_PUBLIC_KEY` and
 `BLOSSOM_SECRET_KEY` are not provided. For a stable deployment, provide
 both values and register external services with `--service` or
 `WireRequest::RegisterService`.
+
+Plain service registration updates the local address book. For public node
+joins, `RegisterService` can carry a signed consensus `NodeAdmission`; that
+proof is staged into the registering validator's next block and adds the public
+node to the verifier set only if a distinct-current-verifier supermajority
+commits the same admission into the next epoch. See
+[`docs/node-lifecycle.md`](docs/node-lifecycle.md).
 
 ```sh
 cargo run --bin blossom-node -- \
@@ -114,7 +136,7 @@ Wire requests:
 - `Ping(NodePing)`
 - `State`
 - `AddressBook`
-- `RegisterService(Service)`
+- `RegisterService(ServiceRegistration)`
 - `Group { group_id, request }`
 - `NextNonce`
 - `SubmitBlock(Block)`

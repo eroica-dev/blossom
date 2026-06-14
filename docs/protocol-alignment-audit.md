@@ -58,6 +58,12 @@ Important protocol expectations from the paper:
 
 ## Partial Or Prototype Behavior
 
+These points are public-readiness boundaries, not hidden assumptions. Blossom's
+current release surface is the protocol core, simulation environment, observer,
+and benchmark harness. The deployable TCP node validates protocol messages and
+supports service wiring, but it is not yet a complete autonomous production
+driver for every consensus stage.
+
 - Block formation exists as primitives (`Transaction`, `Block`, `LocalBlock`,
   `SubmitBlock`), but the benchmark builds one block for one node. The paper's
   benchmark model floods every node and expects every node to contribute one

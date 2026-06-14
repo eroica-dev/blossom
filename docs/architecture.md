@@ -148,6 +148,13 @@ request that returns `WireResponse::Pong(NodePong)` with the caller's nonce
 and payload echoed. It is useful for health checks, latency probes, and
 connectivity tests where no block or quorum message should be created.
 
+Plain service registration is also separate from verifier admission: a bare
+`Service` is local reachability metadata in the address book. Public joins use a
+signed `NodeAdmission` carried by `WireRequest::RegisterService`; the admission
+is staged into the receiver's next block and becomes membership only if that
+block is committed into the next epoch. The full lifecycle is documented in
+[`docs/node-lifecycle.md`](node-lifecycle.md).
+
 Trusted mode is an explicit private-cluster optimization. When
 `RuntimeConfig::trust_mode` is `Trusted`, nodes assume the verifier set
 was provisioned out of band and skip Ed25519 block/message signing and

@@ -131,7 +131,27 @@ impl MessageMatrix {
         let Some((sender, receiver, status)) = response else {
             return false;
         };
+        self.update_cell(is_valid, sender, receiver, status, Some(msg))
+    }
 
+    pub fn update_dispatch_received(&mut self, is_valid: bool, sender: PubKey) -> bool {
+        self.update_cell(
+            is_valid,
+            sender,
+            self.self_key,
+            Status::DispatchReceived,
+            None,
+        )
+    }
+
+    fn update_cell(
+        &mut self,
+        is_valid: bool,
+        sender: PubKey,
+        receiver: PubKey,
+        status: Status,
+        msg: Option<Msg>,
+    ) -> bool {
         let Some(sender_index) = self.find_key_index(&sender) else {
             return false;
         };
@@ -140,7 +160,7 @@ impl MessageMatrix {
         };
 
         self.matrix[receiver_index][sender_index] = if is_valid { status } else { Status::Void };
-        self.message_matrix[sender_index][receiver_index] = Some(msg);
+        self.message_matrix[sender_index][receiver_index] = msg;
 
         self.update_status(sender_index, receiver_index);
         self.status()
@@ -344,6 +364,23 @@ mod tests {
         matrix.update(true, dispatch_from(delayed_sender));
 
         assert_eq!(matrix.node_status[1], Status::NodePassed);
+    }
+
+    #[test]
+    fn lightweight_dispatch_update_advances_status_without_storing_message() {
+        let quorum = key_vec()[..4].to_vec();
+        let mut matrix = MessageMatrix::new(&quorum, &quorum[0]);
+        let sender = quorum[1];
+
+        assert!(!matrix.update_dispatch_received(true, sender));
+
+        let sender_index = matrix.find_key_index(&sender).unwrap();
+        let receiver_index = matrix.find_key_index(&quorum[0]).unwrap();
+        assert_eq!(
+            matrix.matrix[receiver_index][sender_index],
+            Status::DispatchReceived
+        );
+        assert!(matrix.message_matrix[sender_index][receiver_index].is_none());
     }
 
     #[test]

@@ -7,6 +7,8 @@
 #   PAYLOAD_BYTES=0
 #   DATA_PATTERN=splitmix
 #   ITERATIONS=1
+#   CONCURRENCY=1
+#   CPU_CORES=0            metadata only; 0 means unknown/unpinned
 #   WARMUP=0
 #   LATENCY_MS=0
 #   JITTER_MS=0
@@ -29,6 +31,7 @@ report_pinning
 
 mkdir -p "$root/results"
 out="$root/results/chaos_$(timestamp).csv"
+node_out="${out%.csv}_nodes.csv"
 
 trusted_arg=()
 if [[ "${TRUSTED:-0}" == "1" || "${TRUSTED:-false}" == "true" ]]; then
@@ -41,6 +44,8 @@ pinned_exec cargo run --release -p blossom-sim --bin blossom-sim-chaos -- \
   --payload-bytes "${PAYLOAD_BYTES:-0}" \
   --data-pattern "${DATA_PATTERN:-splitmix}" \
   --iterations "${ITERATIONS:-1}" \
+  --concurrency "${CONCURRENCY:-1}" \
+  --cpu-cores "${CPU_CORES:-0}" \
   --warmup "${WARMUP:-0}" \
   --latency-ms "${LATENCY_MS:-0}" \
   --jitter-ms "${JITTER_MS:-0}" \
@@ -49,6 +54,8 @@ pinned_exec cargo run --release -p blossom-sim --bin blossom-sim-chaos -- \
   --response-crash-ppm "${RESPONSE_CRASH_PPM:-0}" \
   --seed "${CHAOS_SEED:-7089336938131516721}" \
   ${trusted_arg[@]+"${trusted_arg[@]}"} \
-  --csv "$out"
+  --csv "$out" \
+  --node-perf-csv "$node_out"
 
 echo "wrote $out"
+echo "wrote $node_out"

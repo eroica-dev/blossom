@@ -174,6 +174,14 @@ quorum boundaries. Membership pruning tests now prove that a verifier set
 derived from committed supermajority removal evidence still yields compatible
 round schedules for every retained validator.
 
+The node lifecycle and membership boundary are documented in
+[`docs/node-lifecycle.md`](node-lifecycle.md): service registration updates local
+address-book reachability, signed `RegisterService` node admissions add public
+validators only through a distinct-current-verifier supermajority in committed
+blocks, genesis establishes initial verifier membership, committed encounter
+evidence can remove verifiers when the removal policy is enabled, and reconnect
+catch-up/admission quorum remains simulator-backed policy work.
+
 **Current gaps:**
 
 - Non-ideal network sizes can produce quorums larger than six by appending
@@ -182,6 +190,9 @@ round schedules for every retained validator.
   is acceptable or whether production should reject those sizes.
 - Production discovery is local address-book registration, not a DHT or durable
   membership protocol.
+- Public join admission is signed and supermajority-gated, but dropped-node
+  reconnect still needs production catch-up proof wiring before automatic
+  trustless rejoin.
 
 **Tests to add next:**
 

@@ -1,100 +1,23 @@
 use std::fmt;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
 
 use blossom::{
-    BlossomError, EncodedFrame, EpochTarget, Result, SimulatedCluster, SimulatedNode, TrustMode,
-    WireRequest, WireResponse, read_encoded_frame, read_wire_response, signed_block,
-    write_encoded_frame, write_wire_request,
+    BlossomError, EncodedFrame, EpochTarget, Result, SimulatedCluster, SimulatedNode,
+    TcpNodeMetricsSnapshot, TrustMode, WireRequest, WireResponse, read_encoded_frame,
+    read_wire_response, signed_block, write_encoded_frame, write_wire_request,
 };
+pub use deterministic_test_env::{CHAOS_RATE_DENOMINATOR, NetworkChaosConfig, NetworkChaosReport};
+use deterministic_test_env::{NetworkChaos as GenericNetworkChaos, SimEnvError};
 use tokio::net::TcpStream;
-use tokio::time::sleep;
-
-pub const CHAOS_RATE_DENOMINATOR: u32 = 1_000_000;
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct NetworkChaosConfig {
-    pub seed: u64,
-    pub latency_ms: u64,
-    pub jitter_ms: u64,
-    pub drop_ppm: u32,
-    pub connect_crash_ppm: u32,
-    pub response_crash_ppm: u32,
-}
-
-impl Default for NetworkChaosConfig {
-    fn default() -> Self {
-        Self {
-            seed: 0x626c_6f73_736f_6d31,
-            latency_ms: 0,
-            jitter_ms: 0,
-            drop_ppm: 0,
-            connect_crash_ppm: 0,
-            response_crash_ppm: 0,
-        }
-    }
-}
-
-impl NetworkChaosConfig {
-    pub fn disabled() -> Self {
-        Self::default()
-    }
-
-    pub fn is_enabled(&self) -> bool {
-        self.latency_ms > 0
-            || self.jitter_ms > 0
-            || self.drop_ppm > 0
-            || self.connect_crash_ppm > 0
-            || self.response_crash_ppm > 0
-    }
-
-    pub fn validate(&self) -> Result<()> {
-        for (label, value) in [
-            ("drop_ppm", self.drop_ppm),
-            ("connect_crash_ppm", self.connect_crash_ppm),
-            ("response_crash_ppm", self.response_crash_ppm),
-        ] {
-            if value > CHAOS_RATE_DENOMINATOR {
-                return Err(BlossomError::WireProtocol(format!(
-                    "{label} must be <= {CHAOS_RATE_DENOMINATOR}"
-                )));
-            }
-        }
-        Ok(())
-    }
-}
-
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct NetworkChaosReport {
-    pub attempts: u64,
-    pub successes: u64,
-    pub dropped: u64,
-    pub connect_crashes: u64,
-    pub response_crashes: u64,
-    pub injected_delay_ms: u64,
-}
 
 #[derive(Clone)]
 pub struct NetworkChaos {
-    inner: Arc<NetworkChaosInner>,
-}
-
-struct NetworkChaosInner {
-    config: NetworkChaosConfig,
-    sequence: AtomicU64,
-    attempts: AtomicU64,
-    successes: AtomicU64,
-    dropped: AtomicU64,
-    connect_crashes: AtomicU64,
-    response_crashes: AtomicU64,
-    injected_delay_ms: AtomicU64,
+    inner: GenericNetworkChaos,
 }
 
 impl fmt::Debug for NetworkChaos {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("NetworkChaos")
-            .field("config", &self.inner.config)
+            .field("config", self.inner.config())
             .field("report", &self.report())
             .finish()
     }
@@ -102,34 +25,28 @@ impl fmt::Debug for NetworkChaos {
 
 impl NetworkChaos {
     pub fn new(config: NetworkChaosConfig) -> Result<Self> {
-        config.validate()?;
         Ok(Self {
-            inner: Arc::new(NetworkChaosInner {
-                config,
-                sequence: AtomicU64::new(0),
-                attempts: AtomicU64::new(0),
-                successes: AtomicU64::new(0),
-                dropped: AtomicU64::new(0),
-                connect_crashes: AtomicU64::new(0),
-                response_crashes: AtomicU64::new(0),
-                injected_delay_ms: AtomicU64::new(0),
-            }),
+            inner: GenericNetworkChaos::new(config).map_err(to_blossom_error)?,
         })
     }
 
     pub fn config(&self) -> &NetworkChaosConfig {
-        &self.inner.config
+        self.inner.config()
     }
 
     pub fn report(&self) -> NetworkChaosReport {
-        NetworkChaosReport {
-            attempts: self.inner.attempts.load(Ordering::Relaxed),
-            successes: self.inner.successes.load(Ordering::Relaxed),
-            dropped: self.inner.dropped.load(Ordering::Relaxed),
-            connect_crashes: self.inner.connect_crashes.load(Ordering::Relaxed),
-            response_crashes: self.inner.response_crashes.load(Ordering::Relaxed),
-            injected_delay_ms: self.inner.injected_delay_ms.load(Ordering::Relaxed),
-        }
+        self.inner.report()
+    }
+
+    pub async fn request_with_ordinal(
+        &self,
+        node_index: usize,
+        ordinal: u64,
+        addr: impl AsRef<str>,
+        request: &WireRequest,
+    ) -> Result<WireResponse> {
+        let sample = self.inner.sample_with_ordinal(node_index as u64, ordinal);
+        self.request_with_sample(addr, request, sample).await
     }
 
     async fn request(
@@ -138,16 +55,34 @@ impl NetworkChaos {
         addr: impl AsRef<str>,
         request: &WireRequest,
     ) -> Result<WireResponse> {
-        let sample = self.sample(node_index as u64);
-        self.before_connect(&sample).await?;
+        let sample = self.inner.sample(node_index as u64);
+        self.request_with_sample(addr, request, sample).await
+    }
+
+    async fn request_with_sample(
+        &self,
+        addr: impl AsRef<str>,
+        request: &WireRequest,
+        sample: deterministic_test_env::ChaosSample,
+    ) -> Result<WireResponse> {
+        self.inner
+            .before_connect(&sample)
+            .await
+            .map_err(to_blossom_io)?;
         let mut stream = TcpStream::connect(addr.as_ref())
             .await
             .map_err(|err| BlossomError::Io(err.to_string()))?;
-        self.after_connect(&sample).await?;
+        self.inner
+            .after_connect(&sample)
+            .await
+            .map_err(to_blossom_io)?;
         write_wire_request(&mut stream, request).await?;
-        self.before_response(&sample).await?;
+        self.inner
+            .before_response(&sample)
+            .await
+            .map_err(to_blossom_io)?;
         let response = read_wire_response(&mut stream).await?;
-        self.inner.successes.fetch_add(1, Ordering::Relaxed);
+        self.inner.record_success();
         Ok(response)
     }
 
@@ -157,16 +92,25 @@ impl NetworkChaos {
         addr: impl AsRef<str>,
         frame: &EncodedFrame,
     ) -> Result<WireResponse> {
-        let sample = self.sample(node_index as u64);
-        self.before_connect(&sample).await?;
+        let sample = self.inner.sample(node_index as u64);
+        self.inner
+            .before_connect(&sample)
+            .await
+            .map_err(to_blossom_io)?;
         let mut stream = TcpStream::connect(addr.as_ref())
             .await
             .map_err(|err| BlossomError::Io(err.to_string()))?;
-        self.after_connect(&sample).await?;
+        self.inner
+            .after_connect(&sample)
+            .await
+            .map_err(to_blossom_io)?;
         write_encoded_frame(&mut stream, frame).await?;
-        self.before_response(&sample).await?;
+        self.inner
+            .before_response(&sample)
+            .await
+            .map_err(to_blossom_io)?;
         let response = read_wire_response(&mut stream).await?;
-        self.inner.successes.fetch_add(1, Ordering::Relaxed);
+        self.inner.record_success();
         Ok(response)
     }
 
@@ -176,94 +120,35 @@ impl NetworkChaos {
         addr: impl AsRef<str>,
         request: &WireRequest,
     ) -> Result<EncodedFrame> {
-        let sample = self.sample(node_index as u64);
-        self.before_connect(&sample).await?;
+        let sample = self.inner.sample(node_index as u64);
+        self.inner
+            .before_connect(&sample)
+            .await
+            .map_err(to_blossom_io)?;
         let mut stream = TcpStream::connect(addr.as_ref())
             .await
             .map_err(|err| BlossomError::Io(err.to_string()))?;
-        self.after_connect(&sample).await?;
-        write_wire_request(&mut stream, request).await?;
-        self.before_response(&sample).await?;
-        let frame = read_encoded_frame(&mut stream).await?;
-        self.inner.successes.fetch_add(1, Ordering::Relaxed);
-        Ok(frame)
-    }
-
-    fn sample(&self, node_index: u64) -> ChaosSample {
-        let sequence = self.inner.sequence.fetch_add(1, Ordering::Relaxed) + 1;
-        self.inner.attempts.fetch_add(1, Ordering::Relaxed);
-        let seed = self.inner.config.seed ^ sequence.rotate_left(17) ^ node_index.rotate_left(37);
-        ChaosSample {
-            request_delay_ms: self.delay_ms(seed, 0x11),
-            response_delay_ms: self.delay_ms(seed, 0x22),
-            drop: self.sample_rate(seed, 0x33, self.inner.config.drop_ppm),
-            connect_crash: self.sample_rate(seed, 0x44, self.inner.config.connect_crash_ppm),
-            response_crash: self.sample_rate(seed, 0x55, self.inner.config.response_crash_ppm),
-        }
-    }
-
-    fn delay_ms(&self, seed: u64, salt: u64) -> u64 {
-        let jitter = if self.inner.config.jitter_ms == 0 {
-            0
-        } else {
-            splitmix64(seed ^ salt) % (self.inner.config.jitter_ms + 1)
-        };
-        self.inner.config.latency_ms + jitter
-    }
-
-    fn sample_rate(&self, seed: u64, salt: u64, ppm: u32) -> bool {
-        ppm > 0 && (splitmix64(seed ^ salt) % CHAOS_RATE_DENOMINATOR as u64) < ppm as u64
-    }
-
-    async fn before_connect(&self, sample: &ChaosSample) -> Result<()> {
-        if sample.drop {
-            self.inner.dropped.fetch_add(1, Ordering::Relaxed);
-            return Err(BlossomError::Io(
-                "simulated network drop before TCP connect".to_string(),
-            ));
-        }
-        self.sleep_ms(sample.request_delay_ms).await;
-        Ok(())
-    }
-
-    async fn after_connect(&self, sample: &ChaosSample) -> Result<()> {
-        if sample.connect_crash {
-            self.inner.connect_crashes.fetch_add(1, Ordering::Relaxed);
-            return Err(BlossomError::Io(
-                "simulated TCP connection crash before request write".to_string(),
-            ));
-        }
-        Ok(())
-    }
-
-    async fn before_response(&self, sample: &ChaosSample) -> Result<()> {
-        if sample.response_crash {
-            self.inner.response_crashes.fetch_add(1, Ordering::Relaxed);
-            return Err(BlossomError::Io(
-                "simulated TCP connection crash before response read".to_string(),
-            ));
-        }
-        self.sleep_ms(sample.response_delay_ms).await;
-        Ok(())
-    }
-
-    async fn sleep_ms(&self, ms: u64) {
-        if ms == 0 {
-            return;
-        }
         self.inner
-            .injected_delay_ms
-            .fetch_add(ms, Ordering::Relaxed);
-        sleep(Duration::from_millis(ms)).await;
+            .after_connect(&sample)
+            .await
+            .map_err(to_blossom_io)?;
+        write_wire_request(&mut stream, request).await?;
+        self.inner
+            .before_response(&sample)
+            .await
+            .map_err(to_blossom_io)?;
+        let frame = read_encoded_frame(&mut stream).await?;
+        self.inner.record_success();
+        Ok(frame)
     }
 }
 
-struct ChaosSample {
-    request_delay_ms: u64,
-    response_delay_ms: u64,
-    drop: bool,
-    connect_crash: bool,
-    response_crash: bool,
+fn to_blossom_error(err: SimEnvError) -> BlossomError {
+    BlossomError::WireProtocol(err.to_string())
+}
+
+fn to_blossom_io(err: SimEnvError) -> BlossomError {
+    BlossomError::Io(err.to_string())
 }
 
 pub struct SimTcpCluster {
@@ -319,6 +204,10 @@ impl SimTcpCluster {
         self.network.report()
     }
 
+    pub fn node_metrics(&self) -> Vec<TcpNodeMetricsSnapshot> {
+        self.cluster.node_metrics()
+    }
+
     pub async fn request(&self, index: usize, request: WireRequest) -> Result<WireResponse> {
         self.network
             .request(index, self.cluster.node(index).addr(), &request)
@@ -364,14 +253,6 @@ impl SimTcpCluster {
             txs,
         ))
     }
-}
-
-fn splitmix64(mut value: u64) -> u64 {
-    value = value.wrapping_add(0x9e37_79b9_7f4a_7c15);
-    let mut z = value;
-    z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
-    z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
-    z ^ (z >> 31)
 }
 
 #[cfg(test)]

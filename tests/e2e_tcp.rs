@@ -9,9 +9,9 @@ use blossom::{
     Block, BlossomBody, Commit, CommitBody, ConsensusGroupId, Dispatch, DispatchBody,
     EchoReDispatch, EchoRequest, EchoResponse, EchoResponseBody, EpochStarted, EpochStartedBody,
     EpochTarget, FanOutStrategy, HashType, Header, Keypair, MSGKey, MockBlockService, Msg,
-    NodePing, Nonce, OverlayRuntime, Proposal, ProposalBody, ServiceKind, Signature,
-    SimulatedCluster, TcpServiceClient, Transaction, TrustMode, Verification, VerificationBody,
-    WireRequest, WireResponse,
+    NodeAdmission, NodePing, Nonce, OverlayRuntime, Proposal, ProposalBody, Service, ServiceKind,
+    Signature, SimulatedCluster, TcpServiceClient, Transaction, TrustMode, Verification,
+    VerificationBody, WireRequest, WireResponse,
 };
 use blossom::{DoHash, EncodedFrame, NodeIdentity};
 
@@ -25,6 +25,7 @@ async fn cluster_exposes_health_state_address_book_and_nonce() {
             WireResponse::Health(health) => {
                 assert_eq!(health.status, "ok");
                 assert_eq!(health.public_key, node.identity.public_key());
+                assert!(health.protocol_hash_compatible());
             }
             response => panic!("expected health, got {}", response.kind()),
         }
@@ -40,6 +41,7 @@ async fn cluster_exposes_health_state_address_book_and_nonce() {
             WireResponse::Pong(pong) => {
                 assert_eq!(pong.group_id, ConsensusGroupId::root());
                 assert_eq!(pong.public_key, node.identity.public_key());
+                assert!(pong.protocol_hash_compatible());
                 assert_eq!(pong.nonce, index as u64);
                 assert_eq!(pong.payload, b"direct-ping");
             }
@@ -77,6 +79,7 @@ async fn cluster_exposes_health_state_address_book_and_nonce() {
         WireResponse::Health(health) => {
             assert_eq!(health.status, "ok");
             assert_eq!(health.public_key, cluster.node(0).identity.public_key());
+            assert!(health.protocol_hash_compatible());
         }
         response => panic!(
             "expected health over persistent connection, got {}",
@@ -121,7 +124,7 @@ async fn address_book_registration_announces_nonce_to_block_service() {
     match cluster
         .request(
             0,
-            WireRequest::RegisterService(block_service.service.clone()),
+            WireRequest::RegisterService(block_service.service.clone().into()),
         )
         .await
         .unwrap()
@@ -142,6 +145,50 @@ async fn address_book_registration_announces_nonce_to_block_service() {
                 service.kind == ServiceKind::Block
                     && service.public_key == block_service.service.public_key
             }));
+        }
+        response => panic!("expected address book, got {}", response.kind()),
+    }
+}
+
+#[tokio::test]
+async fn consensus_service_registration_stages_public_node_admission() {
+    let cluster = SimulatedCluster::spawn(1).await.unwrap();
+    let joiner = Keypair::generate();
+    let target = cluster.next_target(0).await.unwrap();
+    let service = Service::new(
+        ServiceKind::Consensus,
+        joiner.public,
+        "tcp",
+        "127.0.0.1",
+        9191,
+    );
+    let admission = NodeAdmission::signed_for_consensus_service(
+        service.clone(),
+        target.last_epoch,
+        target.nonce,
+        &joiner.signer(),
+    )
+    .unwrap();
+
+    match cluster
+        .request(0, WireRequest::RegisterService(admission.into()))
+        .await
+        .unwrap()
+    {
+        WireResponse::AddressBookUpdated(update) => {
+            assert_eq!(update.service, service);
+            assert_eq!(
+                update.admitted_node.map(|node| node.public_key()),
+                Some(joiner.public)
+            );
+            assert_eq!(update.nonce_announced, None);
+        }
+        response => panic!("expected address book update, got {}", response.kind()),
+    }
+
+    match cluster.request(0, WireRequest::AddressBook).await.unwrap() {
+        WireResponse::AddressBook(services) => {
+            assert!(services.iter().any(|registered| registered == &service));
         }
         response => panic!("expected address book, got {}", response.kind()),
     }

@@ -3,6 +3,7 @@ use std::mem;
 
 use serde::{Deserialize, Serialize};
 
+use crate::admission::NodeAdmission;
 use crate::block::{Block, BlockApplicationState, Transaction};
 use crate::crypto::{PubKey, SecKey};
 use crate::encounter::EncounterRecord;
@@ -17,6 +18,7 @@ pub struct LocalBlock {
     pub block_cap: usize,
     pub application_state: BlockApplicationState,
     pub encounter_records: Vec<EncounterRecord>,
+    pub node_admissions: Vec<NodeAdmission>,
 }
 
 impl LocalBlock {
@@ -27,6 +29,7 @@ impl LocalBlock {
             block_cap,
             application_state: BlockApplicationState::default(),
             encounter_records: Vec::new(),
+            node_admissions: Vec::new(),
         }
     }
 
@@ -54,6 +57,21 @@ impl LocalBlock {
         mem::take(&mut self.encounter_records)
     }
 
+    pub fn add_node_admission(&mut self, admission: NodeAdmission) -> Result<HashType> {
+        admission.verify()?;
+        let hash = admission.body.hash();
+        self.node_admissions.push(admission);
+        Ok(hash)
+    }
+
+    pub fn node_admissions(&self) -> &[NodeAdmission] {
+        &self.node_admissions
+    }
+
+    pub fn take_node_admissions(&mut self) -> Vec<NodeAdmission> {
+        mem::take(&mut self.node_admissions)
+    }
+
     pub fn add_transaction(&mut self, tx: Transaction) -> HashType {
         let hash = tx.hash;
         self.build_block.body.txs.push(tx);
@@ -70,6 +88,7 @@ impl LocalBlock {
         self.build_block.body.nonce = nonce;
         self.build_block.body.application_state = self.application_state.clone();
         self.build_block.body.encounter_records = self.encounter_records.clone();
+        self.build_block.body.node_admissions = self.node_admissions.clone();
         self.build_block.sign(secret_key);
 
         self.ensure_enqueueable(&self.build_block)?;
@@ -77,6 +96,7 @@ impl LocalBlock {
         let block = mem::take(&mut self.build_block);
         self.block_deque.push_back(block);
         self.encounter_records.clear();
+        self.node_admissions.clear();
         Ok(hash)
     }
 

@@ -139,6 +139,10 @@ impl OverlayRuntime {
             .into_services()
     }
 
+    /// Registers or replaces a local service endpoint for overlay fan-out.
+    ///
+    /// Overlay registration does not create consensus state or verifier
+    /// membership; it only makes the endpoint selectable by fan-out strategy.
     pub fn register_service(&self, service: Service) -> Option<Service> {
         self.inner
             .address_book

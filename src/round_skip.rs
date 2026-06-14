@@ -76,11 +76,8 @@ pub fn future_round_assist_decision(input: FutureRoundAssistInput) -> FutureRoun
         _ => {}
     }
 
-    match (input.kind, input.future_body_validated) {
-        (FutureRoundAssistKind::DataBearing, false) => {
-            return FutureRoundAssistDecision::RejectDataVoteUntilValidated;
-        }
-        _ => {}
+    if let (FutureRoundAssistKind::DataBearing, false) = (input.kind, input.future_body_validated) {
+        return FutureRoundAssistDecision::RejectDataVoteUntilValidated;
     }
 
     FutureRoundAssistDecision::Assist

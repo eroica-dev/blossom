@@ -15,6 +15,8 @@ pub use epoch::{
 };
 pub use fuzz::{FuzzCaseKind, FuzzConfig, FuzzReport, run_node_io_fuzz};
 pub use sim::{
-    HermeticActionRecord, HermeticCluster, HermeticEventLog, HermeticEventRecord, HermeticOutcome,
-    HermeticPlan, HermeticSimConfig, PlannedAction, replay_matches, run_plan,
+    ClusterProfile, CpuProfile, HardwareFaultConfig, HardwareFaultKind, HermeticActionRecord,
+    HermeticCluster, HermeticEventLog, HermeticEventRecord, HermeticOutcome, HermeticPerfReport,
+    HermeticPlan, HermeticRunReport, HermeticSimConfig, NodePerfReport, NodeProfile, PlannedAction,
+    replay_matches, run_plan, run_plan_with_perf,
 };

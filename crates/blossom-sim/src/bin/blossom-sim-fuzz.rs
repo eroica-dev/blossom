@@ -63,21 +63,17 @@ async fn main() -> MainResult<()> {
     }
 
     println!("{}", to_csv(&args, &report));
-    match args.csv.as_ref() {
-        Some(path) => {
-            write_csv(path, args.append, &args, &report)?;
-            eprintln!("wrote {}", path.display());
-        }
-        None => {}
+    if let Some(path) = args.csv.as_ref() {
+        write_csv(path, args.append, &args, &report)?;
+        eprintln!("wrote {}", path.display());
     }
 
     Ok(())
 }
 
 fn write_csv(path: &PathBuf, append: bool, args: &Args, report: &FuzzReport) -> MainResult<()> {
-    match path.parent() {
-        Some(parent) => create_dir_all(parent)?,
-        None => {}
+    if let Some(parent) = path.parent() {
+        create_dir_all(parent)?;
     }
 
     let write_header = !append || !path.exists() || path.metadata()?.len() == 0;

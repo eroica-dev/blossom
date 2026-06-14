@@ -4,12 +4,12 @@ use std::io::{BufWriter, Write};
 use std::net::TcpStream;
 use std::sync::{
     Arc, Mutex,
-    atomic::{AtomicU64, Ordering},
     mpsc::{Receiver, RecvTimeoutError, SyncSender, TryRecvError, TrySendError, sync_channel},
 };
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use fast_telemetry::Counter;
 use serde::{Deserialize, Serialize};
 
 use crate::crypto::PubKey;
@@ -289,7 +289,7 @@ impl JsonlTcpTelemetrySinkConfig {
 pub struct JsonlTcpTelemetrySink {
     sender: SyncSender<TelemetryEvent>,
     worker: Mutex<Option<JoinHandle<()>>>,
-    dropped_events: Arc<AtomicU64>,
+    dropped_events: Counter,
 }
 
 impl JsonlTcpTelemetrySink {
@@ -311,12 +311,12 @@ impl JsonlTcpTelemetrySink {
         Ok(Self {
             sender,
             worker: Mutex::new(Some(worker)),
-            dropped_events: Arc::new(AtomicU64::new(0)),
+            dropped_events: Counter::new(64),
         })
     }
 
     pub fn dropped_events(&self) -> u64 {
-        self.dropped_events.load(Ordering::Relaxed)
+        counter_sum_u64(&self.dropped_events)
     }
 }
 
@@ -325,10 +325,14 @@ impl TelemetrySink for JsonlTcpTelemetrySink {
         match self.sender.try_send(event) {
             Ok(()) => {}
             Err(TrySendError::Full(_)) | Err(TrySendError::Disconnected(_)) => {
-                self.dropped_events.fetch_add(1, Ordering::Relaxed);
+                self.dropped_events.inc();
             }
         }
     }
+}
+
+fn counter_sum_u64(counter: &Counter) -> u64 {
+    u64::try_from(counter.sum()).unwrap_or_default()
 }
 
 impl Drop for JsonlTcpTelemetrySink {
@@ -437,32 +441,26 @@ fn append_fast_span_jsonl_event(batch: &mut Vec<u8>, event: &TelemetryEvent) -> 
     batch.write_all(b"{").map_err(|_| ())?;
     append_json_u16_field(batch, "schema_version", event.schema_version, false)?;
     append_json_str_field(batch, "kind", kind, true)?;
-    match event.span_id {
-        Some(span_id) => append_json_u64_field(batch, "span_id", span_id, true)?,
-        None => {}
+    if let Some(span_id) = event.span_id {
+        append_json_u64_field(batch, "span_id", span_id, true)?;
     }
     append_json_u128_field(batch, "timestamp_micros", event.timestamp_micros, true)?;
-    match event.node {
-        Some(node) => append_json_hex_field(batch, "node", node.as_ref(), true)?,
-        None => {}
+    if let Some(node) = event.node {
+        append_json_hex_field(batch, "node", node.as_ref(), true)?;
     }
-    match event.group_id {
-        Some(group_id) => append_json_hex_field(batch, "group_id", group_id.as_ref(), true)?,
-        None => {}
+    if let Some(group_id) = event.group_id {
+        append_json_hex_field(batch, "group_id", group_id.as_ref(), true)?;
     }
     append_json_str_field(batch, "stage", &event.stage, true)?;
     append_json_str_field(batch, "event", &event.event, true)?;
-    match event.last_epoch {
-        Some(last_epoch) => append_json_hex_field(batch, "last_epoch", last_epoch.as_ref(), true)?,
-        None => {}
+    if let Some(last_epoch) = event.last_epoch {
+        append_json_hex_field(batch, "last_epoch", last_epoch.as_ref(), true)?;
     }
-    match event.nonce {
-        Some(nonce) => append_json_u64_field(batch, "nonce", nonce.value(), true)?,
-        None => {}
+    if let Some(nonce) = event.nonce {
+        append_json_u64_field(batch, "nonce", nonce.value(), true)?;
     }
-    match event.round {
-        Some(round) => append_json_u8_field(batch, "round", round, true)?,
-        None => {}
+    if let Some(round) = event.round {
+        append_json_u8_field(batch, "round", round, true)?;
     }
     batch.write_all(b"}\n").map_err(|_| ())?;
     Ok(true)

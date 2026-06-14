@@ -6,7 +6,6 @@ use crate::availability::{
     FilteredPayloadBatchFetchBody, FilteredPayloadDeliveryItem, FilteredPayloadRequest,
 };
 use crate::block::{FilteredDeliveryPolicy, FilteredTransactionSlot};
-use crate::hash::ProtocolHasher;
 use crate::wire::FRAME_PREFIX_BYTES;
 use crate::{
     Block, BlossomError, Commit, CommitBody, DoHash, EchoResponse, EchoResponseBody, HashType,
@@ -82,7 +81,7 @@ impl Default for SubsetLatencyProfile {
             latency_ms: 150,
             min_ms: 1,
             max_ms: 300,
-            seed: 0x7375_6273_6574_31,
+            seed: 0x0073_7562_7365_7431,
         }
     }
 }
@@ -128,7 +127,6 @@ pub struct SubsetGossipConfig {
     pub prefill_mode: SubsetPrefillMode,
     pub prefill_fanout: usize,
     pub prefill_skip_rounds: usize,
-    pub prefill_replicas_per_quorum: usize,
     pub prefill_byzantine_withholders_per_branch: usize,
     pub hash_advertise: bool,
     pub drop_round0_dispatch: bool,
@@ -151,7 +149,6 @@ impl Default for SubsetGossipConfig {
             prefill_mode: SubsetPrefillMode::None,
             prefill_fanout: 0,
             prefill_skip_rounds: 0,
-            prefill_replicas_per_quorum: 2,
             prefill_byzantine_withholders_per_branch: 0,
             hash_advertise: false,
             drop_round0_dispatch: false,
@@ -175,7 +172,6 @@ impl SubsetGossipConfig {
                 prefill_mode: SubsetPrefillMode::PrefillDispatch,
                 prefill_fanout: 0,
                 prefill_skip_rounds: 0,
-                prefill_replicas_per_quorum: 2,
                 repair_missing: false,
                 hash_advertise: false,
                 ..Self::default()
@@ -230,11 +226,6 @@ impl SubsetGossipConfig {
                 "targets per command must be greater than zero".to_string(),
             ));
         }
-        if self.prefill_replicas_per_quorum == 0 {
-            return Err(BlossomError::WireProtocol(
-                "prefill replicas per quorum must be greater than zero".to_string(),
-            ));
-        }
         if matches!(self.prefill_mode, SubsetPrefillMode::PrefillDispatch)
             && self.prefill_skip_rounds > 1
         {
@@ -242,7 +233,74 @@ impl SubsetGossipConfig {
                 "prefill-dispatch can skip at most one consensus round".to_string(),
             ));
         }
-        self.latency.validate()
+        if matches!(self.prefill_mode, SubsetPrefillMode::PrefillDispatch)
+            && !self.trusted
+            && self.prefill_byzantine_withholders_per_branch > 0
+            && self.quorum_size < 5
+        {
+            return Err(BlossomError::WireProtocol(
+                "prefill-dispatch with Byzantine withholding requires quorum size at least 5"
+                    .to_string(),
+            ));
+        }
+        self.latency.validate()?;
+        self.validate_propagation_policy()
+    }
+
+    #[cfg(any(
+        feature = "propagation-adaptive",
+        feature = "propagation-inventory",
+        feature = "propagation-push"
+    ))]
+    fn validate_propagation_policy(&self) -> Result<()> {
+        let uses_inventory = self.hash_advertise || prefill_inventory_is_precomputed(self);
+        let strategy = match uses_inventory {
+            true => crate::propagation::PropagationStrategy::InventoryThenMissing,
+            false => crate::propagation::PropagationStrategy::PushFullBlocks,
+        };
+        let tolerated_byzantine = (self.quorum_size.saturating_sub(1)) / 3;
+        let trust_boundary = match self.trusted {
+            true => crate::propagation::TrustBoundary::Trusted,
+            false => crate::propagation::TrustBoundary::Trustless {
+                quorum_size: self.quorum_size,
+                tolerated_byzantine,
+            },
+        };
+        let manifest_authentication = match (self.trusted, uses_inventory) {
+            (true, true) => crate::propagation::ManifestAuthentication::HashOnly,
+            (false, true) => crate::propagation::ManifestAuthentication::HolderSigned,
+            (_, false) => crate::propagation::ManifestAuthentication::None,
+        };
+        let redundancy = match (uses_inventory, self.prefill_mode) {
+            (true, SubsetPrefillMode::PrefillDispatch | SubsetPrefillMode::Scheduled) => {
+                crate::propagation::RedundancyPlan::new(
+                    self.quorum_size,
+                    self.prefill_byzantine_withholders_per_branch,
+                )
+            }
+            (true, _) => crate::propagation::RedundancyPlan::new(1, 0),
+            (false, _) => crate::propagation::RedundancyPlan::new(1, 0),
+        };
+
+        crate::propagation::PropagationPlan {
+            strategy,
+            trust_boundary,
+            manifest_authentication,
+            redundancy,
+            during_consensus: true,
+        }
+        .validate()
+        .map(|_| ())
+        .map_err(|err| BlossomError::WireProtocol(format!("invalid propagation policy: {err}")))
+    }
+
+    #[cfg(not(any(
+        feature = "propagation-adaptive",
+        feature = "propagation-inventory",
+        feature = "propagation-push"
+    )))]
+    fn validate_propagation_policy(&self) -> Result<()> {
+        Ok(())
     }
 }
 
@@ -266,7 +324,6 @@ pub struct SubsetGossipEpochRow {
     pub prefill_mode: SubsetPrefillMode,
     pub prefill_fanout: usize,
     pub prefill_skip_rounds: usize,
-    pub prefill_replicas_per_quorum: usize,
     pub prefill_byzantine_withholders_per_branch: usize,
     pub hash_advertise: bool,
     pub drop_round0_dispatch: bool,
@@ -290,12 +347,19 @@ pub struct SubsetGossipEpochRow {
     pub subset_repair_batches: usize,
     pub subset_repair_bytes: usize,
     pub subset_repair_latency_ms: u64,
+    pub prefill_requests: usize,
     pub prefill_recipients: usize,
     pub prefill_expected_hashes: usize,
     pub prefill_bytes: usize,
     pub hash_advertise_messages: usize,
     pub hash_advertise_bytes: usize,
     pub duplicate_suppressed_blocks: usize,
+    pub full_dispatch_requests: usize,
+    pub subset_dispatch_requests: usize,
+    pub control_requests: usize,
+    pub subset_repair_requests: usize,
+    pub full_requests: usize,
+    pub subset_requests: usize,
     pub modeled_prefill_latency_ms: u64,
     pub modeled_hash_advertise_latency_ms: u64,
     pub modeled_finality_latency_ms: u64,
@@ -313,6 +377,8 @@ pub struct SubsetGossipEpochRow {
     pub subset_savings_pct: f64,
     pub full_tps: f64,
     pub subset_payload_ready_tps: f64,
+    pub full_req_per_sec: f64,
+    pub subset_payload_ready_req_per_sec: f64,
     pub full_total_gbps: f64,
     pub subset_total_gbps: f64,
     pub full_per_node_gbps: f64,
@@ -353,9 +419,8 @@ impl NodeSubsetState {
     }
 
     fn insert_block_metadata(&mut self, owner: usize, command_count: usize) {
-        match self.blocks.get_mut(owner) {
-            Some(slot @ None) => *slot = Some(PayloadMask::empty(command_count)),
-            Some(Some(_)) | None => {}
+        if let Some(slot @ None) = self.blocks.get_mut(owner) {
+            *slot = Some(PayloadMask::empty(command_count));
         }
     }
 
@@ -591,7 +656,11 @@ struct EpochByteTotals {
     subset_dispatch_bytes: usize,
     hash_advertise_bytes: usize,
     control_bytes: usize,
+    prefill_requests: usize,
+    full_dispatch_requests: usize,
+    subset_dispatch_requests: usize,
     hash_advertise_messages: usize,
+    control_requests: usize,
     duplicate_suppressed_blocks: usize,
 }
 
@@ -707,14 +776,16 @@ fn run_subset_epoch(
         consensus_start_round,
     );
     apply_prefill(
-        config,
-        nodes,
-        &blocks,
-        &prefill_plan,
-        header_len,
-        signature_tree_len,
-        &future_reachability,
-        consensus_start_round,
+        PrefillApplyContext {
+            config,
+            nodes,
+            blocks: &blocks,
+            plan: &prefill_plan,
+            header_len,
+            signature_tree_len,
+            future_reachability: &future_reachability,
+            consensus_start_round,
+        },
         &mut subset_states,
         &mut byte_totals,
         &mut latency_totals,
@@ -728,6 +799,9 @@ fn run_subset_epoch(
         let before_subset = subset_states.clone();
         let mut next_full = full_known.clone();
         let mut next_subset = subset_states.clone();
+        let mut round_dispatch_ms = 0u64;
+        let mut round_hash_advertise_ms = 0u64;
+        let mut round_control_ms = 0u64;
         let drop_dispatch_round = config.drop_round0_dispatch && round == 0;
         let full_dispatch_len_by_sender = before_full
             .iter()
@@ -754,12 +828,12 @@ fn run_subset_epoch(
                 continue;
             }
             let stage_latency = quorum_stage_finality_latency_ms(quorum, config.latency);
-            latency_totals.dispatch_ms += stage_latency;
+            round_dispatch_ms = round_dispatch_ms.max(stage_latency);
             if config.hash_advertise {
-                latency_totals.hash_advertise_ms += stage_latency;
+                round_hash_advertise_ms = round_hash_advertise_ms.max(stage_latency);
             }
             if !config.trusted {
-                latency_totals.control_ms += stage_latency * 4;
+                round_control_ms = round_control_ms.max(stage_latency * 4);
                 byte_totals.control_bytes += control_bytes_for_quorum(
                     round as u8,
                     quorum,
@@ -769,6 +843,7 @@ fn run_subset_epoch(
                     last_epoch,
                     nonce,
                 )?;
+                byte_totals.control_requests += control_requests_for_quorum(quorum.len());
             }
             let precomputed_inventory_routes = if prefill_inventory_is_precomputed(config) {
                 Some(precomputed_inventory_routes_for_quorum(
@@ -790,6 +865,7 @@ fn run_subset_epoch(
                     }
 
                     byte_totals.full_dispatch_bytes += full_dispatch_len_by_sender[*sender];
+                    byte_totals.full_dispatch_requests += 1;
                     if config.hash_advertise {
                         byte_totals.hash_advertise_messages += 1;
                         byte_totals.hash_advertise_bytes += hash_advertise_len_for_block_count(
@@ -802,42 +878,37 @@ fn run_subset_epoch(
                     let mut subset_block_bytes = 0usize;
                     let mut payload_delivery_items = Vec::new();
                     for block in &blocks {
-                        match &precomputed_inventory_routes {
-                            Some(routes) => {
-                                let route = match routes.get(&(*sender, *recipient, block.owner)) {
-                                    Some(route)
-                                        if route.attempt
-                                            >= config.prefill_byzantine_withholders_per_branch
-                                            && !route.payloads.is_empty() =>
-                                    {
-                                        route
-                                    }
-                                    _ => continue,
-                                };
-                                let sender_full =
-                                    match before_subset[*sender].blocks[block.owner].as_ref() {
-                                        Some(sender_full) => sender_full,
-                                        None => continue,
-                                    };
-                                let (incoming, full_count) = PayloadMask::intersection_with_count(
-                                    sender_full,
-                                    &route.payloads,
-                                );
-                                if full_count == 0 {
-                                    continue;
+                        if let Some(routes) = &precomputed_inventory_routes {
+                            let route = match routes.get(&(*sender, *recipient, block.owner)) {
+                                Some(route)
+                                    if route.attempt
+                                        >= config.prefill_byzantine_withholders_per_branch
+                                        && !route.payloads.is_empty() =>
+                                {
+                                    route
                                 }
-                                next_subset[*recipient]
-                                    .mark_full_payloads(block.owner, incoming.clone());
-                                payload_delivery_items.extend(incoming.indices().map(|command| {
-                                    FilteredPayloadDeliveryItem {
-                                        slot_hash: block.slots[command].hash(),
-                                        slot: block.slots[command].clone(),
-                                        payload: Vec::new(),
-                                    }
-                                }));
+                                _ => continue,
+                            };
+                            let sender_full =
+                                match before_subset[*sender].blocks[block.owner].as_ref() {
+                                    Some(sender_full) => sender_full,
+                                    None => continue,
+                                };
+                            let (incoming, full_count) =
+                                PayloadMask::intersection_with_count(sender_full, &route.payloads);
+                            if full_count == 0 {
                                 continue;
                             }
-                            None => {}
+                            next_subset[*recipient]
+                                .mark_full_payloads(block.owner, incoming.clone());
+                            payload_delivery_items.extend(incoming.indices().map(|command| {
+                                FilteredPayloadDeliveryItem {
+                                    slot_hash: block.slots[command].hash(),
+                                    slot: block.slots[command].clone(),
+                                    payload: Vec::new(),
+                                }
+                            }));
+                            continue;
                         }
                         let Some(sender_full) = before_subset[*sender].blocks[block.owner].as_ref()
                         else {
@@ -883,8 +954,7 @@ fn run_subset_epoch(
                         }
                     }
 
-                    byte_totals.subset_dispatch_bytes += if prefill_inventory_is_precomputed(config)
-                    {
+                    let subset_dispatch_bytes = if prefill_inventory_is_precomputed(config) {
                         filtered_payload_batch_delivery_len(
                             nodes[*sender].keypair.public,
                             payload_delivery_items,
@@ -898,6 +968,10 @@ fn run_subset_epoch(
                             subset_block_bytes,
                         )?
                     };
+                    if subset_dispatch_bytes > 0 {
+                        byte_totals.subset_dispatch_requests += 1;
+                    }
+                    byte_totals.subset_dispatch_bytes += subset_dispatch_bytes;
                 }
             }
 
@@ -914,6 +988,9 @@ fn run_subset_epoch(
             }
         }
 
+        latency_totals.dispatch_ms += round_dispatch_ms;
+        latency_totals.hash_advertise_ms += round_hash_advertise_ms;
+        latency_totals.control_ms += round_control_ms;
         full_known = next_full;
         subset_states = next_subset;
     }
@@ -953,6 +1030,12 @@ fn run_subset_epoch(
         + byte_totals.control_bytes
         + subset_repair_bytes;
     let total_commands = config.nodes * config.commands_per_node;
+    let full_requests = byte_totals.full_dispatch_requests + byte_totals.control_requests;
+    let subset_requests = byte_totals.prefill_requests
+        + byte_totals.subset_dispatch_requests
+        + byte_totals.hash_advertise_messages
+        + byte_totals.control_requests
+        + subset_repair_batches;
 
     let epoch_hash = epoch_hash(
         last_epoch,
@@ -988,7 +1071,6 @@ fn run_subset_epoch(
                 .max()
                 .unwrap_or_default(),
             prefill_skip_rounds: consensus_start_round,
-            prefill_replicas_per_quorum: config.prefill_replicas_per_quorum,
             prefill_byzantine_withholders_per_branch: config
                 .prefill_byzantine_withholders_per_branch,
             hash_advertise: config.hash_advertise,
@@ -1013,6 +1095,7 @@ fn run_subset_epoch(
             subset_repair_batches,
             subset_repair_bytes,
             subset_repair_latency_ms,
+            prefill_requests: byte_totals.prefill_requests,
             prefill_recipients: prefill_plan.recipients_by_sender.iter().map(Vec::len).sum(),
             prefill_expected_hashes: prefill_plan
                 .expected_by_node
@@ -1023,6 +1106,12 @@ fn run_subset_epoch(
             hash_advertise_messages: byte_totals.hash_advertise_messages,
             hash_advertise_bytes: byte_totals.hash_advertise_bytes,
             duplicate_suppressed_blocks: byte_totals.duplicate_suppressed_blocks,
+            full_dispatch_requests: byte_totals.full_dispatch_requests,
+            subset_dispatch_requests: byte_totals.subset_dispatch_requests,
+            control_requests: byte_totals.control_requests,
+            subset_repair_requests: subset_repair_batches,
+            full_requests,
+            subset_requests,
             modeled_prefill_latency_ms: latency_totals.prefill_ms,
             modeled_hash_advertise_latency_ms: latency_totals.hash_advertise_ms,
             modeled_finality_latency_ms,
@@ -1043,6 +1132,11 @@ fn run_subset_epoch(
             ),
             full_tps: tps(total_commands, modeled_finality_latency_ms),
             subset_payload_ready_tps: tps(total_commands, subset_payload_ready_latency_ms),
+            full_req_per_sec: per_second(full_requests, modeled_finality_latency_ms),
+            subset_payload_ready_req_per_sec: per_second(
+                subset_requests,
+                subset_payload_ready_latency_ms,
+            ),
             full_total_gbps: gbps(full_wire_bytes, modeled_finality_latency_ms),
             subset_total_gbps: gbps(subset_wire_bytes, subset_payload_ready_latency_ms),
             full_per_node_gbps: gbps(full_wire_bytes, modeled_finality_latency_ms)
@@ -1163,6 +1257,12 @@ fn prefill_routes_full_blocks(config: &SubsetGossipConfig) -> bool {
     matches!(config.prefill_mode, SubsetPrefillMode::PrefillDispatch)
 }
 
+fn prefill_requires_full_payload_redundancy(config: &SubsetGossipConfig) -> bool {
+    prefill_routes_full_blocks(config)
+        && !config.trusted
+        && config.prefill_byzantine_withholders_per_branch > 0
+}
+
 fn effective_prefill_fanout(config: &SubsetGossipConfig) -> usize {
     let requested = if config.prefill_fanout == 0 {
         config.quorum_size
@@ -1177,11 +1277,13 @@ fn prefill_dispatch_fanout(config: &SubsetGossipConfig, topology_rounds: usize) 
         return 0;
     }
 
-    let branch_replicas = config.prefill_replicas_per_quorum.saturating_sub(1);
+    let network_rounds = ceil_log_rounds(config.nodes, config.quorum_size).max(topology_rounds);
+    let route_width = prefill_dispatch_route_width(config);
     let planned = config.quorum_size.saturating_sub(1).saturating_add(
-        branch_replicas
-            .saturating_mul(config.quorum_size)
-            .saturating_mul(topology_rounds.saturating_sub(1)),
+        config
+            .quorum_size
+            .saturating_mul(route_width)
+            .saturating_mul(network_rounds.saturating_sub(1)),
     );
     let requested = if config.prefill_fanout == 0 {
         planned
@@ -1189,6 +1291,33 @@ fn prefill_dispatch_fanout(config: &SubsetGossipConfig, topology_rounds: usize) 
         config.prefill_fanout
     };
     requested.min(config.nodes.saturating_sub(1))
+}
+
+fn ceil_log_rounds(network_size: usize, quorum_size: usize) -> usize {
+    if network_size == 0 || quorum_size < 2 {
+        return 0;
+    }
+
+    let mut rounds = 0usize;
+    let mut covered = 1usize;
+    while covered < network_size {
+        rounds = rounds.saturating_add(1);
+        match covered.checked_mul(quorum_size) {
+            Some(next) => covered = next,
+            None => return rounds,
+        }
+    }
+
+    rounds.max(1)
+}
+
+fn prefill_dispatch_route_width(config: &SubsetGossipConfig) -> usize {
+    if prefill_requires_full_payload_redundancy(config) {
+        return config
+            .prefill_byzantine_withholders_per_branch
+            .saturating_add(1);
+    }
+    1
 }
 
 fn build_prefill_plan(
@@ -1291,7 +1420,7 @@ fn prefill_dispatch_recipients(
         return recipients;
     };
 
-    let mut branch_reps = first_quorum.to_vec();
+    let mut route_frontier = first_quorum.to_vec();
     for recipient in first_quorum {
         if *recipient != sender {
             recipients.insert(*recipient);
@@ -1301,29 +1430,25 @@ fn prefill_dispatch_recipients(
         }
     }
 
-    let extra_replicas_per_branch = config.prefill_replicas_per_quorum.saturating_sub(1);
-    if extra_replicas_per_branch == 0 {
-        return recipients;
-    }
-
     for (round, quorums) in topology.iter().enumerate().skip(1) {
         if recipients.len() >= max_fanout {
             break;
         }
 
-        branch_reps.sort_unstable();
-        branch_reps.dedup();
-        let mut next_branch_reps = Vec::new();
+        route_frontier.sort_unstable();
+        route_frontier.dedup();
+        let mut next_frontier = Vec::new();
 
-        for branch_rep in &branch_reps {
+        for frontier_holder in &route_frontier {
             if recipients.len() >= max_fanout {
                 break;
             }
 
-            let Some(quorum) = quorum_containing_member(quorums, *branch_rep) else {
-                next_branch_reps.push(*branch_rep);
+            let Some(quorum) = quorum_containing_member(quorums, *frontier_holder) else {
+                next_frontier.push(*frontier_holder);
                 continue;
             };
+            let route_width = prefill_dispatch_route_width(config);
 
             let mut candidates = quorum
                 .iter()
@@ -1331,27 +1456,33 @@ fn prefill_dispatch_recipients(
                 .filter(|candidate| *candidate != sender && !recipients.contains(candidate))
                 .collect::<Vec<_>>();
             candidates.sort_by_key(|candidate| {
-                prefill_dispatch_score(config.seed, epoch, sender, round, *branch_rep, *candidate)
+                prefill_dispatch_score(
+                    config.seed,
+                    epoch,
+                    sender,
+                    round,
+                    *frontier_holder,
+                    *candidate,
+                )
             });
 
             let mut added = 0usize;
-            for candidate in candidates {
-                if recipients.len() >= max_fanout || added >= extra_replicas_per_branch {
+            for candidate in candidates.into_iter().take(route_width) {
+                if recipients.len() >= max_fanout {
                     break;
                 }
-                recipients.insert(candidate);
-                if added == 0 {
-                    next_branch_reps.push(candidate);
+                if recipients.insert(candidate) {
+                    next_frontier.push(candidate);
+                    added += 1;
                 }
-                added += 1;
             }
 
             if added == 0 {
-                next_branch_reps.push(*branch_rep);
+                next_frontier.push(*frontier_holder);
             }
         }
 
-        branch_reps = next_branch_reps;
+        route_frontier = next_frontier;
     }
 
     recipients
@@ -1369,14 +1500,14 @@ fn prefill_dispatch_score(
     epoch: usize,
     sender: usize,
     round: usize,
-    branch_rep: usize,
+    frontier_holder: usize,
     candidate: usize,
 ) -> u64 {
     splitmix64(
         seed ^ (epoch as u64).wrapping_mul(0x98a2_c64f_15b8_3d21)
             ^ (sender as u64).wrapping_mul(0xd6e8_feb8_6659_fd93)
             ^ (round as u64).wrapping_mul(0xa076_1d64_78bd_642f)
-            ^ (branch_rep as u64).wrapping_mul(0xe703_7ed1_a0b4_28db)
+            ^ (frontier_holder as u64).wrapping_mul(0xe703_7ed1_a0b4_28db)
             ^ (candidate as u64).wrapping_mul(0x8ebc_6af0_9c88_c6e3),
     )
 }
@@ -1386,8 +1517,8 @@ fn build_future_reachability(
     node_count: usize,
 ) -> Vec<Vec<Vec<usize>>> {
     let mut by_start_round = vec![vec![Vec::new(); node_count]; topology.len() + 1];
-    for start_round in 0..=topology.len() {
-        for source in 0..node_count {
+    for (start_round, per_source) in by_start_round.iter_mut().enumerate() {
+        for (source, slot) in per_source.iter_mut().enumerate().take(node_count) {
             let mut holders = BTreeSet::new();
             holders.insert(source);
             for quorums in topology.iter().skip(start_round) {
@@ -1399,7 +1530,7 @@ fn build_future_reachability(
                 }
                 holders = next;
             }
-            by_start_round[start_round][source] = holders.into_iter().collect();
+            *slot = holders.into_iter().collect();
         }
     }
     by_start_round
@@ -1420,27 +1551,34 @@ fn route_interest_mask(
     mask
 }
 
-fn apply_prefill(
-    config: &SubsetGossipConfig,
-    nodes: &[BenchNode],
-    blocks: &[BlockMeta],
-    plan: &PrefillPlan,
+struct PrefillApplyContext<'a> {
+    config: &'a SubsetGossipConfig,
+    nodes: &'a [BenchNode],
+    blocks: &'a [BlockMeta],
+    plan: &'a PrefillPlan,
     header_len: usize,
     signature_tree_len: usize,
-    future_reachability: &[Vec<Vec<usize>>],
+    future_reachability: &'a [Vec<Vec<usize>>],
     consensus_start_round: usize,
+}
+
+fn apply_prefill(
+    ctx: PrefillApplyContext<'_>,
     states: &mut [NodeSubsetState],
     byte_totals: &mut EpochByteTotals,
     latency_totals: &mut EpochLatencyTotals,
 ) -> Result<()> {
-    for (sender, recipients) in plan.recipients_by_sender.iter().enumerate() {
-        let block = &blocks[sender];
+    let config = ctx.config;
+    for (sender, recipients) in ctx.plan.recipients_by_sender.iter().enumerate() {
+        let block = &ctx.blocks[sender];
         for recipient in recipients {
-            let payloads = if prefill_routes_full_blocks(config) {
+            let payloads = if prefill_requires_full_payload_redundancy(config) {
+                PayloadMask::full(config.commands_per_node)
+            } else if prefill_routes_full_blocks(config) {
                 route_interest_mask(
                     config,
                     block,
-                    &future_reachability[consensus_start_round][*recipient],
+                    &ctx.future_reachability[ctx.consensus_start_round][*recipient],
                 )
             } else {
                 PayloadMask::full(config.commands_per_node)
@@ -1450,19 +1588,20 @@ fn apply_prefill(
                 continue;
             }
             let prefill_len = dispatch_len_for_block_stats(
-                header_len,
-                signature_tree_len,
+                ctx.header_len,
+                ctx.signature_tree_len,
                 1,
                 block.tombstone_block_len + (payload_count * config.command_bytes),
             )?;
             states[*recipient].merge_block(sender, payloads);
             byte_totals.prefill_bytes += prefill_len;
+            byte_totals.prefill_requests += 1;
             latency_totals.prefill_ms = latency_totals
                 .prefill_ms
                 .max(config.latency.edge_latency_ms(sender, *recipient));
         }
     }
-    debug_assert_eq!(nodes.len(), states.len());
+    debug_assert_eq!(ctx.nodes.len(), states.len());
     Ok(())
 }
 
@@ -1796,6 +1935,13 @@ fn control_bytes_for_quorum(
     Ok(bytes)
 }
 
+fn control_requests_for_quorum(quorum_len: usize) -> usize {
+    let peers = quorum_len.saturating_sub(1);
+    let echo_requests = quorum_len.saturating_mul(peers).saturating_mul(peers);
+    let decision_requests = 3usize.saturating_mul(quorum_len).saturating_mul(peers);
+    echo_requests.saturating_add(decision_requests)
+}
+
 fn quorum_known_blocks(
     quorum: &[usize],
     before_full: &[Vec<bool>],
@@ -2113,30 +2259,21 @@ fn command_key_hash(epoch: usize, owner: usize, command: usize) -> HashType {
 }
 
 fn command_payload_hash(epoch: usize, owner: usize, command: usize, len: usize) -> HashType {
-    const HASH_CHUNK_BYTES: usize = 64;
-
-    let mut hasher = ProtocolHasher::new();
+    // The subset-gossip model accounts for payload bytes in wire totals but
+    // never materializes payload bodies. Use a stable synthetic commitment so
+    // large bandwidth sweeps scale with graph size, not fake byte hashing.
+    let mut bytes = [0u8; 32];
     let mut state = (epoch as u64)
         .wrapping_mul(0x9e37_79b9_7f4a_7c15)
         .wrapping_add((owner as u64) << 32)
-        .wrapping_add(command as u64);
-
-    let mut remaining = len;
-    let mut buffer = [0u8; HASH_CHUNK_BYTES];
-    while remaining > 0 {
-        let take = remaining.min(buffer.len());
-        let mut filled = 0usize;
-        while filled < take {
-            state = splitmix64(state);
-            let state_bytes = state.to_le_bytes();
-            let copy_len = (take - filled).min(state_bytes.len());
-            buffer[filled..filled + copy_len].copy_from_slice(&state_bytes[..copy_len]);
-            filled += copy_len;
-        }
-        hasher.update(&buffer[..take]);
-        remaining -= take;
+        .wrapping_add(command as u64)
+        ^ (len as u64).rotate_left(17)
+        ^ 0x5ab5_e7a1_da7a_0001;
+    for chunk in bytes.chunks_mut(8) {
+        state = splitmix64(state);
+        chunk.copy_from_slice(&state.to_le_bytes()[..chunk.len()]);
     }
-    hasher.finalize()
+    HashType(bytes)
 }
 
 fn splitmix64(mut value: u64) -> u64 {
@@ -2160,10 +2297,14 @@ fn pct(numerator: usize, denominator: usize) -> f64 {
 }
 
 fn tps(commands: usize, latency_ms: u64) -> f64 {
+    per_second(commands, latency_ms)
+}
+
+fn per_second(count: usize, latency_ms: u64) -> f64 {
     if latency_ms == 0 {
         0.0
     } else {
-        commands as f64 / (latency_ms as f64 / 1000.0)
+        count as f64 / (latency_ms as f64 / 1000.0)
     }
 }
 
@@ -2192,6 +2333,18 @@ mod tests {
         assert_eq!(first, second);
         assert!(first.binary_search(&2).is_ok());
         assert_eq!(first.len(), 3);
+    }
+
+    #[test]
+    fn synthetic_payload_commitment_is_stable_and_length_sensitive() {
+        let first = command_payload_hash(1, 2, 3, 1024);
+        let second = command_payload_hash(1, 2, 3, 1024);
+        let different_len = command_payload_hash(1, 2, 3, 2048);
+        let different_command = command_payload_hash(1, 2, 4, 1024);
+
+        assert_eq!(first, second);
+        assert_ne!(first, different_len);
+        assert_ne!(first, different_command);
     }
 
     #[test]
@@ -2402,7 +2555,6 @@ mod tests {
             targets_per_command: 3,
             repair_missing: false,
             prefill_mode: SubsetPrefillMode::PrefillDispatch,
-            prefill_replicas_per_quorum: 2,
             ..SubsetGossipConfig::default()
         };
 
@@ -2426,12 +2578,59 @@ mod tests {
     }
 
     #[test]
+    fn modeled_latency_uses_parallel_quorums_within_round() {
+        let config = SubsetGossipConfig {
+            nodes: 36,
+            epochs: 1,
+            quorum_size: 6,
+            commands_per_node: 16,
+            command_bytes: 128,
+            targets_per_command: 3,
+            prefill_mode: SubsetPrefillMode::PrefillDispatch,
+            repair_missing: false,
+            trusted: true,
+            ..SubsetGossipConfig::default()
+        };
+
+        let row = run_subset_gossip(config).unwrap().rows.remove(0);
+
+        assert_eq!(row.quorums, 6);
+        assert_eq!(row.modeled_prefill_latency_ms, 150);
+        assert_eq!(row.modeled_dispatch_latency_ms, 150);
+        assert_eq!(row.modeled_control_latency_ms, 0);
+        assert_eq!(row.subset_payload_ready_latency_ms, 300);
+    }
+
+    #[test]
+    fn trustless_mode_models_control_once_per_parallel_round() {
+        let config = SubsetGossipConfig {
+            nodes: 36,
+            epochs: 1,
+            quorum_size: 6,
+            commands_per_node: 16,
+            command_bytes: 128,
+            targets_per_command: 3,
+            prefill_mode: SubsetPrefillMode::PrefillDispatch,
+            repair_missing: false,
+            trusted: false,
+            ..SubsetGossipConfig::default()
+        };
+
+        let row = run_subset_gossip(config).unwrap().rows.remove(0);
+
+        assert_eq!(row.quorums, 6);
+        assert_eq!(row.modeled_prefill_latency_ms, 150);
+        assert_eq!(row.modeled_dispatch_latency_ms, 150);
+        assert_eq!(row.modeled_control_latency_ms, 600);
+        assert_eq!(row.subset_payload_ready_latency_ms, 900);
+    }
+
+    #[test]
     fn prefill_dispatch_fanout_scales_with_log_rounds() {
         let config = SubsetGossipConfig {
             nodes: 1000,
             quorum_size: 6,
             prefill_mode: SubsetPrefillMode::PrefillDispatch,
-            prefill_replicas_per_quorum: 2,
             ..SubsetGossipConfig::default()
         };
 
@@ -2439,6 +2638,207 @@ mod tests {
 
         assert_eq!(rounds, 4);
         assert_eq!(prefill_dispatch_fanout(&config, rounds), 23);
+    }
+
+    #[test]
+    fn prefill_dispatch_fanout_uses_ceil_depth_for_non_ideal_networks() {
+        let config = SubsetGossipConfig {
+            nodes: 64,
+            quorum_size: 6,
+            prefill_mode: SubsetPrefillMode::PrefillDispatch,
+            ..SubsetGossipConfig::default()
+        };
+        let (_, topology_rounds) = find_round_number(config.nodes, config.quorum_size);
+
+        assert_eq!(topology_rounds, 2);
+        assert_eq!(ceil_log_rounds(config.nodes, config.quorum_size), 3);
+        assert_eq!(prefill_dispatch_fanout(&config, topology_rounds), 17);
+    }
+
+    #[test]
+    fn prefill_dispatch_fanout_is_derived_from_quorum_schedule() {
+        let config = SubsetGossipConfig {
+            nodes: 64,
+            quorum_size: 6,
+            prefill_mode: SubsetPrefillMode::PrefillDispatch,
+            ..SubsetGossipConfig::default()
+        };
+        let (_, topology_rounds) = find_round_number(config.nodes, config.quorum_size);
+
+        assert_eq!(prefill_dispatch_fanout(&config, topology_rounds), 17);
+    }
+
+    #[test]
+    fn prefill_dispatch_boundary_sizes_use_ceil_log_depth() {
+        let cases = [
+            (5usize, 1usize, 4usize),
+            (6, 1, 5),
+            (7, 2, 6),
+            (35, 2, 11),
+            (36, 2, 11),
+            (37, 3, 17),
+            (215, 3, 17),
+            (216, 3, 17),
+            (217, 4, 23),
+            (1_000, 4, 23),
+            (1_296, 4, 23),
+            (1_297, 5, 29),
+        ];
+
+        for (nodes, expected_rounds, expected_fanout) in cases {
+            let config = SubsetGossipConfig {
+                nodes,
+                quorum_size: 6,
+                prefill_mode: SubsetPrefillMode::PrefillDispatch,
+                ..SubsetGossipConfig::default()
+            };
+            let rounds = ceil_log_rounds(config.nodes, config.quorum_size);
+
+            assert_eq!(rounds, expected_rounds, "nodes={nodes}");
+            assert_eq!(
+                prefill_dispatch_fanout(&config, rounds),
+                expected_fanout,
+                "nodes={nodes}"
+            );
+        }
+    }
+
+    #[test]
+    fn prefill_dispatch_non_ideal_boundary_sizes_complete_without_repair() {
+        for nodes in [35usize, 36, 37, 64, 72] {
+            let row = run_subset_gossip(SubsetGossipConfig {
+                seed: 0x626f_756e_6461_7279 ^ nodes as u64,
+                nodes,
+                epochs: 1,
+                quorum_size: 6,
+                commands_per_node: 4,
+                command_bytes: 32,
+                targets_per_command: 3,
+                repair_missing: false,
+                prefill_mode: SubsetPrefillMode::PrefillDispatch,
+                ..SubsetGossipConfig::default()
+            })
+            .unwrap()
+            .rows
+            .remove(0);
+
+            assert!(row.metadata_converged, "nodes={nodes}");
+            assert!(row.subset_payloads_complete_before_repair, "nodes={nodes}");
+            assert_eq!(
+                row.subset_missing_payloads_before_repair, 0,
+                "nodes={nodes}"
+            );
+            assert_eq!(row.subset_repair_batches, 0, "nodes={nodes}");
+        }
+    }
+
+    #[test]
+    fn prefill_expected_hashes_reject_stale_epoch_replay() {
+        let config = SubsetGossipConfig {
+            nodes: 36,
+            quorum_size: 6,
+            commands_per_node: 4,
+            command_bytes: 32,
+            targets_per_command: 3,
+            prefill_mode: SubsetPrefillMode::PrefillDispatch,
+            ..SubsetGossipConfig::default()
+        };
+        let nodes = build_nodes(config.seed, config.nodes);
+        let topology = round_quorums(
+            &nodes
+                .iter()
+                .map(|node| node.keypair.public)
+                .collect::<Vec<_>>(),
+            HashType::default(),
+            config.shuffle,
+            config.quorum_size,
+        );
+        let consensus_start_round = consensus_start_round(&config, topology.len());
+        let stale_blocks =
+            build_epoch_blocks(0, &config, &nodes, HashType::default(), Nonce::new(1)).unwrap();
+        let current_blocks =
+            build_epoch_blocks(1, &config, &nodes, HashType::default(), Nonce::new(2)).unwrap();
+        let current_plan = build_prefill_plan(
+            1,
+            &config,
+            &nodes,
+            &current_blocks,
+            &topology,
+            consensus_start_round,
+        );
+        let recipient = current_plan.recipients_by_sender[0][0];
+        let expected = &current_plan.expected_by_node[&nodes[recipient].keypair.public];
+
+        assert!(expected.contains(&current_blocks[0].hash));
+        assert!(!expected.contains(&stale_blocks[0].hash));
+    }
+
+    #[test]
+    fn prefill_expected_hashes_reject_equivocated_payload_commitment() {
+        let config = SubsetGossipConfig {
+            nodes: 36,
+            quorum_size: 6,
+            commands_per_node: 4,
+            command_bytes: 32,
+            targets_per_command: 3,
+            prefill_mode: SubsetPrefillMode::PrefillDispatch,
+            ..SubsetGossipConfig::default()
+        };
+        let equivocated_config = SubsetGossipConfig {
+            command_bytes: 33,
+            ..config.clone()
+        };
+        let nodes = build_nodes(config.seed, config.nodes);
+        let topology = round_quorums(
+            &nodes
+                .iter()
+                .map(|node| node.keypair.public)
+                .collect::<Vec<_>>(),
+            HashType::default(),
+            config.shuffle,
+            config.quorum_size,
+        );
+        let consensus_start_round = consensus_start_round(&config, topology.len());
+        let honest_blocks =
+            build_epoch_blocks(0, &config, &nodes, HashType::default(), Nonce::new(1)).unwrap();
+        let equivocated_blocks = build_epoch_blocks(
+            0,
+            &equivocated_config,
+            &nodes,
+            HashType::default(),
+            Nonce::new(1),
+        )
+        .unwrap();
+        let honest_plan = build_prefill_plan(
+            0,
+            &config,
+            &nodes,
+            &honest_blocks,
+            &topology,
+            consensus_start_round,
+        );
+        let recipient = honest_plan.recipients_by_sender[0][0];
+        let expected = &honest_plan.expected_by_node[&nodes[recipient].keypair.public];
+
+        assert!(expected.contains(&honest_blocks[0].hash));
+        assert_ne!(honest_blocks[0].hash, equivocated_blocks[0].hash);
+        assert!(!expected.contains(&equivocated_blocks[0].hash));
+    }
+
+    #[test]
+    fn prefill_dispatch_fanout_widens_route_for_declared_withholders() {
+        let config = SubsetGossipConfig {
+            nodes: 64,
+            quorum_size: 6,
+            prefill_mode: SubsetPrefillMode::PrefillDispatch,
+            prefill_byzantine_withholders_per_branch: 1,
+            ..SubsetGossipConfig::default()
+        };
+        let (_, topology_rounds) = find_round_number(config.nodes, config.quorum_size);
+
+        assert_eq!(topology_rounds, 2);
+        assert_eq!(ceil_log_rounds(config.nodes, config.quorum_size), 3);
+        assert_eq!(prefill_dispatch_fanout(&config, topology_rounds), 29);
     }
 
     #[test]
@@ -2452,7 +2852,6 @@ mod tests {
             targets_per_command: 3,
             repair_missing: false,
             prefill_mode: SubsetPrefillMode::PrefillDispatch,
-            prefill_replicas_per_quorum: 2,
             ..SubsetGossipConfig::default()
         };
 
@@ -2475,7 +2874,6 @@ mod tests {
             targets_per_command: 3,
             repair_missing: false,
             prefill_mode: SubsetPrefillMode::PrefillDispatch,
-            prefill_replicas_per_quorum: 2,
             prefill_byzantine_withholders_per_branch: 1,
             ..SubsetGossipConfig::default()
         };
@@ -2484,6 +2882,98 @@ mod tests {
 
         assert!(row.subset_payloads_complete_before_repair);
         assert_eq!(row.subset_missing_payloads_before_repair, 0);
+    }
+
+    #[test]
+    fn prefill_dispatch_survives_two_byzantine_route_withholders_for_q8() {
+        let config = SubsetGossipConfig {
+            nodes: 144,
+            epochs: 1,
+            quorum_size: 8,
+            commands_per_node: 8,
+            command_bytes: 64,
+            targets_per_command: 3,
+            repair_missing: false,
+            prefill_mode: SubsetPrefillMode::PrefillDispatch,
+            prefill_byzantine_withholders_per_branch: 2,
+            ..SubsetGossipConfig::default()
+        };
+
+        let row = run_subset_gossip(config).unwrap().rows.remove(0);
+
+        assert_eq!(row.prefill_fanout, 55);
+        assert!(row.metadata_converged);
+        assert!(row.subset_payloads_complete_before_repair);
+        assert_eq!(row.subset_missing_payloads_before_repair, 0);
+    }
+
+    #[test]
+    fn prefill_dispatch_survives_three_byzantine_route_withholders_for_q12() {
+        let config = SubsetGossipConfig {
+            nodes: 144,
+            epochs: 1,
+            quorum_size: 12,
+            commands_per_node: 8,
+            command_bytes: 64,
+            targets_per_command: 3,
+            repair_missing: false,
+            prefill_mode: SubsetPrefillMode::PrefillDispatch,
+            prefill_byzantine_withholders_per_branch: 3,
+            ..SubsetGossipConfig::default()
+        };
+
+        let row = run_subset_gossip(config).unwrap().rows.remove(0);
+
+        assert_eq!(row.prefill_fanout, 59);
+        assert!(row.metadata_converged);
+        assert!(row.subset_payloads_complete_before_repair);
+        assert_eq!(row.subset_missing_payloads_before_repair, 0);
+    }
+
+    #[test]
+    fn prefill_dispatch_survives_one_withholder_for_non_ideal_network_size() {
+        let config = SubsetGossipConfig {
+            seed: 109742935629,
+            nodes: 64,
+            epochs: 1,
+            quorum_size: 6,
+            commands_per_node: 16,
+            command_bytes: 128,
+            targets_per_command: 3,
+            repair_missing: false,
+            prefill_mode: SubsetPrefillMode::PrefillDispatch,
+            prefill_byzantine_withholders_per_branch: 1,
+            ..SubsetGossipConfig::default()
+        };
+
+        let row = run_subset_gossip(config).unwrap().rows.remove(0);
+
+        assert_eq!(row.prefill_fanout, 29);
+        assert!(row.subset_payloads_complete_before_repair);
+        assert_eq!(row.subset_missing_payloads_before_repair, 0);
+    }
+
+    #[test]
+    fn bft_prefill_rejects_deep_small_quorum_with_withholding() {
+        let config = SubsetGossipConfig {
+            seed: 109741012189,
+            nodes: 72,
+            epochs: 1,
+            quorum_size: 4,
+            commands_per_node: 16,
+            command_bytes: 128,
+            targets_per_command: 3,
+            repair_missing: false,
+            prefill_mode: SubsetPrefillMode::PrefillDispatch,
+            prefill_byzantine_withholders_per_branch: 1,
+            ..SubsetGossipConfig::default()
+        };
+
+        let err = run_subset_gossip(config).unwrap_err();
+        assert!(
+            err.to_string().contains("requires quorum size at least 5"),
+            "{err}"
+        );
     }
 
     #[test]
@@ -2560,7 +3050,55 @@ mod tests {
     }
 
     #[test]
-    fn single_prefill_holder_is_not_byzantine_resilient() {
+    fn precomputed_inventory_routes_ignore_metadata_only_false_holders() {
+        let config = SubsetGossipConfig {
+            nodes: 4,
+            quorum_size: 4,
+            commands_per_node: 4,
+            prefill_mode: SubsetPrefillMode::PrefillDispatch,
+            ..SubsetGossipConfig::default()
+        };
+        let mut target_masks = vec![PayloadMask::empty(4); 4];
+        target_masks[1].set(0);
+        target_masks[1].set(1);
+        let block = BlockMeta {
+            hash: HashType::default(),
+            owner: 0,
+            full_block_len: 0,
+            tombstone_block_len: 0,
+            target_masks,
+            target_payload_deliveries: 2,
+            slots: Vec::new(),
+        };
+        let mut states = (0..4).map(|_| NodeSubsetState::new(4)).collect::<Vec<_>>();
+        states[0].insert_local_block(0, 4);
+        states[2].insert_block_metadata(0, 4);
+        states[3].merge_block(0, PayloadMask::full(4));
+        let future_reachability = vec![
+            vec![vec![0], vec![1], vec![2], vec![3]],
+            vec![vec![0], vec![1], vec![2], vec![3]],
+        ];
+
+        let routes = precomputed_inventory_routes_for_quorum(
+            &config,
+            0,
+            &[1, 2, 3],
+            &[block],
+            &states,
+            &future_reachability,
+        );
+
+        assert_eq!(routes.get(&(3, 1, 0)).map(|route| route.attempt), Some(0));
+        assert!(!routes.contains_key(&(2, 1, 0)));
+    }
+
+    #[cfg(any(
+        feature = "propagation-adaptive",
+        feature = "propagation-inventory",
+        feature = "propagation-push"
+    ))]
+    #[test]
+    fn propagation_policy_rejects_trustless_inventory_without_prefill_coverage() {
         let config = SubsetGossipConfig {
             nodes: 36,
             epochs: 1,
@@ -2569,16 +3107,41 @@ mod tests {
             command_bytes: 128,
             targets_per_command: 3,
             repair_missing: false,
-            prefill_mode: SubsetPrefillMode::PrefillDispatch,
-            prefill_replicas_per_quorum: 1,
+            prefill_mode: SubsetPrefillMode::None,
+            hash_advertise: true,
             prefill_byzantine_withholders_per_branch: 1,
             ..SubsetGossipConfig::default()
         };
 
-        let row = run_subset_gossip(config).unwrap().rows.remove(0);
+        let err = run_subset_gossip(config).unwrap_err();
+        assert!(err.to_string().contains("invalid propagation policy"));
+    }
 
-        assert!(!row.subset_payloads_complete_before_repair);
-        assert!(row.subset_missing_payloads_before_repair > 0);
+    #[cfg(any(
+        feature = "propagation-adaptive",
+        feature = "propagation-inventory",
+        feature = "propagation-push"
+    ))]
+    #[test]
+    fn propagation_policy_rejects_withholding_above_quorum_tolerance() {
+        let config = SubsetGossipConfig {
+            nodes: 72,
+            epochs: 1,
+            quorum_size: 6,
+            commands_per_node: 16,
+            command_bytes: 128,
+            targets_per_command: 3,
+            repair_missing: false,
+            prefill_mode: SubsetPrefillMode::PrefillDispatch,
+            prefill_byzantine_withholders_per_branch: 2,
+            ..SubsetGossipConfig::default()
+        };
+
+        let err = run_subset_gossip(config).unwrap_err();
+        assert!(
+            err.to_string().contains("exceeds quorum tolerance"),
+            "{err}"
+        );
     }
 
     #[test]
@@ -2592,7 +3155,6 @@ mod tests {
             targets_per_command: 3,
             repair_missing: false,
             prefill_mode: SubsetPrefillMode::PrefillDispatch,
-            prefill_replicas_per_quorum: 2,
             prefill_byzantine_withholders_per_branch: 1,
             ..SubsetGossipConfig::default()
         };
@@ -2601,7 +3163,6 @@ mod tests {
 
         assert!(row.subset_payloads_complete_before_repair);
         assert_eq!(row.subset_missing_payloads_before_repair, 0);
-        assert_eq!(row.prefill_replicas_per_quorum, 2);
         assert_eq!(row.prefill_byzantine_withholders_per_branch, 1);
     }
 

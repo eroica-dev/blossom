@@ -23,7 +23,7 @@ cd "$ws_root"
 report_pinning
 
 timestamp_value="$(timestamp)"
-protocol_versions="${PROTOCOL_VERSIONS:-${PROTOCOL_VERSION:-v1}}"
+protocol_versions="${PROTOCOL_VERSIONS:-${PROTOCOL_VERSION:-v1 v2}}"
 out_dir="${OUT_DIR:-$root/results/subset_gossip_${protocol_versions// /_}_${timestamp_value}}"
 mkdir -p "$out_dir"
 

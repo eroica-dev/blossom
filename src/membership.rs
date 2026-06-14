@@ -98,6 +98,30 @@ impl ConsensusNodeRemovalPlan {
     }
 }
 
+/// The result of reducing committed node-admission records into membership
+/// additions.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default)]
+pub struct ConsensusNodeAdmissionPlan {
+    pub admitted: Vec<NodeIdentity>,
+    pub decisions: Vec<ConsensusNodeAdmissionDecision>,
+    pub required_observers: usize,
+}
+
+impl ConsensusNodeAdmissionPlan {
+    pub fn is_empty(&self) -> bool {
+        self.admitted.is_empty()
+    }
+}
+
+/// A deterministic decision to add one verifier at the next epoch boundary.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct ConsensusNodeAdmissionDecision {
+    pub node: NodeIdentity,
+    pub admission_hash: HashType,
+    pub observer_count: usize,
+    pub required_observers: usize,
+}
+
 /// Reduces committed epoch blocks into a deterministic node-removal plan.
 ///
 /// Only current verifiers can accuse current verifiers, the encounter record
@@ -208,6 +232,116 @@ pub fn derive_consensus_node_removal_plan(
     }
 }
 
+/// Reduces committed epoch blocks into a deterministic public-node admission
+/// plan.
+///
+/// Only blocks from current verifiers can sponsor admissions, and the same
+/// signed admission body must be carried by a distinct-validator supermajority.
+/// The joining node must sign an admission body for the exact parent epoch and
+/// nonce, and already active verifiers are ignored so a same-epoch drop cannot
+/// be undone by a join proof carried in that same block set.
+pub fn derive_consensus_node_admission_plan(
+    verifiers: &IndexTreeMap<PubKey, NodeIdentity>,
+    committed_blocks: &BTreeMap<HashType, Block>,
+    last_epoch: HashType,
+    nonce: Nonce,
+) -> ConsensusNodeAdmissionPlan {
+    let required_observers = supermajority_count(verifiers.len());
+    if verifiers.is_empty() {
+        return ConsensusNodeAdmissionPlan {
+            admitted: Vec::new(),
+            decisions: Vec::new(),
+            required_observers,
+        };
+    }
+
+    let mut evidence_by_admission = BTreeMap::<HashType, PendingNodeAdmission>::new();
+    for block in committed_blocks.values() {
+        let observer = block.body.validator;
+        if !verifiers.contains_key(&observer) {
+            continue;
+        }
+
+        let mut observed_in_block = BTreeSet::new();
+        for admission in &block.body.node_admissions {
+            if admission.body.last_epoch != last_epoch
+                || admission.body.nonce != nonce
+                || admission.verify().is_err()
+            {
+                continue;
+            }
+            let admission_hash = admission.body.hash();
+            if !observed_in_block.insert(admission_hash) {
+                continue;
+            }
+            let node = admission.body.node.clone();
+            let public_key = node.public_key();
+            if verifiers.contains_key(&public_key) {
+                continue;
+            }
+            evidence_by_admission
+                .entry(admission_hash)
+                .or_insert_with(|| PendingNodeAdmission {
+                    node,
+                    admission_hash,
+                    observers: BTreeSet::new(),
+                })
+                .observers
+                .insert(observer);
+        }
+    }
+
+    let mut decisions_by_key = BTreeMap::<PubKey, ConsensusNodeAdmissionDecision>::new();
+    for pending in evidence_by_admission.into_values() {
+        let observer_count = pending.observers.len();
+        if observer_count < required_observers {
+            continue;
+        }
+
+        let decision = ConsensusNodeAdmissionDecision {
+            node: pending.node,
+            admission_hash: pending.admission_hash,
+            observer_count,
+            required_observers,
+        };
+        decisions_by_key
+            .entry(decision.node.public_key())
+            .and_modify(|existing| {
+                if admission_decision_precedes(&decision, existing) {
+                    *existing = decision.clone();
+                }
+            })
+            .or_insert(decision);
+    }
+
+    let decisions = decisions_by_key.into_values().collect::<Vec<_>>();
+    ConsensusNodeAdmissionPlan {
+        admitted: decisions
+            .iter()
+            .map(|decision| decision.node.clone())
+            .collect(),
+        decisions,
+        required_observers,
+    }
+}
+
+#[derive(Debug, Clone)]
+struct PendingNodeAdmission {
+    node: NodeIdentity,
+    admission_hash: HashType,
+    observers: BTreeSet<PubKey>,
+}
+
+fn admission_decision_precedes(
+    left: &ConsensusNodeAdmissionDecision,
+    right: &ConsensusNodeAdmissionDecision,
+) -> bool {
+    left.observer_count
+        .cmp(&right.observer_count)
+        .then_with(|| right.admission_hash.cmp(&left.admission_hash))
+        .is_gt()
+}
+
 /// Applies a previously computed removal plan to a verifier set.
 pub fn apply_consensus_node_removal_plan(
     verifiers: &mut IndexTreeMap<PubKey, NodeIdentity>,
@@ -218,6 +352,16 @@ pub fn apply_consensus_node_removal_plan(
         if removed.insert(subject) {
             let _ = verifiers.remove(&subject);
         }
+    }
+}
+
+/// Applies a previously computed admission plan to a verifier set.
+pub fn apply_consensus_node_admission_plan(
+    verifiers: &mut IndexTreeMap<PubKey, NodeIdentity>,
+    plan: &ConsensusNodeAdmissionPlan,
+) {
+    for node in &plan.admitted {
+        verifiers.insert(node.public_key(), node.clone());
     }
 }
 
@@ -237,12 +381,17 @@ pub fn apply_epoch_membership_transition(
         derive_consensus_node_removal_plan(verifiers, committed_blocks, last_epoch, nonce, policy);
     let mut next_verifiers = verifiers.clone();
     apply_consensus_node_removal_plan(&mut next_verifiers, &plan);
+    let admission_plan =
+        derive_consensus_node_admission_plan(verifiers, committed_blocks, last_epoch, nonce);
+    apply_consensus_node_admission_plan(&mut next_verifiers, &admission_plan);
     (next_verifiers, plan)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::address_book::{Service, ServiceKind};
+    use crate::admission::NodeAdmission;
     use crate::algorithm::select_quorums_from_index_tree;
     use crate::crypto::Keypair;
     use crate::encounter::{EncounterPhase, EncounterRecord, EncounterRecordBody};
@@ -292,6 +441,43 @@ mod tests {
         block.body.encounter_records.push(record);
         block.sign(&observer.secret);
         block
+    }
+
+    fn admission_block(
+        observer: &Keypair,
+        admission: crate::admission::NodeAdmission,
+        last_epoch: HashType,
+        nonce: Nonce,
+    ) -> Block {
+        admission_block_with_created(observer, admission, last_epoch, nonce, 0)
+    }
+
+    fn admission_block_with_created(
+        observer: &Keypair,
+        admission: crate::admission::NodeAdmission,
+        last_epoch: HashType,
+        nonce: Nonce,
+        created: u128,
+    ) -> Block {
+        let mut block = Block::default();
+        block.body.last_epoch = last_epoch;
+        block.body.nonce = nonce;
+        block.body.created = created;
+        block.body.node_admissions.push(admission);
+        block.sign(&observer.secret);
+        block
+    }
+
+    fn signed_admission(keypair: &Keypair, last_epoch: HashType, nonce: Nonce) -> NodeAdmission {
+        let service = Service::new(
+            ServiceKind::Consensus,
+            keypair.public,
+            "tcp",
+            "127.0.0.1",
+            9100,
+        );
+        NodeAdmission::signed_for_consensus_service(service, last_epoch, nonce, &keypair.signer())
+            .unwrap()
     }
 
     #[test]
@@ -581,5 +767,131 @@ mod tests {
         assert_eq!(plan.decisions.len(), 1);
         assert_eq!(plan.decisions[0].subject, invalid_subject);
         assert_eq!(plan.decisions[0].invalid_signature_count, 4);
+    }
+
+    #[test]
+    fn single_validator_signed_node_admission_adds_new_verifier() {
+        let keypairs = [Keypair::generate()];
+        let joiner = Keypair::generate();
+        let verifiers = verifier_set(&keypairs);
+        let last_epoch = HashType([1; 32]);
+        let nonce = Nonce::new(2);
+        let admission = signed_admission(&joiner, last_epoch, nonce);
+        let block = admission_block(&keypairs[0], admission, last_epoch, nonce);
+        let blocks = [(block.hash, block)]
+            .into_iter()
+            .collect::<BTreeMap<_, _>>();
+
+        let (next_verifiers, removal_plan) = apply_epoch_membership_transition(
+            &verifiers,
+            &blocks,
+            last_epoch,
+            nonce,
+            ConsensusNodeRemovalPolicy::disabled(),
+        );
+
+        assert!(removal_plan.is_empty());
+        assert!(next_verifiers.contains_key(&joiner.public));
+        assert_eq!(next_verifiers.len(), verifiers.len() + 1);
+    }
+
+    #[test]
+    fn signed_node_admission_requires_supermajority_of_current_verifiers() {
+        let keypairs = (0..6).map(|_| Keypair::generate()).collect::<Vec<_>>();
+        let joiner = Keypair::generate();
+        let verifiers = verifier_set(&keypairs);
+        let last_epoch = HashType([1; 32]);
+        let nonce = Nonce::new(2);
+        let admission = signed_admission(&joiner, last_epoch, nonce);
+        let blocks = keypairs[..3]
+            .iter()
+            .map(|observer| {
+                let block = admission_block(observer, admission.clone(), last_epoch, nonce);
+                (block.hash, block)
+            })
+            .collect::<BTreeMap<_, _>>();
+
+        let plan = derive_consensus_node_admission_plan(&verifiers, &blocks, last_epoch, nonce);
+
+        assert_eq!(plan.required_observers, 4);
+        assert!(plan.is_empty());
+    }
+
+    #[test]
+    fn duplicate_admission_votes_from_one_validator_do_not_satisfy_quorum() {
+        let keypairs = (0..6).map(|_| Keypair::generate()).collect::<Vec<_>>();
+        let joiner = Keypair::generate();
+        let verifiers = verifier_set(&keypairs);
+        let last_epoch = HashType([1; 32]);
+        let nonce = Nonce::new(2);
+        let admission = signed_admission(&joiner, last_epoch, nonce);
+        let blocks = (0..4)
+            .map(|index| {
+                let block = admission_block_with_created(
+                    &keypairs[0],
+                    admission.clone(),
+                    last_epoch,
+                    nonce,
+                    index,
+                );
+                (block.hash, block)
+            })
+            .collect::<BTreeMap<_, _>>();
+
+        let plan = derive_consensus_node_admission_plan(&verifiers, &blocks, last_epoch, nonce);
+
+        assert_eq!(plan.required_observers, 4);
+        assert!(plan.is_empty());
+    }
+
+    #[test]
+    fn supermajority_signed_node_admission_adds_new_verifier() {
+        let keypairs = (0..6).map(|_| Keypair::generate()).collect::<Vec<_>>();
+        let joiner = Keypair::generate();
+        let verifiers = verifier_set(&keypairs);
+        let last_epoch = HashType([1; 32]);
+        let nonce = Nonce::new(2);
+        let admission = signed_admission(&joiner, last_epoch, nonce);
+        let blocks = keypairs[..4]
+            .iter()
+            .map(|observer| {
+                let block = admission_block(observer, admission.clone(), last_epoch, nonce);
+                (block.hash, block)
+            })
+            .collect::<BTreeMap<_, _>>();
+
+        let (next_verifiers, removal_plan) = apply_epoch_membership_transition(
+            &verifiers,
+            &blocks,
+            last_epoch,
+            nonce,
+            ConsensusNodeRemovalPolicy::disabled(),
+        );
+
+        assert!(removal_plan.is_empty());
+        assert!(next_verifiers.contains_key(&joiner.public));
+        assert_eq!(next_verifiers.len(), verifiers.len() + 1);
+        let plan = derive_consensus_node_admission_plan(&verifiers, &blocks, last_epoch, nonce);
+        assert_eq!(plan.decisions.len(), 1);
+        assert_eq!(plan.decisions[0].observer_count, 4);
+        assert_eq!(plan.decisions[0].required_observers, 4);
+    }
+
+    #[test]
+    fn stale_or_unsigned_node_admissions_do_not_add_verifiers() {
+        let keypairs = (0..6).map(|_| Keypair::generate()).collect::<Vec<_>>();
+        let joiner = Keypair::generate();
+        let verifiers = verifier_set(&keypairs);
+        let last_epoch = HashType([1; 32]);
+        let nonce = Nonce::new(2);
+        let stale = signed_admission(&joiner, last_epoch, Nonce::new(1));
+        let block = admission_block(&keypairs[0], stale, last_epoch, nonce);
+        let blocks = [(block.hash, block)]
+            .into_iter()
+            .collect::<BTreeMap<_, _>>();
+
+        let plan = derive_consensus_node_admission_plan(&verifiers, &blocks, last_epoch, nonce);
+
+        assert!(plan.is_empty());
     }
 }

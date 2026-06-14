@@ -3,7 +3,10 @@ name = "blossom"
 version = "0.2.0"
 edition = "2024"
 description = "Extracted Blossom consensus protocol logic from Eden."
-license = "UNLICENSED"
+license = "MIT"
+repository = "https://github.com/eden-dev-inc/blossom"
+homepage = "https://github.com/eden-dev-inc/blossom"
+documentation = "https://docs.rs/blossom"
 
 [features]
 default = []
@@ -11,12 +14,24 @@ availability-gossip = ["filtered-transactions"]
 external-transaction-hashes = []
 filtered-transactions = []
 insecure-fast-hash = ["dep:xxhash-rust"]
+propagation-adaptive = [
+    "propagation-push",
+    "propagation-inventory",
+    "blossom-propagation/adaptive",
+]
+propagation-inventory = [
+    "dep:blossom-propagation",
+    "blossom-propagation/bandwidth-inventory",
+]
+propagation-push = ["dep:blossom-propagation", "blossom-propagation/latency-push"]
 
 [dependencies]
+blossom-propagation = { version = "0.1.0", path = "crates/blossom-propagation", optional = true }
 borsh = { version = "1.5.7", features = ["derive"] }
 bytes = "1.11.1"
 clap = { version = "4.5", features = ["derive", "env"] }
 ed25519-dalek = { version = "2.2.0", features = ["batch", "hazmat", "rand_core"] }
+fast-telemetry = { version = "0.5.1", default-features = false }
 hex = { version = "0.4.3", features = ["serde"] }
 indextreemap = "0.2.0"
 itoa = "1.0.15"
@@ -45,6 +60,8 @@ harness = false
 members = [
     ".",
     "crates/blossom-observer",
+    "crates/blossom-propagation",
     "crates/blossom-sim",
+    "crates/deterministic-test-env",
 ]
 resolver = "3"

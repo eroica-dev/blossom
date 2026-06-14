@@ -342,6 +342,7 @@ fn bench_block_scaling(c: &mut Criterion) {
     group.finish();
 }
 
+#[cfg_attr(not(feature = "filtered-transactions"), allow(unused_variables))]
 fn bench_filtered_transactions(c: &mut Criterion) {
     #[cfg(feature = "filtered-transactions")]
     {
@@ -419,6 +420,7 @@ fn bench_filtered_transactions(c: &mut Criterion) {
     }
 }
 
+#[cfg_attr(not(feature = "availability-gossip"), allow(unused_variables))]
 fn bench_availability_gossip(c: &mut Criterion) {
     #[cfg(feature = "availability-gossip")]
     {
