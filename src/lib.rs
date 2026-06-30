@@ -83,8 +83,8 @@ pub use error::{BlossomError, Result};
 pub use group::ConsensusGroupId;
 pub use harness::{MockBlockService, SimulatedCluster, SimulatedNode, signed_block};
 pub use hash::{
-    DoHash, HashType, SHA256_FAIR_ORDER_PROTOCOL_HASH_ALGORITHM, SHA256_PROTOCOL_HASH_ALGORITHM,
-    XXH3_FAIR_ORDER_PROTOCOL_HASH_ALGORITHM, XXH3_PROTOCOL_HASH_ALGORITHM, protocol_hash_algorithm,
+    DoHash, FAIR_BLOCK_ORDERING_PROTOCOL_FEATURE_CODE, HashType, PROTOCOL_FEATURE_CODES,
+    SHA256_PROTOCOL_HASH_ALGORITHM, XXH3_PROTOCOL_HASH_ALGORITHM, protocol_hash_algorithm,
     protocol_hash_algorithm_is_compatible,
 };
 pub use indextreemap::{IndexTreeMap, SharedIndexTreeMap};

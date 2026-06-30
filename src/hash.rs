@@ -6,6 +6,7 @@ use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::fmt;
 use std::ops::Deref;
+use std::sync::OnceLock;
 #[cfg(feature = "insecure-fast-hash")]
 use xxhash_rust::xxh3::Xxh3;
 
@@ -13,32 +14,38 @@ use crate::error::{BlossomError, Result};
 
 pub const SHA256_PROTOCOL_HASH_ALGORITHM: &str = "sha256";
 pub const XXH3_PROTOCOL_HASH_ALGORITHM: &str = "xxh3-128x2";
-pub const SHA256_FAIR_ORDER_PROTOCOL_HASH_ALGORITHM: &str = "sha256+fair-block-ordering";
-pub const XXH3_FAIR_ORDER_PROTOCOL_HASH_ALGORITHM: &str = "xxh3-128x2+fair-block-ordering";
+pub const FAIR_BLOCK_ORDERING_PROTOCOL_FEATURE_CODE: &str = "fair-block-ordering";
+#[cfg(feature = "fair-block-ordering")]
+pub const PROTOCOL_FEATURE_CODES: &[&str] = &[FAIR_BLOCK_ORDERING_PROTOCOL_FEATURE_CODE];
+#[cfg(not(feature = "fair-block-ordering"))]
+pub const PROTOCOL_FEATURE_CODES: &[&str] = &[];
 
 pub fn protocol_hash_algorithm() -> &'static str {
-    #[cfg(all(feature = "insecure-fast-hash", feature = "fair-block-ordering"))]
-    {
-        XXH3_FAIR_ORDER_PROTOCOL_HASH_ALGORITHM
-    }
+    static PROTOCOL_HASH_ALGORITHM: OnceLock<String> = OnceLock::new();
+    PROTOCOL_HASH_ALGORITHM
+        .get_or_init(protocol_hash_algorithm_string)
+        .as_str()
+}
 
-    #[cfg(all(feature = "insecure-fast-hash", not(feature = "fair-block-ordering")))]
+fn protocol_base_hash_algorithm() -> &'static str {
+    #[cfg(feature = "insecure-fast-hash")]
     {
         XXH3_PROTOCOL_HASH_ALGORITHM
     }
 
-    #[cfg(all(not(feature = "insecure-fast-hash"), feature = "fair-block-ordering"))]
-    {
-        SHA256_FAIR_ORDER_PROTOCOL_HASH_ALGORITHM
-    }
-
-    #[cfg(all(
-        not(feature = "insecure-fast-hash"),
-        not(feature = "fair-block-ordering")
-    ))]
+    #[cfg(not(feature = "insecure-fast-hash"))]
     {
         SHA256_PROTOCOL_HASH_ALGORITHM
     }
+}
+
+fn protocol_hash_algorithm_string() -> String {
+    let mut profile = protocol_base_hash_algorithm().to_string();
+    for feature_code in PROTOCOL_FEATURE_CODES {
+        profile.push('+');
+        profile.push_str(feature_code);
+    }
+    profile
 }
 
 pub fn protocol_hash_algorithm_is_compatible(peer: &str) -> bool {
@@ -251,16 +258,18 @@ mod tests {
     #[cfg(feature = "fair-block-ordering")]
     fn protocol_hash_algorithm_reports_fair_ordering_profile() {
         #[cfg(feature = "insecure-fast-hash")]
-        assert_eq!(
-            protocol_hash_algorithm(),
-            XXH3_FAIR_ORDER_PROTOCOL_HASH_ALGORITHM
-        );
+        assert_eq!(protocol_hash_algorithm(), "xxh3-128x2+fair-block-ordering");
 
         #[cfg(not(feature = "insecure-fast-hash"))]
+        assert_eq!(protocol_hash_algorithm(), "sha256+fair-block-ordering");
+
         assert_eq!(
-            protocol_hash_algorithm(),
-            SHA256_FAIR_ORDER_PROTOCOL_HASH_ALGORITHM
+            PROTOCOL_FEATURE_CODES,
+            &[FAIR_BLOCK_ORDERING_PROTOCOL_FEATURE_CODE]
         );
+        assert!(!protocol_hash_algorithm_is_compatible(
+            protocol_base_hash_algorithm()
+        ));
     }
 
     #[test]
