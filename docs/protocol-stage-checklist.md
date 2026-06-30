@@ -584,16 +584,17 @@ Appraisal -> Echo -> Verification -> Proposal -> Request -> Commit
 
 ## Stage 11: Transaction Validation And Ledger Integration
 
-**Status:** ledger semantics are not implemented in this crate. Fair epoch
-block ordering is implemented as a protocol-side mitigation for hash-grinding
-against ledger-style consumers.
+**Status:** ledger semantics are not implemented in this crate. The optional
+`fair-block-ordering` feature implements protocol-side fair epoch block
+ordering as a mitigation for hash-grinding against ledger-style consumers.
 
 Blossom commits opaque transaction payloads. Application-owned semantics,
 ledger mutation, derivative epoch hashing, transaction tagging, and historical
-queries remain outside the crate. Finalized epoch block trees use
-domain-separated fair-order commitments derived from all accepted block bytes
-and the aggregate transaction count; ledger adapters should consume blocks via
-`EpochBody::fair_ordered_blocks()`.
+queries remain outside the crate. When all validators are compiled with
+`fair-block-ordering`, finalized epoch block trees use domain-separated
+fair-order commitments derived from all accepted block bytes and the aggregate
+transaction count. Ledger adapters should consume blocks via
+`EpochBody::ordered_blocks()`.
 
 **Current gaps:**
 
@@ -601,10 +602,14 @@ and the aggregate transaction count; ledger adapters should consume blocks via
 - No transaction pre-validation or final validation rules.
 - No derivative epoch hash over validated transaction outcomes.
 - No append-only ledger update or historical query implementation.
+- No runtime negotiation for changing ordering mode inside a live network;
+  mixed raw-order/fair-order builds are rejected by protocol profile
+  compatibility checks.
 
 **Tests to add:**
 
-- Ledger-adapter contract tests with deterministic fair transaction ordering.
+- Ledger-adapter contract tests with deterministic transaction ordering under
+  both raw-order and fair-order feature builds.
 - Invalid transaction tests proving invalid bodies do not change ledger state
   but still produce deterministic outcomes.
 - Multi-node tests where all honest validators apply the same epoch body and
@@ -614,6 +619,8 @@ and the aggregate transaction count; ledger adapters should consume blocks via
 
 - Given the same fair-ordered epoch block set and deterministic application
   rules, all honest validators compute the same ledger state.
+- Given identical feature builds, all honest validators commit and sign the same
+  epoch Merkle root for the same accepted block set.
 - Invalid transaction handling is deterministic and cannot fork honest state.
 - Historical query paths are derived from committed ledger data.
 

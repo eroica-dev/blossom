@@ -9,7 +9,9 @@ use rs_merkle::{MerkleTree, algorithms::Sha256};
 use serde::{Deserialize, Serialize, Serializer, ser::SerializeStruct};
 
 use crate::algorithm::{select_quorums_from_index_tree, supermajority_count};
-use crate::block::{Block, fair_ordered_block_commitments, fair_ordered_blocks};
+use crate::block::Block;
+#[cfg(feature = "fair-block-ordering")]
+use crate::block::{fair_ordered_block_commitments, fair_ordered_blocks};
 use crate::blossom::{
     Commit, Dispatch, EchoReDispatch, EchoRequest, EchoResponse, Proposal, SignatureTree,
     SignaturesForHash, Verification,
@@ -272,17 +274,40 @@ pub struct EpochBody {
 
 impl EpochBody {
     pub fn application_states(&self) -> impl Iterator<Item = (&HashType, &PubKey, &[u8])> {
-        fair_ordered_blocks(&self.blocks)
-            .into_iter()
-            .map(|(hash, block)| {
-                (
-                    hash,
-                    &block.body.validator,
-                    block.body.application_state.as_slice(),
-                )
-            })
+        #[cfg(feature = "fair-block-ordering")]
+        {
+            fair_ordered_blocks(&self.blocks)
+                .into_iter()
+                .map(|(hash, block)| {
+                    (
+                        hash,
+                        &block.body.validator,
+                        block.body.application_state.as_slice(),
+                    )
+                })
+        }
+
+        #[cfg(not(feature = "fair-block-ordering"))]
+        self.blocks.iter().map(|(hash, block)| {
+            (
+                hash,
+                &block.body.validator,
+                block.body.application_state.as_slice(),
+            )
+        })
     }
 
+    pub fn ordered_blocks(&self) -> Vec<(&HashType, &Block)> {
+        #[cfg(feature = "fair-block-ordering")]
+        {
+            fair_ordered_blocks(&self.blocks)
+        }
+
+        #[cfg(not(feature = "fair-block-ordering"))]
+        self.blocks.iter().collect()
+    }
+
+    #[cfg(feature = "fair-block-ordering")]
     pub fn fair_ordered_blocks(&self) -> Vec<(&HashType, &Block)> {
         fair_ordered_blocks(&self.blocks)
     }
@@ -867,29 +892,26 @@ pub fn init_proposals(quorum: u32) -> PropCount {
 }
 
 fn block_merkle_root(blocks: &BTreeMap<HashType, Block>) -> HashType {
-    let ordered_commitments = fair_ordered_block_commitments(blocks);
+    #[cfg(feature = "fair-block-ordering")]
+    let leaves = fair_ordered_block_commitments(blocks);
+
+    #[cfg(not(feature = "fair-block-ordering"))]
+    let leaves = blocks.keys().copied().collect::<Vec<_>>();
 
     #[cfg(feature = "insecure-fast-hash")]
     {
-        if ordered_commitments.is_empty() {
+        if leaves.is_empty() {
             return HashType::default();
         }
-        if let Some(hash) = ordered_commitments
-            .first()
-            .copied()
-            .filter(|_| ordered_commitments.len() == 1)
-        {
+        if let Some(hash) = leaves.first().copied().filter(|_| leaves.len() == 1) {
             return hash;
         }
-        HashType::hash_slices(ordered_commitments.iter().map(AsRef::as_ref))
+        HashType::hash_slices(leaves.iter().map(AsRef::as_ref))
     }
 
     #[cfg(not(feature = "insecure-fast-hash"))]
     {
-        let leaves = ordered_commitments
-            .iter()
-            .map(|hash| hash.0)
-            .collect::<Vec<_>>();
+        let leaves = leaves.iter().map(|hash| hash.0).collect::<Vec<_>>();
         HashType::from_byte_hash(
             MerkleTree::<Sha256>::from_leaves(&leaves)
                 .root()
@@ -915,6 +937,21 @@ mod tests {
     use crate::membership::ConsensusNodeRemovalPolicy;
     use crate::messages::Msg;
     use crate::wire::{EncodedFrame, FRAME_PREFIX_BYTES, WireRequest, WireRequestFrame};
+
+    #[cfg(feature = "fair-block-ordering")]
+    fn sealed_epoch_block(label: &str, txs: &[&str]) -> Block {
+        let mut block = Block::default();
+        block.body.created = 42;
+        block.body.nonce = Nonce::new(1);
+        for tx in txs {
+            block
+                .body
+                .txs
+                .push(Transaction::new(format!("{label}:{tx}")));
+        }
+        block.seal_unsigned(PubKey(HashType::hash(label.as_bytes()).0));
+        block
+    }
 
     fn node(index: u8) -> NodeIdentity {
         NodeIdentity::new(
@@ -1044,6 +1081,18 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(feature = "fair-block-ordering"))]
+    fn block_merkle_root_uses_raw_hash_without_fair_order_feature() {
+        let block = Block::empty_with_nonce(Nonce::new(1));
+        let hash = block.hash();
+        let mut blocks = BTreeMap::new();
+        blocks.insert(hash, block);
+
+        assert_eq!(block_merkle_root(&blocks), hash);
+    }
+
+    #[test]
+    #[cfg(feature = "fair-block-ordering")]
     fn block_merkle_root_uses_fair_order_commitments() {
         let block = Block::empty_with_nonce(Nonce::new(1));
         let hash = block.hash();
@@ -1055,6 +1104,54 @@ mod tests {
             fair_ordered_block_commitments(&blocks)[0]
         );
         assert_ne!(block_merkle_root(&blocks), hash);
+    }
+
+    #[test]
+    #[cfg(feature = "fair-block-ordering")]
+    fn fair_ordered_epoch_hash_is_consistent_across_arrival_order() {
+        let first = sealed_epoch_block("first", &["a", "b"]);
+        let second = sealed_epoch_block("second", &["c"]);
+        let mut first_arrival = BTreeMap::new();
+        first_arrival.insert(first.hash, first.clone());
+        first_arrival.insert(second.hash, second.clone());
+        let mut second_arrival = BTreeMap::new();
+        second_arrival.insert(second.hash, second);
+        second_arrival.insert(first.hash, first);
+
+        assert_eq!(
+            fair_ordered_block_commitments(&first_arrival),
+            fair_ordered_block_commitments(&second_arrival)
+        );
+
+        let mut first_epoch = Epoch {
+            hash: HashType::default(),
+            signatures: BTreeMap::default(),
+            body: EpochBody {
+                last_epoch: HashType([1; 32]),
+                nonce: Nonce::new(2),
+                merkle_root: block_merkle_root(&first_arrival),
+                blocks: first_arrival,
+                ..Default::default()
+            },
+        };
+        first_epoch.set_hash();
+
+        let mut second_epoch = Epoch {
+            hash: HashType::default(),
+            signatures: BTreeMap::default(),
+            body: EpochBody {
+                last_epoch: HashType([1; 32]),
+                nonce: Nonce::new(2),
+                merkle_root: block_merkle_root(&second_arrival),
+                blocks: second_arrival,
+                ..Default::default()
+            },
+        };
+        second_epoch.set_hash();
+
+        assert_eq!(first_epoch.body.merkle_root, second_epoch.body.merkle_root);
+        assert_eq!(first_epoch.hash, second_epoch.hash);
+        assert_ne!(first_epoch.body.merkle_root, first_epoch.body.blocks.hash());
     }
 
     #[test]

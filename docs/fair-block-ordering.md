@@ -17,10 +17,24 @@ Blossom now derives the epoch block tree from fair-order commitments:
    only as a deterministic tie-breaker.
 5. Commit those ordered fair keys into the epoch Merkle root.
 
+This behavior is behind the `fair-block-ordering` compile-time feature:
+
+```sh
+cargo build --features fair-block-ordering
+```
+
+Every validator in the same network must be compiled with the same ordering
+feature set. Builds that enable fair ordering advertise a different protocol
+hash profile, for example `sha256+fair-block-ordering`, so health and ping
+compatibility checks can reject mixed raw-order/fair-order fleets before they
+try to agree on an epoch.
+
 The raw block hash remains the signed block identity. Validators still verify
 the block hash, Merkle root, transaction commitments, and block signature before
 the block enters the accepted set. The fair-order key is only the final
-epoch-ordering commitment.
+epoch-ordering commitment. The final order is signed off through the normal
+epoch hash: the epoch body commits the fair-order Merkle root, and validators
+sign that epoch hash once consensus reaches the accepted block set.
 
 This prevents a participant from knowing its final tree position by simply
 constructing a lower raw block hash. The final order depends on all accepted
@@ -28,8 +42,10 @@ block bytes and the aggregate transaction count, so the ordering seed is not
 known from any one participant's local block alone.
 
 Applications that execute ledger-style transactions should consume epoch blocks
-through `EpochBody::fair_ordered_blocks()` instead of iterating the raw
-`BTreeMap<HashType, Block>` directly.
+through `EpochBody::ordered_blocks()`. With `fair-block-ordering` enabled this
+returns fair-order sequence; without the feature it returns the historical raw
+block-hash sequence. Applications that require fair ordering should compile
+with the feature and can call `EpochBody::fair_ordered_blocks()` directly.
 
 This is not a mempool fairness system, encrypted order flow, or MEV auction.
 Applications that need those properties still need application-layer rules for

@@ -13,14 +13,29 @@ use crate::error::{BlossomError, Result};
 
 pub const SHA256_PROTOCOL_HASH_ALGORITHM: &str = "sha256";
 pub const XXH3_PROTOCOL_HASH_ALGORITHM: &str = "xxh3-128x2";
+pub const SHA256_FAIR_ORDER_PROTOCOL_HASH_ALGORITHM: &str = "sha256+fair-block-ordering";
+pub const XXH3_FAIR_ORDER_PROTOCOL_HASH_ALGORITHM: &str = "xxh3-128x2+fair-block-ordering";
 
 pub fn protocol_hash_algorithm() -> &'static str {
-    #[cfg(feature = "insecure-fast-hash")]
+    #[cfg(all(feature = "insecure-fast-hash", feature = "fair-block-ordering"))]
+    {
+        XXH3_FAIR_ORDER_PROTOCOL_HASH_ALGORITHM
+    }
+
+    #[cfg(all(feature = "insecure-fast-hash", not(feature = "fair-block-ordering")))]
     {
         XXH3_PROTOCOL_HASH_ALGORITHM
     }
 
-    #[cfg(not(feature = "insecure-fast-hash"))]
+    #[cfg(all(not(feature = "insecure-fast-hash"), feature = "fair-block-ordering"))]
+    {
+        SHA256_FAIR_ORDER_PROTOCOL_HASH_ALGORITHM
+    }
+
+    #[cfg(all(
+        not(feature = "insecure-fast-hash"),
+        not(feature = "fair-block-ordering")
+    ))]
     {
         SHA256_PROTOCOL_HASH_ALGORITHM
     }
@@ -221,6 +236,32 @@ where
 mod tests {
     use super::*;
     use crate::crypto::PubKey;
+
+    #[test]
+    #[cfg(not(feature = "fair-block-ordering"))]
+    fn protocol_hash_algorithm_reports_raw_ordering_profile() {
+        #[cfg(feature = "insecure-fast-hash")]
+        assert_eq!(protocol_hash_algorithm(), XXH3_PROTOCOL_HASH_ALGORITHM);
+
+        #[cfg(not(feature = "insecure-fast-hash"))]
+        assert_eq!(protocol_hash_algorithm(), SHA256_PROTOCOL_HASH_ALGORITHM);
+    }
+
+    #[test]
+    #[cfg(feature = "fair-block-ordering")]
+    fn protocol_hash_algorithm_reports_fair_ordering_profile() {
+        #[cfg(feature = "insecure-fast-hash")]
+        assert_eq!(
+            protocol_hash_algorithm(),
+            XXH3_FAIR_ORDER_PROTOCOL_HASH_ALGORITHM
+        );
+
+        #[cfg(not(feature = "insecure-fast-hash"))]
+        assert_eq!(
+            protocol_hash_algorithm(),
+            SHA256_FAIR_ORDER_PROTOCOL_HASH_ALGORITHM
+        );
+    }
 
     #[test]
     fn hex_display_parse_and_json_round_trip() {

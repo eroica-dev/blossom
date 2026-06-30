@@ -12,6 +12,7 @@ documentation = "https://docs.rs/blossom"
 default = []
 availability-gossip = ["filtered-transactions"]
 external-transaction-hashes = []
+fair-block-ordering = []
 filtered-transactions = []
 insecure-fast-hash = ["dep:xxhash-rust"]
 propagation-adaptive = [

@@ -90,8 +90,9 @@ production node that autonomously drives every consensus stage end to end.
 - `docs/node-lifecycle.md`: service registration, verifier membership,
   node dropping, and simulated reconnect admission.
 - `docs/architecture.md`: paper-informed architecture map for the extracted crate.
-- `docs/fair-block-ordering.md`: fair epoch block ordering for ledger-style
-  applications that must not execute blocks by grindable raw hash order.
+- `docs/fair-block-ordering.md`: optional `fair-block-ordering` feature for
+  ledger-style applications that must not execute blocks by grindable raw hash
+  order.
 - `docs/source-map.md`: source files used for the extraction.
 - `docs/testing.md`: end-to-end testing and harness guide.
 

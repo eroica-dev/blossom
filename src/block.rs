@@ -1,5 +1,6 @@
 use borsh::{BorshDeserialize, BorshSerialize};
 use serde::{Deserialize, Serialize};
+#[cfg(feature = "fair-block-ordering")]
 use std::collections::BTreeMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -12,7 +13,9 @@ use crate::nonce::Nonce;
 
 pub const BLOCK_APPLICATION_STATE_SOFT_LIMIT_BYTES: usize = 4 * 1024;
 pub const BLOCK_APPLICATION_STATE_MAX_BYTES: usize = 8 * 1024;
+#[cfg(feature = "fair-block-ordering")]
 const FAIR_BLOCK_ORDER_SEED_DOMAIN: &[u8] = b"blossom.fair-block-order.seed.v1";
+#[cfg(feature = "fair-block-ordering")]
 const FAIR_BLOCK_ORDER_KEY_DOMAIN: &[u8] = b"blossom.fair-block-order.key.v1";
 
 /// Opaque application-defined transaction data.
@@ -713,12 +716,14 @@ impl Block {
         self.body.txs.is_empty()
     }
 
+    #[cfg(feature = "fair-block-ordering")]
     pub fn append_fair_order_bytes_to(&self, bytes: &mut Vec<u8>) {
         bytes.extend_from_slice(self.hash.as_ref());
         bytes.extend_from_slice(self.signature.as_ref());
         self.body.append_bytes_to(bytes);
     }
 
+    #[cfg(feature = "fair-block-ordering")]
     pub fn fair_order_encoded_len(&self) -> usize {
         32 + self.signature.as_ref().len() + self.body.encoded_len()
     }
@@ -740,6 +745,7 @@ impl Block {
     }
 }
 
+#[cfg(feature = "fair-block-ordering")]
 pub fn fair_order_transaction_count(blocks: &BTreeMap<HashType, Block>) -> u64 {
     blocks
         .values()
@@ -747,6 +753,7 @@ pub fn fair_order_transaction_count(blocks: &BTreeMap<HashType, Block>) -> u64 {
         .fold(0u64, u64::saturating_add)
 }
 
+#[cfg(feature = "fair-block-ordering")]
 pub fn fair_block_order_seed(blocks: &BTreeMap<HashType, Block>) -> HashType {
     let transaction_count = fair_order_transaction_count(blocks);
     let modulo = transaction_count.max(1);
@@ -764,6 +771,7 @@ pub fn fair_block_order_seed(blocks: &BTreeMap<HashType, Block>) -> HashType {
     hasher.finalize()
 }
 
+#[cfg(feature = "fair-block-ordering")]
 pub fn fair_block_order_key(
     seed: HashType,
     transaction_count: u64,
@@ -781,6 +789,7 @@ pub fn fair_block_order_key(
     hasher.finalize()
 }
 
+#[cfg(feature = "fair-block-ordering")]
 pub fn fair_ordered_blocks(blocks: &BTreeMap<HashType, Block>) -> Vec<(&HashType, &Block)> {
     let seed = fair_block_order_seed(blocks);
     let transaction_count = fair_order_transaction_count(blocks);
@@ -801,6 +810,7 @@ pub fn fair_ordered_blocks(blocks: &BTreeMap<HashType, Block>) -> Vec<(&HashType
         .collect()
 }
 
+#[cfg(feature = "fair-block-ordering")]
 pub fn fair_ordered_block_commitments(blocks: &BTreeMap<HashType, Block>) -> Vec<HashType> {
     let seed = fair_block_order_seed(blocks);
     let transaction_count = fair_order_transaction_count(blocks);
@@ -817,6 +827,7 @@ pub fn fair_ordered_block_commitments(blocks: &BTreeMap<HashType, Block>) -> Vec
     commitments.into_iter().map(|(key, _)| key).collect()
 }
 
+#[cfg(feature = "fair-block-ordering")]
 fn update_modulo_seed(
     hasher: &mut ProtocolHasher,
     bytes: &[u8],
@@ -1090,6 +1101,7 @@ mod tests {
         EncounterOutcome, EncounterPhase, EncounterRecord, EncounterRecordBody,
     };
 
+    #[cfg(feature = "fair-block-ordering")]
     fn sealed_test_block(label: &str, txs: &[&str]) -> Block {
         let mut block = Block::default();
         block.body.created = 42;
@@ -1331,6 +1343,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "fair-block-ordering")]
     fn fair_order_seed_uses_modulo_transaction_count_and_all_block_bytes() {
         let block_a = sealed_test_block("a", &["tx-1"]);
         let block_b = sealed_test_block("b", &["tx-1"]);
@@ -1364,6 +1377,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "fair-block-ordering")]
     fn fair_ordering_can_reverse_raw_hash_order() {
         let mut found_reversal = false;
         for left_index in 0..64u16 {

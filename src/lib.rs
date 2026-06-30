@@ -67,6 +67,11 @@ pub use block::{
 };
 #[cfg(feature = "filtered-transactions")]
 pub use block::{FilteredDeliveryPolicy, FilteredPayloadView, FilteredTransactionSlot};
+#[cfg(feature = "fair-block-ordering")]
+pub use block::{
+    fair_block_order_key, fair_block_order_seed, fair_order_transaction_count,
+    fair_ordered_block_commitments, fair_ordered_blocks,
+};
 pub use block_store::{BlockHandle, BlockIndex, BlockRecord};
 pub use blossom::*;
 pub use crypto::{Keypair, PubKey, SecKey, SecretSigner, Signature, verify_batch};
@@ -78,8 +83,9 @@ pub use error::{BlossomError, Result};
 pub use group::ConsensusGroupId;
 pub use harness::{MockBlockService, SimulatedCluster, SimulatedNode, signed_block};
 pub use hash::{
-    DoHash, HashType, SHA256_PROTOCOL_HASH_ALGORITHM, XXH3_PROTOCOL_HASH_ALGORITHM,
-    protocol_hash_algorithm, protocol_hash_algorithm_is_compatible,
+    DoHash, HashType, SHA256_FAIR_ORDER_PROTOCOL_HASH_ALGORITHM, SHA256_PROTOCOL_HASH_ALGORITHM,
+    XXH3_FAIR_ORDER_PROTOCOL_HASH_ALGORITHM, XXH3_PROTOCOL_HASH_ALGORITHM, protocol_hash_algorithm,
+    protocol_hash_algorithm_is_compatible,
 };
 pub use indextreemap::{IndexTreeMap, SharedIndexTreeMap};
 pub use local_block::LocalBlock;
