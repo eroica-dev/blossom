@@ -603,8 +603,8 @@ transaction count. Ledger adapters should consume blocks via
 - No derivative epoch hash over validated transaction outcomes.
 - No append-only ledger update or historical query implementation.
 - No runtime negotiation for changing ordering mode inside a live network;
-  mixed raw-order/fair-order builds are rejected by protocol profile
-  compatibility checks.
+  mixed raw-order/fair-order builds are rejected by protocol feature-code
+  profile compatibility checks.
 
 **Tests to add:**
 

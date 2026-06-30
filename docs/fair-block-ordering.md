@@ -29,6 +29,26 @@ hash profile, for example `sha256+fair-block-ordering`, so health and ping
 compatibility checks can reject mixed raw-order/fair-order fleets before they
 try to agree on an epoch.
 
+Consensus-affecting features also have stable numeric feature codes. The
+profile is rendered as readable labels, but the canonical feature-code byte
+sequence is:
+
+```text
+version: u8
+feature_count: u16 big endian
+feature_id[0]: u16 big endian
+...
+feature_id[n]: u16 big endian
+```
+
+Feature id `0x0000` is reserved. `fair-block-ordering` is feature id `0x0001`.
+Feature ids are sorted in ascending order before profile construction. The
+format leaves 65,535 usable feature ids overall, 65,534 future feature ids after
+fair ordering, and up to 65,535 active features in one encoded profile. The
+readable profile remains intentionally human-friendly, for example
+`sha256+fair-block-ordering`, while the byte-code profile gives future
+extensions a compact deterministic compatibility namespace.
+
 The raw block hash remains the signed block identity. Validators still verify
 the block hash, Merkle root, transaction commitments, and block signature before
 the block enters the accepted set. The fair-order key is only the final

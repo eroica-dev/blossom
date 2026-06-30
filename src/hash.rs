@@ -14,11 +14,28 @@ use crate::error::{BlossomError, Result};
 
 pub const SHA256_PROTOCOL_HASH_ALGORITHM: &str = "sha256";
 pub const XXH3_PROTOCOL_HASH_ALGORITHM: &str = "xxh3-128x2";
-pub const FAIR_BLOCK_ORDERING_PROTOCOL_FEATURE_CODE: &str = "fair-block-ordering";
+pub const PROTOCOL_FEATURE_CODE_VERSION: u8 = 1;
+pub const RESERVED_PROTOCOL_FEATURE_CODE: u16 = 0x0000;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProtocolFeatureCode {
+    pub id: u16,
+    pub label: &'static str,
+}
+
+impl ProtocolFeatureCode {
+    pub const fn new(id: u16, label: &'static str) -> Self {
+        Self { id, label }
+    }
+}
+
+pub const FAIR_BLOCK_ORDERING_PROTOCOL_FEATURE_CODE: ProtocolFeatureCode =
+    ProtocolFeatureCode::new(0x0001, "fair-block-ordering");
 #[cfg(feature = "fair-block-ordering")]
-pub const PROTOCOL_FEATURE_CODES: &[&str] = &[FAIR_BLOCK_ORDERING_PROTOCOL_FEATURE_CODE];
+pub const PROTOCOL_FEATURE_CODES: &[ProtocolFeatureCode] =
+    &[FAIR_BLOCK_ORDERING_PROTOCOL_FEATURE_CODE];
 #[cfg(not(feature = "fair-block-ordering"))]
-pub const PROTOCOL_FEATURE_CODES: &[&str] = &[];
+pub const PROTOCOL_FEATURE_CODES: &[ProtocolFeatureCode] = &[];
 
 pub fn protocol_hash_algorithm() -> &'static str {
     static PROTOCOL_HASH_ALGORITHM: OnceLock<String> = OnceLock::new();
@@ -43,13 +60,28 @@ fn protocol_hash_algorithm_string() -> String {
     let mut profile = protocol_base_hash_algorithm().to_string();
     for feature_code in PROTOCOL_FEATURE_CODES {
         profile.push('+');
-        profile.push_str(feature_code);
+        profile.push_str(feature_code.label);
     }
     profile
 }
 
 pub fn protocol_hash_algorithm_is_compatible(peer: &str) -> bool {
     peer == protocol_hash_algorithm()
+}
+
+pub fn protocol_feature_code_bytes() -> Vec<u8> {
+    assert!(
+        PROTOCOL_FEATURE_CODES.len() <= u16::MAX as usize,
+        "protocol feature profile cannot encode more than u16::MAX active features"
+    );
+
+    let mut bytes = Vec::with_capacity(3 + (PROTOCOL_FEATURE_CODES.len() * 2));
+    bytes.push(PROTOCOL_FEATURE_CODE_VERSION);
+    bytes.extend_from_slice(&(PROTOCOL_FEATURE_CODES.len() as u16).to_be_bytes());
+    for feature_code in PROTOCOL_FEATURE_CODES {
+        bytes.extend_from_slice(&feature_code.id.to_be_bytes());
+    }
+    bytes
 }
 
 #[derive(
@@ -252,6 +284,12 @@ mod tests {
 
         #[cfg(not(feature = "insecure-fast-hash"))]
         assert_eq!(protocol_hash_algorithm(), SHA256_PROTOCOL_HASH_ALGORITHM);
+
+        assert_eq!(PROTOCOL_FEATURE_CODES, &[]);
+        assert_eq!(
+            protocol_feature_code_bytes(),
+            vec![PROTOCOL_FEATURE_CODE_VERSION, 0x00, 0x00]
+        );
     }
 
     #[test]
@@ -267,9 +305,29 @@ mod tests {
             PROTOCOL_FEATURE_CODES,
             &[FAIR_BLOCK_ORDERING_PROTOCOL_FEATURE_CODE]
         );
+        assert_eq!(
+            protocol_feature_code_bytes(),
+            vec![PROTOCOL_FEATURE_CODE_VERSION, 0x00, 0x01, 0x00, 0x01]
+        );
         assert!(!protocol_hash_algorithm_is_compatible(
             protocol_base_hash_algorithm()
         ));
+    }
+
+    #[test]
+    fn protocol_feature_code_namespace_has_extension_room() {
+        assert!(u16::MAX as usize > 65_000);
+        assert!(PROTOCOL_FEATURE_CODES.len() <= u16::MAX as usize);
+        assert!(
+            PROTOCOL_FEATURE_CODES
+                .iter()
+                .all(|feature_code| feature_code.id != RESERVED_PROTOCOL_FEATURE_CODE)
+        );
+        assert!(
+            PROTOCOL_FEATURE_CODES
+                .windows(2)
+                .all(|window| window[0].id < window[1].id)
+        );
     }
 
     #[test]
