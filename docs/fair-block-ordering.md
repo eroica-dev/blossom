@@ -17,17 +17,25 @@ Blossom now derives the epoch block tree from fair-order commitments:
    only as a deterministic tie-breaker.
 5. Commit those ordered fair keys into the epoch Merkle root.
 
-This behavior is behind the `fair-block-ordering` compile-time feature:
+This behavior is enabled by default for trustless deployments through the
+`fair-block-ordering` compile-time feature:
 
 ```sh
-cargo build --features fair-block-ordering
+cargo build
 ```
 
-Every validator in the same network must be compiled with the same ordering
-feature set. Builds that enable fair ordering advertise a different protocol
-hash profile, for example `sha256+fair-block-ordering`, so health and ping
-compatibility checks can reject mixed raw-order/fair-order fleets before they
-try to agree on an epoch.
+Legacy raw block-hash ordering remains available for compatibility testing and
+private deployments that explicitly opt out of default trustless behavior:
+
+```sh
+cargo build --no-default-features
+```
+
+Every validator in the same network must still be compiled with the same
+ordering feature set. Default builds advertise a fair-ordering protocol hash
+profile, for example `sha256+fair-block-ordering`, so health and ping
+compatibility checks can reject mixed raw-order/fair-order fleets before they try
+to agree on an epoch.
 
 Consensus-affecting features also have stable numeric feature codes. The
 profile is rendered as readable labels, but the canonical feature-code byte
@@ -74,10 +82,10 @@ block bytes and the aggregate transaction count, so the ordering seed is not
 known from any one participant's local block alone.
 
 Applications that execute ledger-style transactions should consume epoch blocks
-through `EpochBody::ordered_blocks()`. With `fair-block-ordering` enabled this
-returns fair-order sequence; without the feature it returns the historical raw
-block-hash sequence. Applications that require fair ordering should compile
-with the feature and can call `EpochBody::fair_ordered_blocks()` directly.
+through `EpochBody::ordered_blocks()`. In default trustless builds this returns
+the fair-order sequence. In explicit `--no-default-features` legacy builds it
+returns the historical raw block-hash sequence. Applications that require direct
+access to the fair-order path can call `EpochBody::fair_ordered_blocks()`.
 
 ## Validation
 
@@ -87,9 +95,8 @@ tests compare the streaming transcript against the previous materialized byte
 transcript and repeatedly compute the same accepted block set from multiple
 threads to catch hidden ordering or shared-state bugs.
 
-Local Criterion measurements for `cargo bench --bench protocol --features
-fair-block-ordering fair_block_ordering -- --warm-up-time 1 --measurement-time 2
---sample-size 10`:
+Local Criterion measurements for `cargo bench --bench protocol
+fair_block_ordering -- --warm-up-time 1 --measurement-time 2 --sample-size 10`:
 
 | Blocks | Transactions | Raw leaf hash | Fair seed | Fair commitments |
 | ---: | ---: | ---: | ---: | ---: |

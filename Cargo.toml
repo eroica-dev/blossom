@@ -9,7 +9,7 @@ homepage = "https://github.com/eden-dev-inc/blossom"
 documentation = "https://docs.rs/blossom"
 
 [features]
-default = []
+default = ["fair-block-ordering"]
 availability-gossip = ["filtered-transactions"]
 external-transaction-hashes = []
 fair-block-ordering = []

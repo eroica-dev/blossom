@@ -9,9 +9,10 @@ homepage = "https://github.com/eden-dev-inc/blossom"
 documentation = "https://docs.rs/blossom-sim"
 
 [features]
-default = []
+default = ["fair-block-ordering"]
 availability-gossip = ["blossom/availability-gossip"]
 external-transaction-hashes = ["blossom/external-transaction-hashes"]
+fair-block-ordering = ["blossom/fair-block-ordering"]
 filtered-transactions = ["blossom/filtered-transactions"]
 insecure-fast-hash = ["blossom/insecure-fast-hash"]
 propagation-adaptive = ["blossom/propagation-adaptive"]
@@ -19,7 +20,7 @@ propagation-inventory = ["blossom/propagation-inventory"]
 propagation-push = ["blossom/propagation-push"]
 
 [dependencies]
-blossom = { version = "0.2.0", path = "../.." }
+blossom = { version = "0.2.0", path = "../..", default-features = false }
 deterministic-test-env = { version = "0.1.0", path = "../deterministic-test-env" }
 clap = { version = "4.5", features = ["derive", "env"] }
 tokio = { version = "1.48", features = ["macros", "net", "rt-multi-thread", "time"] }

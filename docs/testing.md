@@ -26,7 +26,16 @@ cargo test --features insecure-fast-hash
 ```
 
 That feature is for trusted/performance experiments. The default test run is
-the secure SHA-256 protocol path.
+the secure SHA-256 protocol path with trustless fair block ordering enabled.
+
+Run the legacy raw block-hash ordering path:
+
+```sh
+cargo test -p blossom --no-default-features
+```
+
+Use this only as a compatibility regression gate. Trustless deploys should use
+the default feature set.
 
 Run only the end-to-end suite:
 

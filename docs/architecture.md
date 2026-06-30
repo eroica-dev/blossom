@@ -199,20 +199,19 @@ verifier-set supermajority.
 
 After block propagation, the paper expects all non-Byzantine validators
 to hold the same preliminary epoch: a deterministic block set, with
-transactions ordered inside each block. When the `fair-block-ordering`
-feature is enabled across the whole network, the epoch block tree is
-derived from fair-order commitments rather than raw block-hash order, so
-ledger-style applications are not expected to execute blocks by grindable
-hash position. Each validator then independently verifies the epoch, applies
-valid transaction bodies to the append-only ledger, and signs the resulting
-epoch hash.
+transactions ordered inside each block. Default trustless builds enable
+`fair-block-ordering`, so the epoch block tree is derived from fair-order
+commitments rather than raw block-hash order and ledger-style applications are
+not expected to execute blocks by grindable hash position. Each validator then
+independently verifies the epoch, applies valid transaction bodies to the
+append-only ledger, and signs the resulting epoch hash.
 
 The current crate preserves the protocol-side foundations for that
 work:
 
 - block hash and signature verification in `src/block.rs`
-- optional fair-order block commitments and ordered maps for block sets and
-  signature trees
+- default trustless fair-order block commitments and ordered maps for block
+  sets and signature trees
 - epoch chain and epoch body containers in `src/state.rs`
 
 Full transaction validation is intentionally not implemented here yet.
@@ -220,7 +219,8 @@ The paper's transaction tagging, derivative hash, append-only ledger
 state, account/index update rules, and auditing/query behavior should
 be implemented as a ledger layer that consumes finalized blocks through
 `EpochBody::ordered_blocks()`. Ledger adapters that require fair ordering
-should enable `fair-block-ordering` on every validator.
+should use default trustless builds on every validator; legacy raw ordering is
+available only through explicit `--no-default-features` builds.
 
 Filtered transactions preserve that boundary. Blossom validates canonical slot
 commitments, tombstone shape, and full-payload hash matches, but the meaning of

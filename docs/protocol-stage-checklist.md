@@ -584,17 +584,17 @@ Appraisal -> Echo -> Verification -> Proposal -> Request -> Commit
 
 ## Stage 11: Transaction Validation And Ledger Integration
 
-**Status:** ledger semantics are not implemented in this crate. The optional
-`fair-block-ordering` feature implements protocol-side fair epoch block
-ordering as a mitigation for hash-grinding against ledger-style consumers.
+**Status:** ledger semantics are not implemented in this crate. Default
+trustless builds enable `fair-block-ordering`, which implements protocol-side
+fair epoch block ordering as a mitigation for hash-grinding against ledger-style
+consumers.
 
 Blossom commits opaque transaction payloads. Application-owned semantics,
 ledger mutation, derivative epoch hashing, transaction tagging, and historical
-queries remain outside the crate. When all validators are compiled with
-`fair-block-ordering`, finalized epoch block trees use domain-separated
-fair-order commitments derived from all accepted block bytes and the aggregate
-transaction count. Ledger adapters should consume blocks via
-`EpochBody::ordered_blocks()`.
+queries remain outside the crate. In default trustless builds, finalized epoch
+block trees use domain-separated fair-order commitments derived from all
+accepted block bytes and the aggregate transaction count. Ledger adapters should
+consume blocks via `EpochBody::ordered_blocks()`.
 
 **Current gaps:**
 
@@ -609,7 +609,7 @@ transaction count. Ledger adapters should consume blocks via
 **Tests to add:**
 
 - Ledger-adapter contract tests with deterministic transaction ordering under
-  both raw-order and fair-order feature builds.
+  both explicit raw-order legacy builds and default fair-order trustless builds.
 - Invalid transaction tests proving invalid bodies do not change ledger state
   but still produce deterministic outcomes.
 - Multi-node tests where all honest validators apply the same epoch body and
