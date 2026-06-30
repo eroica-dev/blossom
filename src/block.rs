@@ -1,5 +1,6 @@
 use borsh::{BorshDeserialize, BorshSerialize};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::admission::NodeAdmission;
@@ -11,6 +12,8 @@ use crate::nonce::Nonce;
 
 pub const BLOCK_APPLICATION_STATE_SOFT_LIMIT_BYTES: usize = 4 * 1024;
 pub const BLOCK_APPLICATION_STATE_MAX_BYTES: usize = 8 * 1024;
+const FAIR_BLOCK_ORDER_SEED_DOMAIN: &[u8] = b"blossom.fair-block-order.seed.v1";
+const FAIR_BLOCK_ORDER_KEY_DOMAIN: &[u8] = b"blossom.fair-block-order.key.v1";
 
 /// Opaque application-defined transaction data.
 ///
@@ -710,6 +713,16 @@ impl Block {
         self.body.txs.is_empty()
     }
 
+    pub fn append_fair_order_bytes_to(&self, bytes: &mut Vec<u8>) {
+        bytes.extend_from_slice(self.hash.as_ref());
+        bytes.extend_from_slice(self.signature.as_ref());
+        self.body.append_bytes_to(bytes);
+    }
+
+    pub fn fair_order_encoded_len(&self) -> usize {
+        32 + self.signature.as_ref().len() + self.body.encoded_len()
+    }
+
     /// Returns a local filtered view of this block for `viewer`.
     ///
     /// The block hash, Merkle root, and signature are not changed. Only
@@ -724,6 +737,96 @@ impl Block {
             .map(|tx| tx.materialize_for(viewer))
             .collect();
         block
+    }
+}
+
+pub fn fair_order_transaction_count(blocks: &BTreeMap<HashType, Block>) -> u64 {
+    blocks
+        .values()
+        .map(|block| block.body.txs.len() as u64)
+        .fold(0u64, u64::saturating_add)
+}
+
+pub fn fair_block_order_seed(blocks: &BTreeMap<HashType, Block>) -> HashType {
+    let transaction_count = fair_order_transaction_count(blocks);
+    let modulo = transaction_count.max(1);
+    let mut byte_index = 0u64;
+    let mut hasher = ProtocolHasher::new();
+    hasher.update(FAIR_BLOCK_ORDER_SEED_DOMAIN);
+    hasher.update(transaction_count.to_le_bytes());
+    hasher.update((blocks.len() as u64).to_le_bytes());
+    for (block_hash, block) in blocks {
+        let mut block_bytes = Vec::with_capacity(block.fair_order_encoded_len());
+        block.append_fair_order_bytes_to(&mut block_bytes);
+        update_modulo_seed(&mut hasher, block_hash.as_ref(), modulo, &mut byte_index);
+        update_modulo_seed(&mut hasher, &block_bytes, modulo, &mut byte_index);
+    }
+    hasher.finalize()
+}
+
+pub fn fair_block_order_key(
+    seed: HashType,
+    transaction_count: u64,
+    block_hash: &HashType,
+    block: &Block,
+) -> HashType {
+    let mut hasher = ProtocolHasher::new();
+    hasher.update(FAIR_BLOCK_ORDER_KEY_DOMAIN);
+    hasher.update(seed.as_ref());
+    hasher.update(transaction_count.to_le_bytes());
+    hasher.update(block_hash.as_ref());
+    hasher.update(block.hash.as_ref());
+    hasher.update(block.body.validator.as_ref());
+    hasher.update((block.body.txs.len() as u64).to_le_bytes());
+    hasher.finalize()
+}
+
+pub fn fair_ordered_blocks(blocks: &BTreeMap<HashType, Block>) -> Vec<(&HashType, &Block)> {
+    let seed = fair_block_order_seed(blocks);
+    let transaction_count = fair_order_transaction_count(blocks);
+    let mut ordered = blocks
+        .iter()
+        .map(|(block_hash, block)| {
+            (
+                fair_block_order_key(seed, transaction_count, block_hash, block),
+                block_hash,
+                block,
+            )
+        })
+        .collect::<Vec<_>>();
+    ordered.sort_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(right.1)));
+    ordered
+        .into_iter()
+        .map(|(_, block_hash, block)| (block_hash, block))
+        .collect()
+}
+
+pub fn fair_ordered_block_commitments(blocks: &BTreeMap<HashType, Block>) -> Vec<HashType> {
+    let seed = fair_block_order_seed(blocks);
+    let transaction_count = fair_order_transaction_count(blocks);
+    let mut commitments = blocks
+        .iter()
+        .map(|(block_hash, block)| {
+            (
+                fair_block_order_key(seed, transaction_count, block_hash, block),
+                *block_hash,
+            )
+        })
+        .collect::<Vec<_>>();
+    commitments.sort_unstable();
+    commitments.into_iter().map(|(key, _)| key).collect()
+}
+
+fn update_modulo_seed(
+    hasher: &mut ProtocolHasher,
+    bytes: &[u8],
+    modulo: u64,
+    byte_index: &mut u64,
+) {
+    for byte in bytes {
+        hasher.update((*byte_index % modulo).to_le_bytes());
+        hasher.update([*byte]);
+        *byte_index = byte_index.wrapping_add(1);
     }
 }
 
@@ -987,6 +1090,20 @@ mod tests {
         EncounterOutcome, EncounterPhase, EncounterRecord, EncounterRecordBody,
     };
 
+    fn sealed_test_block(label: &str, txs: &[&str]) -> Block {
+        let mut block = Block::default();
+        block.body.created = 42;
+        block.body.nonce = Nonce::new(1);
+        for tx in txs {
+            block
+                .body
+                .txs
+                .push(Transaction::new(format!("{label}:{tx}")));
+        }
+        block.seal_unsigned(PubKey(HashType::hash(label.as_bytes()).0));
+        block
+    }
+
     #[test]
     fn block_signature_round_trip() {
         let keypair = Keypair::generate();
@@ -1211,6 +1328,67 @@ mod tests {
         assert_eq!(decoded, kv);
         assert_eq!(tx.hash, HashType::hash(tx.payload()));
         assert_eq!(tx.to_bytes(), [tx.hash.as_ref(), tx.payload()].concat());
+    }
+
+    #[test]
+    fn fair_order_seed_uses_modulo_transaction_count_and_all_block_bytes() {
+        let block_a = sealed_test_block("a", &["tx-1"]);
+        let block_b = sealed_test_block("b", &["tx-1"]);
+        let block_c = sealed_test_block("c", &["tx-1", "tx-2"]);
+        let mut one_block = BTreeMap::new();
+        one_block.insert(block_a.hash, block_a.clone());
+        let mut two_blocks_same_count = one_block.clone();
+        two_blocks_same_count.insert(block_b.hash, block_b);
+        let mut two_blocks_more_txs = one_block.clone();
+        two_blocks_more_txs.insert(block_c.hash, block_c);
+
+        let one_seed = fair_block_order_seed(&one_block);
+        let same_count_seed = fair_block_order_seed(&two_blocks_same_count);
+        let more_txs_seed = fair_block_order_seed(&two_blocks_more_txs);
+        assert_ne!(one_seed, same_count_seed);
+        assert_ne!(same_count_seed, more_txs_seed);
+
+        let one_key = fair_block_order_key(
+            one_seed,
+            fair_order_transaction_count(&one_block),
+            &block_a.hash,
+            &block_a,
+        );
+        let more_txs_key = fair_block_order_key(
+            more_txs_seed,
+            fair_order_transaction_count(&two_blocks_more_txs),
+            &block_a.hash,
+            &block_a,
+        );
+        assert_ne!(one_key, more_txs_key);
+    }
+
+    #[test]
+    fn fair_ordering_can_reverse_raw_hash_order() {
+        let mut found_reversal = false;
+        for left_index in 0..64u16 {
+            for right_index in (left_index + 1)..128u16 {
+                let left = sealed_test_block(&format!("left-{left_index}"), &["tx"]);
+                let right = sealed_test_block(&format!("right-{right_index}"), &["tx"]);
+                let mut blocks = BTreeMap::new();
+                blocks.insert(left.hash, left);
+                blocks.insert(right.hash, right);
+                let raw_order = blocks.keys().copied().collect::<Vec<_>>();
+                let fair_order = fair_ordered_blocks(&blocks)
+                    .into_iter()
+                    .map(|(hash, _)| *hash)
+                    .collect::<Vec<_>>();
+                if raw_order != fair_order {
+                    found_reversal = true;
+                    break;
+                }
+            }
+            if found_reversal {
+                break;
+            }
+        }
+
+        assert!(found_reversal);
     }
 
     #[cfg(feature = "filtered-transactions")]

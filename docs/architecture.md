@@ -198,23 +198,27 @@ verifier-set supermajority.
 ### Transaction Validation
 
 After block propagation, the paper expects all non-Byzantine validators
-to hold the same preliminary epoch: a deterministically ordered block
-set, with transactions ordered inside each block. Each validator then
-independently verifies the epoch, applies valid transaction bodies to
-the append-only ledger, and signs the resulting epoch hash.
+to hold the same preliminary epoch: a deterministically fair-ordered block
+set, with transactions ordered inside each block. The epoch block tree is
+derived from fair-order commitments rather than raw block-hash order, so
+ledger-style applications are not expected to execute blocks by grindable
+hash position. Each validator then independently verifies the epoch, applies
+valid transaction bodies to the append-only ledger, and signs the resulting
+epoch hash.
 
 The current crate preserves the protocol-side foundations for that
 work:
 
 - block hash and signature verification in `src/block.rs`
-- ordered maps for block sets and signature trees
+- fair-order block commitments and ordered maps for block sets and
+  signature trees
 - epoch chain and epoch body containers in `src/state.rs`
 
 Full transaction validation is intentionally not implemented here yet.
 The paper's transaction tagging, derivative hash, append-only ledger
 state, account/index update rules, and auditing/query behavior should
-be implemented as a ledger layer that consumes this crate's finalized
-block sets.
+be implemented as a ledger layer that consumes finalized blocks through
+`EpochBody::fair_ordered_blocks()`.
 
 Filtered transactions preserve that boundary. Blossom validates canonical slot
 commitments, tombstone shape, and full-payload hash matches, but the meaning of

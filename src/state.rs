@@ -9,7 +9,7 @@ use rs_merkle::{MerkleTree, algorithms::Sha256};
 use serde::{Deserialize, Serialize, Serializer, ser::SerializeStruct};
 
 use crate::algorithm::{select_quorums_from_index_tree, supermajority_count};
-use crate::block::Block;
+use crate::block::{Block, fair_ordered_block_commitments, fair_ordered_blocks};
 use crate::blossom::{
     Commit, Dispatch, EchoReDispatch, EchoRequest, EchoResponse, Proposal, SignatureTree,
     SignaturesForHash, Verification,
@@ -272,13 +272,19 @@ pub struct EpochBody {
 
 impl EpochBody {
     pub fn application_states(&self) -> impl Iterator<Item = (&HashType, &PubKey, &[u8])> {
-        self.blocks.iter().map(|(hash, block)| {
-            (
-                hash,
-                &block.body.validator,
-                block.body.application_state.as_slice(),
-            )
-        })
+        fair_ordered_blocks(&self.blocks)
+            .into_iter()
+            .map(|(hash, block)| {
+                (
+                    hash,
+                    &block.body.validator,
+                    block.body.application_state.as_slice(),
+                )
+            })
+    }
+
+    pub fn fair_ordered_blocks(&self) -> Vec<(&HashType, &Block)> {
+        fair_ordered_blocks(&self.blocks)
     }
 
     pub fn to_bytes(&self) -> Vec<u8> {
@@ -861,20 +867,29 @@ pub fn init_proposals(quorum: u32) -> PropCount {
 }
 
 fn block_merkle_root(blocks: &BTreeMap<HashType, Block>) -> HashType {
+    let ordered_commitments = fair_ordered_block_commitments(blocks);
+
     #[cfg(feature = "insecure-fast-hash")]
     {
-        if blocks.is_empty() {
+        if ordered_commitments.is_empty() {
             return HashType::default();
         }
-        if let Some(hash) = blocks.keys().next().copied().filter(|_| blocks.len() == 1) {
+        if let Some(hash) = ordered_commitments
+            .first()
+            .copied()
+            .filter(|_| ordered_commitments.len() == 1)
+        {
             return hash;
         }
-        blocks.hash()
+        HashType::hash_slices(ordered_commitments.iter().map(AsRef::as_ref))
     }
 
     #[cfg(not(feature = "insecure-fast-hash"))]
     {
-        let leaves = blocks.keys().map(|hash| hash.0).collect::<Vec<_>>();
+        let leaves = ordered_commitments
+            .iter()
+            .map(|hash| hash.0)
+            .collect::<Vec<_>>();
         HashType::from_byte_hash(
             MerkleTree::<Sha256>::from_leaves(&leaves)
                 .root()
@@ -1029,13 +1044,17 @@ mod tests {
     }
 
     #[test]
-    fn block_merkle_root_matches_single_block_leaf() {
+    fn block_merkle_root_uses_fair_order_commitments() {
         let block = Block::empty_with_nonce(Nonce::new(1));
         let hash = block.hash();
         let mut blocks = BTreeMap::new();
         blocks.insert(hash, block);
 
-        assert_eq!(block_merkle_root(&blocks), hash);
+        assert_eq!(
+            block_merkle_root(&blocks),
+            fair_ordered_block_commitments(&blocks)[0]
+        );
+        assert_ne!(block_merkle_root(&blocks), hash);
     }
 
     #[test]
