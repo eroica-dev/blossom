@@ -26,11 +26,46 @@ that six-member quorum. This distinction is important: slow-node tolerance and
 Byzantine equivocator tolerance are related, but not identical.
 
 The implemented quorum schedule is deterministic. Nodes are sorted by public
-key, optionally shuffled from the epoch seed, and then assigned to recursive
-round quorums. For \(n=36\) and \(q=6\), the implementation creates two rounds:
-one row-like round and one transposed column-like round. Non-square network
-sizes are mapped to the largest implementation-supported topology below or
-equal to the active set, with extra nodes appended into existing quorums.
+key, optionally shuffled from the epoch seed, and then assigned into a
+\(q\)-ary tensor coordinate system. For active validator count \(n\) and
+quorum size \(q\), the schedule dimension is
+\[
+D(n,q)=\max \left(1,\left\lceil \log_q(n)\right\rceil\right).
+\]
+The ideal tensor capacity is \(q^{D(n,q)}\). Non-ideal network sizes are mapped
+into the same deterministic schedule, with overflow validators appended into
+existing quorums according to the public ordering. This preserves a common
+quorum view across honest validators while allowing the implementation to run
+when \(n\) is not exactly a power of \(q\).
+
+Conceptually, a validator occupies a coordinate
+\[
+    a_i=(a_{i,0},a_{i,1},\ldots,a_{i,D-1}) \in [q]^D .
+\]
+Each consensus layer moves across one tensor dimension. The local quorum for a
+layer consists of validators that share the node's other coordinates and vary
+along the active dimension. Earlier protocol drafts used this schedule directly:
+for \(n=36\) and \(q=6\), the network formed a \(6 \times 6\) tensor and ran a
+row-like round followed by a column-like round. If the first data-spreading
+round failed, however, a correct local block could remain trapped at the leaf
+of the tree and be lost from that branch.
+
+The 2025--2026 v2 implementation therefore adds deterministic
+\emph{prefill dispatch}. Before verified consensus begins, each node sends its
+local block to the future contacts that will carry that block through the
+remaining tensor layers. In the default single-route profile, the remote
+prefill fanout is
+\[
+P(n,q)=\min \left(n-1,\ (q-1)+(D(n,q)-1)q\right),
+\]
+or approximately \(Dq\) holders including the source node. The prefill stage
+replaces only the first data-spreading consensus round; the later verified
+rounds still run and certify the canonical epoch state. With \(q=6\) and
+\(D=10\), this means a node sends to \(59\) remote contacts, or \(60\) holders
+including itself, even though the tensor capacity is
+\(6^{10}=60{,}466{,}176\) validators.
+
+\input{figures/tensor_prefill_cube}
 
 \subsection{Trusted and Verified Paths}
 
@@ -46,9 +81,32 @@ validator identities, and each signed message is bound to the epoch, nonce,
 round, message kind, sender identity, and body being admitted.
 \end{description}
 
-The benchmark binary \path{src/bin/blossom-epoch-bench.rs} models these paths
-separately. For a two-round \(q=6\) topology, trusted propagation has two
-network stages, while verified propagation has ten network stages.
+The epoch benchmark binary models these paths separately. For a two-layer
+\(q=6\) topology, the legacy trusted path has two data-moving stages, while
+the legacy verified path has ten proof-bearing network stages. With v2 prefill
+dispatch enabled, the first data-spreading verified round is replaced by one
+availability hop, so the same two-layer topology uses one prefill hop plus one
+five-message verified round.
+
+\subsection{Default Trustless Epoch Ordering}
+
+The default trustless build enables fair block ordering, exposed in code under
+the fair-block-ordering compile-time feature. This feature is
+consensus-affecting: it changes the
+domain-separated epoch block tree from raw block-hash ordering to fair-order
+commitments. The active profile is labeled
+sha256+fair-block-ordering and is also encoded with a stable numeric
+feature code. Honest validators include the same feature-code byte sequence in
+the protocol hash namespace, so mixed raw-order and fair-order fleets reject
+one another before attempting to finalize an epoch.
+
+Fair ordering is applied after blocks and transactions have entered the
+accepted set. It does not allow a node to make invalid data valid, and it does
+not change the quorum threshold. Instead, it derives an epoch-local ordering
+key from the canonical block transcript and the total transaction population.
+This prevents ledger-style applications from relying on raw hash order as a
+front-running surface. Explicit raw block-hash ordering remains available only
+for legacy or private compatibility builds that disable default features.
 
 \subsection{Runtime Reconciliation and Membership}
 

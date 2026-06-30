@@ -14,8 +14,14 @@ We use the following variables:
 \begin{description}
 \item[\(n\)] active validator count.
 \item[\(q\)] quorum size. The current implementation uses \(q=6\).
-\item[\(R(n,q)\)] number of deterministic quorum rounds selected by the
-implementation.
+\item[\(D(n,q)\)] tensor dimension selected by the implementation, where
+\(D(n,q)=\max(1,\lceil \log_q(n)\rceil)\).
+\item[\(R_2(n,q)\)] active verified consensus rounds after v2 prefill
+dispatch. For the large-network path where \(D(n,q)>1\),
+\(R_2(n,q)=D(n,q)-1\). Without prefill dispatch, the legacy value is
+\(D(n,q)\).
+\item[\(P(n,q)\)] remote prefill recipient count. In the default single-route
+profile, \(P(n,q)=\min(n-1,(q-1)+(D(n,q)-1)q)\).
 \item[\(S(x)\)] implemented supermajority threshold, where
 \(S(x)=x-\lfloor x/3 \rfloor\).
 \item[\(F(x)\)] Byzantine safety bound, where
@@ -77,24 +83,33 @@ A_{\mathrm{verified}}
 \{\mathrm{dispatch},\mathrm{echo},\mathrm{verification},
 \mathrm{proposal},\mathrm{commit}\}.
 \]
-The modeled propagation latency is therefore:
+The v2 prefill stage is a one-hop data-availability stage, not a consensus
+stage. Let \(\Pi(n,q)\) be the modeled latency of that prefill hop. The modeled
+propagation latency for the prefill-dispatch path is therefore:
 \[
 L_m(n,q)
 =
-\sum_{r=1}^{R(n,q)}
+\Pi(n,q)+
+\sum_{r=1}^{R_2(n,q)}
 \sum_{a \in A_m}
 \max_{Q \in \mathcal{Q}_r}
 \Lambda_a(Q).
 \]
+For the legacy path without prefill dispatch, set \(\Pi(n,q)=0\) and replace
+\(R_2(n,q)\) with \(D(n,q)\).
+
 If every directed edge has the same latency \(l\), this reduces to
 \[
-L_{\mathrm{trusted}}(n,q)=R(n,q)l,
+L_{\mathrm{trusted}}(n,q)=D(n,q)l,
 \]
 \[
-L_{\mathrm{verified}}(n,q)=5R(n,q)l.
+L_{\mathrm{verified}}(n,q)=\left(1+5(D(n,q)-1)\right)l
+\quad\text{for }D(n,q)>1.
 \]
-For \(n=36\) and \(q=6\), \(R(n,q)=2\), so the trusted path uses two network
-stages and the verified path uses ten network stages.
+For \(n=36\) and \(q=6\), \(D(n,q)=2\). The trusted path still uses two
+data-moving stages, while the verified v2 path uses one prefill hop plus one
+five-message verified round, or six network stages. The legacy verified path
+without prefill uses ten network stages.
 
 The block-time model is:
 \[
