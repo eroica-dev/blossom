@@ -3,7 +3,7 @@ use indextreemap::{IndexTreeMap, SharedIndexTreeMap};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 #[cfg(not(feature = "insecure-fast-hash"))]
 use sha2::{Digest, Sha256};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::ops::Deref;
 use std::sync::OnceLock;
@@ -31,6 +31,31 @@ impl ProtocolFeatureCode {
 
 pub const FAIR_BLOCK_ORDERING_PROTOCOL_FEATURE_CODE: ProtocolFeatureCode =
     ProtocolFeatureCode::new(0x0001, "fair-block-ordering");
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProtocolConsensusSurface {
+    EpochBlockOrdering,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProtocolFeatureRegistryEntry {
+    pub code: ProtocolFeatureCode,
+    pub dependencies: &'static [u16],
+    pub conflicts: &'static [u16],
+    pub consensus_surface: ProtocolConsensusSurface,
+}
+
+pub const FAIR_BLOCK_ORDERING_PROTOCOL_FEATURE: ProtocolFeatureRegistryEntry =
+    ProtocolFeatureRegistryEntry {
+        code: FAIR_BLOCK_ORDERING_PROTOCOL_FEATURE_CODE,
+        dependencies: &[],
+        conflicts: &[],
+        consensus_surface: ProtocolConsensusSurface::EpochBlockOrdering,
+    };
+
+pub const PROTOCOL_FEATURE_REGISTRY: &[ProtocolFeatureRegistryEntry] =
+    &[FAIR_BLOCK_ORDERING_PROTOCOL_FEATURE];
+
 #[cfg(feature = "fair-block-ordering")]
 pub const PROTOCOL_FEATURE_CODES: &[ProtocolFeatureCode] =
     &[FAIR_BLOCK_ORDERING_PROTOCOL_FEATURE_CODE];
@@ -69,11 +94,155 @@ pub fn protocol_hash_algorithm_is_compatible(peer: &str) -> bool {
     peer == protocol_hash_algorithm()
 }
 
+pub fn protocol_feature_registry_entry(id: u16) -> Option<&'static ProtocolFeatureRegistryEntry> {
+    PROTOCOL_FEATURE_REGISTRY
+        .iter()
+        .find(|entry| entry.code.id == id)
+}
+
+pub fn validate_protocol_feature_registry() -> Result<()> {
+    let mut seen = BTreeSet::new();
+    let mut previous = None;
+    for entry in PROTOCOL_FEATURE_REGISTRY {
+        let code = entry.code;
+        if code.id == RESERVED_PROTOCOL_FEATURE_CODE {
+            return Err(BlossomError::WireProtocol(
+                "protocol feature registry uses reserved feature id 0x0000".to_string(),
+            ));
+        }
+        if code.label.is_empty() {
+            return Err(BlossomError::WireProtocol(
+                "protocol feature registry contains an empty feature label".to_string(),
+            ));
+        }
+        if previous.is_some_and(|previous| previous >= code.id) {
+            return Err(BlossomError::WireProtocol(
+                "protocol feature registry must be sorted by ascending feature id".to_string(),
+            ));
+        }
+        if !seen.insert(code.id) {
+            return Err(BlossomError::WireProtocol(format!(
+                "protocol feature registry duplicates feature id 0x{:04x}",
+                code.id
+            )));
+        }
+        previous = Some(code.id);
+    }
+
+    for entry in PROTOCOL_FEATURE_REGISTRY {
+        for dependency in entry.dependencies {
+            if *dependency == entry.code.id {
+                return Err(BlossomError::WireProtocol(format!(
+                    "protocol feature {} depends on itself",
+                    entry.code.label
+                )));
+            }
+            if !seen.contains(dependency) {
+                return Err(BlossomError::WireProtocol(format!(
+                    "protocol feature {} depends on unregistered feature id 0x{dependency:04x}",
+                    entry.code.label
+                )));
+            }
+        }
+        for conflict in entry.conflicts {
+            if *conflict == entry.code.id {
+                return Err(BlossomError::WireProtocol(format!(
+                    "protocol feature {} conflicts with itself",
+                    entry.code.label
+                )));
+            }
+            if !seen.contains(conflict) {
+                return Err(BlossomError::WireProtocol(format!(
+                    "protocol feature {} conflicts with unregistered feature id 0x{conflict:04x}",
+                    entry.code.label
+                )));
+            }
+            if entry.dependencies.contains(conflict) {
+                return Err(BlossomError::WireProtocol(format!(
+                    "protocol feature {} both depends on and conflicts with feature id 0x{conflict:04x}",
+                    entry.code.label
+                )));
+            }
+        }
+    }
+
+    Ok(())
+}
+
+pub fn validate_protocol_feature_codes(codes: &[ProtocolFeatureCode]) -> Result<()> {
+    validate_protocol_feature_registry()?;
+
+    if codes.len() > u16::MAX as usize {
+        return Err(BlossomError::WireProtocol(
+            "protocol feature profile has too many active features".to_string(),
+        ));
+    }
+
+    let mut seen = BTreeSet::new();
+    let mut previous = None;
+    for code in codes {
+        if code.id == RESERVED_PROTOCOL_FEATURE_CODE {
+            return Err(BlossomError::WireProtocol(
+                "protocol feature profile uses reserved feature id 0x0000".to_string(),
+            ));
+        }
+        if code.label.is_empty() {
+            return Err(BlossomError::WireProtocol(
+                "protocol feature profile contains an empty feature label".to_string(),
+            ));
+        }
+        if previous.is_some_and(|previous| previous >= code.id) {
+            return Err(BlossomError::WireProtocol(
+                "protocol feature profile must be sorted by ascending feature id".to_string(),
+            ));
+        }
+        if !seen.insert(code.id) {
+            return Err(BlossomError::WireProtocol(format!(
+                "protocol feature profile duplicates feature id 0x{:04x}",
+                code.id
+            )));
+        }
+        let Some(entry) = protocol_feature_registry_entry(code.id) else {
+            return Err(BlossomError::WireProtocol(format!(
+                "protocol feature profile uses unregistered feature id 0x{:04x}",
+                code.id
+            )));
+        };
+        if entry.code.label != code.label {
+            return Err(BlossomError::WireProtocol(format!(
+                "protocol feature id 0x{:04x} label mismatch: expected {}, got {}",
+                code.id, entry.code.label, code.label
+            )));
+        }
+        previous = Some(code.id);
+    }
+
+    for code in codes {
+        let entry = protocol_feature_registry_entry(code.id).expect("entry checked above");
+        for dependency in entry.dependencies {
+            if !seen.contains(dependency) {
+                return Err(BlossomError::WireProtocol(format!(
+                    "protocol feature {} requires missing feature id 0x{dependency:04x}",
+                    entry.code.label
+                )));
+            }
+        }
+        for conflict in entry.conflicts {
+            if seen.contains(conflict) {
+                return Err(BlossomError::WireProtocol(format!(
+                    "protocol feature {} conflicts with feature id 0x{conflict:04x}",
+                    entry.code.label
+                )));
+            }
+        }
+    }
+
+    Ok(())
+}
+
 pub fn protocol_feature_code_bytes() -> Vec<u8> {
-    assert!(
-        PROTOCOL_FEATURE_CODES.len() <= u16::MAX as usize,
-        "protocol feature profile cannot encode more than u16::MAX active features"
-    );
+    validate_protocol_feature_codes(PROTOCOL_FEATURE_CODES)
+        .expect("compiled protocol feature profile must be valid");
 
     let mut bytes = Vec::with_capacity(3 + (PROTOCOL_FEATURE_CODES.len() * 2));
     bytes.push(PROTOCOL_FEATURE_CODE_VERSION);
@@ -327,6 +496,50 @@ mod tests {
             PROTOCOL_FEATURE_CODES
                 .windows(2)
                 .all(|window| window[0].id < window[1].id)
+        );
+    }
+
+    #[test]
+    fn protocol_feature_registry_validates_active_profile() {
+        assert_eq!(
+            protocol_feature_registry_entry(FAIR_BLOCK_ORDERING_PROTOCOL_FEATURE_CODE.id),
+            Some(&FAIR_BLOCK_ORDERING_PROTOCOL_FEATURE)
+        );
+        assert!(validate_protocol_feature_registry().is_ok());
+        assert!(validate_protocol_feature_codes(PROTOCOL_FEATURE_CODES).is_ok());
+        assert!(
+            PROTOCOL_FEATURE_REGISTRY
+                .windows(2)
+                .all(|window| window[0].code.id < window[1].code.id)
+        );
+    }
+
+    #[test]
+    fn protocol_feature_registry_rejects_invalid_profiles() {
+        assert!(
+            validate_protocol_feature_codes(&[ProtocolFeatureCode::new(
+                RESERVED_PROTOCOL_FEATURE_CODE,
+                "reserved"
+            )])
+            .is_err()
+        );
+        assert!(
+            validate_protocol_feature_codes(&[ProtocolFeatureCode::new(0x7fff, "not-registered")])
+                .is_err()
+        );
+        assert!(
+            validate_protocol_feature_codes(&[ProtocolFeatureCode::new(
+                FAIR_BLOCK_ORDERING_PROTOCOL_FEATURE_CODE.id,
+                "wrong-label"
+            )])
+            .is_err()
+        );
+        assert!(
+            validate_protocol_feature_codes(&[
+                FAIR_BLOCK_ORDERING_PROTOCOL_FEATURE_CODE,
+                FAIR_BLOCK_ORDERING_PROTOCOL_FEATURE_CODE
+            ])
+            .is_err()
         );
     }
 

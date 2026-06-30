@@ -515,6 +515,60 @@ fn bench_availability_gossip(c: &mut Criterion) {
     }
 }
 
+#[cfg_attr(not(feature = "fair-block-ordering"), allow(unused_variables))]
+fn bench_fair_block_ordering(c: &mut Criterion) {
+    #[cfg(feature = "fair-block-ordering")]
+    {
+        let mut group = c.benchmark_group("fair_block_ordering");
+        group.sample_size(10);
+
+        for (block_count, txs_per_block) in [(6usize, 256usize), (36, 128), (216, 64)] {
+            let blocks = fair_order_blocks(block_count, txs_per_block, 32);
+            let total_txs = block_count * txs_per_block;
+            group.throughput(Throughput::Elements(total_txs as u64));
+
+            group.bench_with_input(
+                BenchmarkId::new("raw_collect_and_hash_block_leaves", block_count),
+                &blocks,
+                |b, blocks| {
+                    b.iter(|| {
+                        let leaves = black_box(blocks).keys().copied().collect::<Vec<_>>();
+                        black_box(HashType::hash_slices(leaves.iter().map(AsRef::as_ref)))
+                    });
+                },
+            );
+
+            group.bench_with_input(
+                BenchmarkId::new("fair_transaction_count", block_count),
+                &blocks,
+                |b, blocks| {
+                    b.iter(|| black_box(blossom::fair_order_transaction_count(black_box(blocks))));
+                },
+            );
+
+            group.bench_with_input(
+                BenchmarkId::new("fair_order_seed", block_count),
+                &blocks,
+                |b, blocks| {
+                    b.iter(|| black_box(blossom::fair_block_order_seed(black_box(blocks))));
+                },
+            );
+
+            group.bench_with_input(
+                BenchmarkId::new("fair_ordered_block_commitments", block_count),
+                &blocks,
+                |b, blocks| {
+                    b.iter(|| {
+                        black_box(blossom::fair_ordered_block_commitments(black_box(blocks)))
+                    });
+                },
+            );
+        }
+
+        group.finish();
+    }
+}
+
 fn block_with_txs(count: usize) -> Block {
     let mut block = Block::default();
     block.body.last_epoch = HashType([1; 32]);
@@ -540,6 +594,22 @@ fn block_with_payload_txs(count: usize, payload_len: usize) -> Block {
         block.body.txs.push(Transaction::new(bytes));
     }
     block
+}
+
+#[cfg(feature = "fair-block-ordering")]
+fn fair_order_blocks(
+    block_count: usize,
+    txs_per_block: usize,
+    payload_len: usize,
+) -> BTreeMap<HashType, Block> {
+    (0..block_count)
+        .map(|block_index| {
+            let mut block = block_with_payload_txs(txs_per_block, payload_len);
+            block.body.nonce = Nonce::new(block_index as u64 + 1);
+            block.seal_unsigned(PubKey(HashType::hash(&block_index.to_le_bytes()).0));
+            (block.hash, block)
+        })
+        .collect()
 }
 
 fn signed_block(keypair: &Keypair) -> Block {
@@ -639,6 +709,7 @@ criterion_group!(
     bench_block_index,
     bench_block_scaling,
     bench_filtered_transactions,
-    bench_availability_gossip
+    bench_availability_gossip,
+    bench_fair_block_ordering
 );
 criterion_main!(benches);

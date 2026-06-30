@@ -49,6 +49,18 @@ readable profile remains intentionally human-friendly, for example
 `sha256+fair-block-ordering`, while the byte-code profile gives future
 extensions a compact deterministic compatibility namespace.
 
+Each consensus-affecting feature is also registered in the protocol feature
+registry with a stable feature id and label, dependency ids, conflict ids, and
+the consensus surface touched by the feature. The compiled feature profile is
+validated before its byte-code sequence is emitted. This rejects reserved ids,
+duplicate ids, unregistered ids, mismatched labels, missing dependencies,
+conflicts, and non-ascending feature lists.
+
+A combination of independent features is represented by the sorted set of
+feature ids. A combination needs its own feature id only when the combined
+behavior is a new consensus rule rather than the independent composition of the
+two features.
+
 The raw block hash remains the signed block identity. Validators still verify
 the block hash, Merkle root, transaction commitments, and block signature before
 the block enters the accepted set. The fair-order key is only the final
@@ -66,6 +78,29 @@ through `EpochBody::ordered_blocks()`. With `fair-block-ordering` enabled this
 returns fair-order sequence; without the feature it returns the historical raw
 block-hash sequence. Applications that require fair ordering should compile
 with the feature and can call `EpochBody::fair_ordered_blocks()` directly.
+
+## Validation
+
+The fair-order seed path streams canonical block bytes directly into the modulo
+hasher instead of allocating one encoded block buffer per block. Regression
+tests compare the streaming transcript against the previous materialized byte
+transcript and repeatedly compute the same accepted block set from multiple
+threads to catch hidden ordering or shared-state bugs.
+
+Local Criterion measurements for `cargo bench --bench protocol --features
+fair-block-ordering fair_block_ordering -- --warm-up-time 1 --measurement-time 2
+--sample-size 10`:
+
+| Blocks | Transactions | Raw leaf hash | Fair seed | Fair commitments |
+| ---: | ---: | ---: | ---: | ---: |
+| 6 | 1,536 | 0.49 us | 1.87 ms | 1.86 ms |
+| 36 | 4,608 | 2.29 us | 5.66 ms | 5.89 ms |
+| 216 | 13,824 | 12.81 us | 18.18 ms | 17.68 ms |
+
+The modulo fair-order path is intentionally much more expensive than raw
+block-hash ordering because it commits the accepted block byte field into a
+global transaction-count residue stream. In practice this is an epoch-finality
+cost, not a per-message or per-transaction hot-path cost.
 
 This is not a mempool fairness system, encrypted order flow, or MEV auction.
 Applications that need those properties still need application-layer rules for

@@ -565,6 +565,24 @@ impl Transaction {
         bytes.extend_from_slice(self.payload.bytes.as_slice());
     }
 
+    #[cfg(feature = "fair-block-ordering")]
+    fn update_canonical_payload_fair_order_seed(
+        &self,
+        hasher: &mut ProtocolHasher,
+        modulo: u64,
+        byte_index: &mut u64,
+    ) {
+        #[cfg(feature = "filtered-transactions")]
+        if let Some(slot) = &self.filtered_slot {
+            let mut bytes = Vec::with_capacity(slot.encoded_len());
+            slot.append_bytes_to(&mut bytes);
+            update_modulo_seed(hasher, &bytes, modulo, byte_index);
+            return;
+        }
+
+        update_modulo_seed(hasher, self.payload.bytes.as_slice(), modulo, byte_index);
+    }
+
     fn update_canonical_payload_hash(&self, hasher: &mut ProtocolHasher) {
         #[cfg(feature = "filtered-transactions")]
         if let Some(slot) = &self.filtered_slot {
@@ -724,6 +742,18 @@ impl Block {
     }
 
     #[cfg(feature = "fair-block-ordering")]
+    fn update_fair_order_seed(
+        &self,
+        hasher: &mut ProtocolHasher,
+        modulo: u64,
+        byte_index: &mut u64,
+    ) {
+        update_modulo_seed(hasher, self.hash.as_ref(), modulo, byte_index);
+        update_modulo_seed(hasher, self.signature.as_ref(), modulo, byte_index);
+        self.body.update_fair_order_seed(hasher, modulo, byte_index);
+    }
+
+    #[cfg(feature = "fair-block-ordering")]
     pub fn fair_order_encoded_len(&self) -> usize {
         32 + self.signature.as_ref().len() + self.body.encoded_len()
     }
@@ -763,10 +793,8 @@ pub fn fair_block_order_seed(blocks: &BTreeMap<HashType, Block>) -> HashType {
     hasher.update(transaction_count.to_le_bytes());
     hasher.update((blocks.len() as u64).to_le_bytes());
     for (block_hash, block) in blocks {
-        let mut block_bytes = Vec::with_capacity(block.fair_order_encoded_len());
-        block.append_fair_order_bytes_to(&mut block_bytes);
         update_modulo_seed(&mut hasher, block_hash.as_ref(), modulo, &mut byte_index);
-        update_modulo_seed(&mut hasher, &block_bytes, modulo, &mut byte_index);
+        block.update_fair_order_seed(&mut hasher, modulo, &mut byte_index);
     }
     hasher.finalize()
 }
@@ -834,10 +862,27 @@ fn update_modulo_seed(
     modulo: u64,
     byte_index: &mut u64,
 ) {
+    const MODULO_ENTRY_BYTES: usize = 9;
+    const MODULO_CHUNK_ENTRIES: usize = 128;
+    const MODULO_CHUNK_BYTES: usize = MODULO_ENTRY_BYTES * MODULO_CHUNK_ENTRIES;
+
+    let mut chunk = [0u8; MODULO_CHUNK_BYTES];
+    let mut chunk_len = 0usize;
+
     for byte in bytes {
-        hasher.update((*byte_index % modulo).to_le_bytes());
-        hasher.update([*byte]);
+        chunk[chunk_len..chunk_len + 8].copy_from_slice(&(*byte_index % modulo).to_le_bytes());
+        chunk[chunk_len + 8] = *byte;
+        chunk_len += MODULO_ENTRY_BYTES;
         *byte_index = byte_index.wrapping_add(1);
+
+        if chunk_len == MODULO_CHUNK_BYTES {
+            hasher.update(chunk);
+            chunk_len = 0;
+        }
+    }
+
+    if chunk_len > 0 {
+        hasher.update(&chunk[..chunk_len]);
     }
 }
 
@@ -957,6 +1002,68 @@ impl BlockBody {
             bytes.extend_from_slice(tx.hash.as_ref());
             bytes.extend_from_slice(&(tx.canonical_payload_encoded_len() as u64).to_le_bytes());
             tx.append_canonical_payload_to(bytes);
+        }
+    }
+
+    #[cfg(feature = "fair-block-ordering")]
+    fn update_fair_order_seed(
+        &self,
+        hasher: &mut ProtocolHasher,
+        modulo: u64,
+        byte_index: &mut u64,
+    ) {
+        update_modulo_seed(hasher, self.validator.as_ref(), modulo, byte_index);
+        update_modulo_seed(hasher, self.last_epoch.as_ref(), modulo, byte_index);
+        update_modulo_seed(hasher, &self.nonce.to_le_bytes(), modulo, byte_index);
+        update_modulo_seed(hasher, &self.created.to_le_bytes(), modulo, byte_index);
+        update_modulo_seed(hasher, &self.dispatched.to_le_bytes(), modulo, byte_index);
+        update_modulo_seed(hasher, self.merkle_root.as_ref(), modulo, byte_index);
+        update_modulo_seed(
+            hasher,
+            &(self.application_state.len() as u64).to_le_bytes(),
+            modulo,
+            byte_index,
+        );
+        update_modulo_seed(
+            hasher,
+            self.application_state.as_slice(),
+            modulo,
+            byte_index,
+        );
+        update_modulo_seed(
+            hasher,
+            &(self.encounter_records.len() as u64).to_le_bytes(),
+            modulo,
+            byte_index,
+        );
+        for record in &self.encounter_records {
+            let mut bytes = Vec::with_capacity(record.encoded_len());
+            record.append_bytes_to(&mut bytes);
+            update_modulo_seed(hasher, &bytes, modulo, byte_index);
+        }
+        update_modulo_seed(
+            hasher,
+            &(self.node_admissions.len() as u64).to_le_bytes(),
+            modulo,
+            byte_index,
+        );
+        for admission in &self.node_admissions {
+            let mut bytes = Vec::with_capacity(
+                admission.body.encoded_len() + admission.signature.as_ref().len(),
+            );
+            admission.body.append_bytes_to(&mut bytes);
+            bytes.extend_from_slice(admission.signature.as_ref());
+            update_modulo_seed(hasher, &bytes, modulo, byte_index);
+        }
+        for tx in &self.txs {
+            update_modulo_seed(hasher, tx.hash.as_ref(), modulo, byte_index);
+            update_modulo_seed(
+                hasher,
+                &(tx.canonical_payload_encoded_len() as u64).to_le_bytes(),
+                modulo,
+                byte_index,
+            );
+            tx.update_canonical_payload_fair_order_seed(hasher, modulo, byte_index);
         }
     }
 
@@ -1114,6 +1221,38 @@ mod tests {
         }
         block.seal_unsigned(PubKey(HashType::hash(label.as_bytes()).0));
         block
+    }
+
+    #[cfg(feature = "fair-block-ordering")]
+    fn fair_order_test_blocks(count: usize) -> BTreeMap<HashType, Block> {
+        (0..count)
+            .map(|index| {
+                let txs = (0..=(index % 5))
+                    .map(|tx_index| format!("tx-{tx_index}"))
+                    .collect::<Vec<_>>();
+                let tx_refs = txs.iter().map(String::as_str).collect::<Vec<_>>();
+                let block = sealed_test_block(&format!("block-{index}"), &tx_refs);
+                (block.hash, block)
+            })
+            .collect()
+    }
+
+    #[cfg(feature = "fair-block-ordering")]
+    fn materialized_fair_block_order_seed(blocks: &BTreeMap<HashType, Block>) -> HashType {
+        let transaction_count = fair_order_transaction_count(blocks);
+        let modulo = transaction_count.max(1);
+        let mut byte_index = 0u64;
+        let mut hasher = ProtocolHasher::new();
+        hasher.update(FAIR_BLOCK_ORDER_SEED_DOMAIN);
+        hasher.update(transaction_count.to_le_bytes());
+        hasher.update((blocks.len() as u64).to_le_bytes());
+        for (block_hash, block) in blocks {
+            let mut block_bytes = Vec::with_capacity(block.fair_order_encoded_len());
+            block.append_fair_order_bytes_to(&mut block_bytes);
+            update_modulo_seed(&mut hasher, block_hash.as_ref(), modulo, &mut byte_index);
+            update_modulo_seed(&mut hasher, &block_bytes, modulo, &mut byte_index);
+        }
+        hasher.finalize()
     }
 
     #[test]
@@ -1374,6 +1513,47 @@ mod tests {
             &block_a,
         );
         assert_ne!(one_key, more_txs_key);
+    }
+
+    #[test]
+    #[cfg(feature = "fair-block-ordering")]
+    fn fair_order_seed_streaming_matches_materialized_transcript() {
+        let blocks = fair_order_test_blocks(24);
+
+        assert_eq!(
+            fair_block_order_seed(&blocks),
+            materialized_fair_block_order_seed(&blocks)
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "fair-block-ordering")]
+    fn fair_ordering_is_stable_under_parallel_repeated_reads() {
+        use std::sync::Arc;
+        use std::thread;
+
+        let blocks = Arc::new(fair_order_test_blocks(48));
+        let expected_seed = fair_block_order_seed(&blocks);
+        let expected_commitments = fair_ordered_block_commitments(&blocks);
+        let handles = (0..8)
+            .map(|_| {
+                let blocks = Arc::clone(&blocks);
+                let expected_commitments = expected_commitments.clone();
+                thread::spawn(move || {
+                    for _ in 0..128 {
+                        assert_eq!(fair_block_order_seed(&blocks), expected_seed);
+                        assert_eq!(
+                            fair_ordered_block_commitments(&blocks),
+                            expected_commitments
+                        );
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+
+        for handle in handles {
+            handle.join().unwrap();
+        }
     }
 
     #[test]
