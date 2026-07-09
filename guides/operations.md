@@ -1,0 +1,41 @@
+# Operations
+
+## Runtime Persistence
+
+`blossom-node` supports committed runtime snapshots and durable verified block
+storage:
+
+- `BLOSSOM_STATE_SNAPSHOT`
+- `BLOSSOM_BLOCK_STORE`
+- `BLOSSOM_BOOTSTRAP_SERVICES`
+
+The node can sync bootstrap address-book metadata, but reachability metadata
+does not change validator membership.
+
+## TCP Wire Surface
+
+The TCP server accepts one length-prefixed request frame per connection:
+
+```text
+u32 big-endian payload length
+Borsh-encoded WireRequest
+```
+
+Responses use the same frame shape with `WireResponse`.
+
+Important requests include `Health`, `Ping`, `State`, `EpochChain`,
+`EpochChainRange`, `AddressBook`, `RegisterService`, `Group`, `NextNonce`,
+`SubmitBlock`, `Dispatch`, `PrefillDispatch`, `Message`, `SendNonce`,
+`BlockNonce`, `GetBlock`, and `SendBlock`.
+
+## Telemetry
+
+`TelemetrySink` implementations emit stage progress, spans, dropped-node events,
+reconnect events, block-flow metrics, and errors. `blossom-observer` collects
+JSONL telemetry and analyzes distributed health across nodes.
+
+## Production Notes
+
+Before public trustless deployment, operators should add deployment-specific key
+management, monitoring, alerting, public-join abuse controls, and multi-host
+soak testing.
