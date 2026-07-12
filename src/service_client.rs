@@ -8,7 +8,9 @@ use crate::block::Block;
 use crate::error::{BlossomError, Result};
 use crate::nonce::Nonce;
 use crate::tcp::send_wire_request;
-use crate::wire::{NodePing, NodePong, WireRequest, WireResponse};
+use crate::wire::{
+    ApplicationRequest, ApplicationResponse, NodePing, NodePong, WireRequest, WireResponse,
+};
 
 #[derive(Clone, Debug, Default)]
 pub struct TcpServiceClient;
@@ -28,6 +30,21 @@ impl TcpServiceClient {
             WireResponse::Error(message) => Err(BlossomError::ExternalService(message)),
             response => Err(BlossomError::WireProtocol(format!(
                 "expected pong response, got {}",
+                response.kind()
+            ))),
+        }
+    }
+
+    pub async fn application(
+        &self,
+        service: &Service,
+        request: ApplicationRequest,
+    ) -> Result<ApplicationResponse> {
+        match send(service, WireRequest::Application(request)).await? {
+            WireResponse::Application(response) => Ok(response),
+            WireResponse::Error(message) => Err(BlossomError::ExternalService(message)),
+            response => Err(BlossomError::WireProtocol(format!(
+                "expected application response, got {}",
                 response.kind()
             ))),
         }

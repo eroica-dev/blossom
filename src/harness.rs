@@ -420,6 +420,7 @@ fn request_kind(request: &WireRequest) -> &'static str {
     match request {
         WireRequest::Health => "health",
         WireRequest::Ping(_) => "ping",
+        WireRequest::Application(_) => "application",
         #[cfg(feature = "availability-gossip")]
         WireRequest::AvailabilityGossip(_) => "availability_gossip",
         #[cfg(feature = "availability-gossip")]

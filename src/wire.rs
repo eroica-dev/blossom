@@ -65,6 +65,7 @@ static CONFIGURED_HOT_WIRE_CODEC_ENABLED: OnceLock<bool> = OnceLock::new();
 pub enum WireRequest {
     Health,
     Ping(NodePing),
+    Application(ApplicationRequest),
     #[cfg(feature = "availability-gossip")]
     AvailabilityGossip(AvailabilityGossip),
     #[cfg(feature = "availability-gossip")]
@@ -113,6 +114,7 @@ pub enum WireRequest {
 pub enum WireResponse {
     Health(NodeHealth),
     Pong(NodePong),
+    Application(ApplicationResponse),
     #[cfg(feature = "availability-gossip")]
     AvailabilityReceipt(AvailabilityReceipt),
     #[cfg(feature = "availability-gossip")]
@@ -136,11 +138,48 @@ pub enum WireResponse {
     Error(String),
 }
 
+/// Application-owned request bytes carried over the Blossom service
+/// connection. Blossom transports the envelope but does not interpret the
+/// payload. Applications should keep the service on a trusted network or add
+/// their own authorization at the handler boundary.
+#[derive(Serialize, Deserialize, BorshSerialize, BorshDeserialize, Debug, Clone)]
+pub struct ApplicationRequest {
+    pub kind: String,
+    pub payload: Vec<u8>,
+}
+
+impl ApplicationRequest {
+    pub fn new(kind: impl Into<String>, payload: impl Into<Vec<u8>>) -> Self {
+        Self {
+            kind: kind.into(),
+            payload: payload.into(),
+        }
+    }
+}
+
+/// Application-owned response bytes returned over the Blossom service
+/// connection.
+#[derive(Serialize, Deserialize, BorshSerialize, BorshDeserialize, Debug, Clone)]
+pub struct ApplicationResponse {
+    pub kind: String,
+    pub payload: Vec<u8>,
+}
+
+impl ApplicationResponse {
+    pub fn new(kind: impl Into<String>, payload: impl Into<Vec<u8>>) -> Self {
+        Self {
+            kind: kind.into(),
+            payload: payload.into(),
+        }
+    }
+}
+
 impl WireResponse {
     pub fn kind(&self) -> &'static str {
         match self {
             Self::Health(_) => "health",
             Self::Pong(_) => "pong",
+            Self::Application(_) => "application",
             #[cfg(feature = "availability-gossip")]
             Self::AvailabilityReceipt(_) => "availability_receipt",
             #[cfg(feature = "availability-gossip")]

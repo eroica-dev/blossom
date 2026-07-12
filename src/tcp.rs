@@ -1,3 +1,5 @@
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -15,16 +17,23 @@ use crate::overlay::{BroadcastReport, broadcast_wire_request};
 use crate::runtime::{MultiGroupRuntime, NodeRuntime};
 use crate::service_client::TcpServiceClient;
 use crate::wire::{
-    AddressBookUpdate, EncodedFrame, NodeHealth, NodePong, WireRequest, WireRequestFrame,
-    WireResponse, read_encoded_frame, read_wire_request_frame_optional, read_wire_response,
-    write_encoded_frame, write_wire_request, write_wire_response,
+    AddressBookUpdate, ApplicationRequest, ApplicationResponse, EncodedFrame, NodeHealth, NodePong,
+    WireRequest, WireRequestFrame, WireResponse, read_encoded_frame,
+    read_wire_request_frame_optional, read_wire_response, write_encoded_frame, write_wire_request,
+    write_wire_response,
 };
+
+pub type ApplicationHandler =
+    Arc<dyn Fn(ApplicationRequest) -> ApplicationHandlerFuture + Send + Sync>;
+pub type ApplicationHandlerFuture =
+    Pin<Box<dyn Future<Output = Result<ApplicationResponse>> + Send>>;
 
 #[derive(Clone)]
 pub struct TcpNode {
     pub runtime: NodeRuntime,
     pub services: TcpServiceClient,
     metrics: Option<TcpNodeMetrics>,
+    application_handler: Option<ApplicationHandler>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -77,6 +86,7 @@ impl TcpNode {
             runtime,
             services: TcpServiceClient::new(),
             metrics: None,
+            application_handler: None,
         }
     }
 
@@ -85,6 +95,7 @@ impl TcpNode {
             runtime,
             services,
             metrics: None,
+            application_handler: None,
         }
     }
 
@@ -93,6 +104,19 @@ impl TcpNode {
             runtime,
             services: TcpServiceClient::new(),
             metrics: Some(metrics),
+            application_handler: None,
+        }
+    }
+
+    pub fn with_application_handler(
+        runtime: NodeRuntime,
+        handler: impl Fn(ApplicationRequest) -> ApplicationHandlerFuture + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            runtime,
+            services: TcpServiceClient::new(),
+            metrics: None,
+            application_handler: Some(Arc::new(handler)),
         }
     }
 
@@ -313,6 +337,14 @@ impl TcpNode {
 
     pub async fn handle_request(&self, request: WireRequest) -> Result<WireResponse> {
         match request {
+            WireRequest::Application(request) => {
+                let handler = self.application_handler.as_ref().ok_or_else(|| {
+                    BlossomError::WireProtocol(
+                        "application requests are not configured on this node".to_string(),
+                    )
+                })?;
+                Ok(WireResponse::Application(handler(request).await?))
+            }
             WireRequest::Group { group_id, request } => {
                 if group_id != self.runtime.group_id() {
                     return Err(unknown_group(group_id));
@@ -484,6 +516,9 @@ async fn handle_runtime_request(
             ping.nonce,
             ping.payload,
         ))),
+        WireRequest::Application(_) => Err(BlossomError::WireProtocol(
+            "application requests require an application handler".to_string(),
+        )),
         #[cfg(feature = "availability-gossip")]
         WireRequest::AvailabilityGossip(gossip) => Ok(WireResponse::AvailabilityReceipt(
             runtime.receive_availability_gossip(gossip)?,
@@ -742,6 +777,54 @@ mod tests {
             BlossomError::WireProtocol(message) => assert!(message.contains("does not have")),
             error => panic!("unexpected error: {error}"),
         }
+    }
+
+    #[tokio::test]
+    async fn application_handler_round_trips_over_node_request_path() {
+        let (base_node, keypair) = tcp_node();
+        let node = TcpNode::with_application_handler(base_node.runtime, |request| {
+            Box::pin(async move {
+                assert_eq!(request.kind, "test/echo");
+                Ok(ApplicationResponse::new("test/echo", request.payload))
+            })
+        });
+
+        match node
+            .handle_request(WireRequest::Application(ApplicationRequest::new(
+                "test/echo",
+                b"payload",
+            )))
+            .await
+            .unwrap()
+        {
+            WireResponse::Application(response) => {
+                assert_eq!(response.kind, "test/echo");
+                assert_eq!(response.payload, b"payload");
+            }
+            response => panic!(
+                "expected application response from {}, got {}",
+                keypair.public,
+                response.kind()
+            ),
+        }
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(node.clone().serve(listener));
+        let service = Service::new(
+            ServiceKind::Engine,
+            keypair.public,
+            "tcp",
+            "127.0.0.1",
+            port,
+        );
+        let response = TcpServiceClient::new()
+            .application(&service, ApplicationRequest::new("test/echo", b"network"))
+            .await
+            .unwrap();
+        assert_eq!(response.kind, "test/echo");
+        assert_eq!(response.payload, b"network");
+        server.abort();
     }
 
     #[tokio::test]

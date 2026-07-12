@@ -143,20 +143,20 @@ pub use subset_gossip::{
     run_subset_gossip_v1, run_subset_gossip_v2,
 };
 pub use tcp::{
-    ConsensusDriverConfig, ConsensusDriverTick, TcpConnection, TcpMultiGroupNode, TcpNode,
-    TcpNodeMetrics, TcpNodeMetricsSnapshot, send_wire_frame, send_wire_request,
-    send_wire_request_raw_response,
+    ApplicationHandler, ApplicationHandlerFuture, ConsensusDriverConfig, ConsensusDriverTick,
+    TcpConnection, TcpMultiGroupNode, TcpNode, TcpNodeMetrics, TcpNodeMetricsSnapshot,
+    send_wire_frame, send_wire_request, send_wire_request_raw_response,
 };
 pub use telemetry::{
     InMemoryTelemetrySink, JsonlTcpTelemetrySink, JsonlTcpTelemetrySinkConfig, NoopTelemetrySink,
     TELEMETRY_SCHEMA_VERSION, TelemetryEvent, TelemetryEventKind, TelemetryHandle, TelemetrySink,
 };
 pub use wire::{
-    AddressBookUpdate, EncodedFrame, FRAME_PREFIX_BYTES, FRAME_WRITE_CHUNK_BYTES_ENV,
-    HOT_WIRE_CODEC_ENV, HotDispatch, NodeHealth, NodePing, NodePong, ServiceRegistration,
-    WireRequest, WireRequestFrame, WireResponse, configured_frame_write_chunk_bytes,
-    configured_max_frame_size, decode_wire_request_frame, decode_wire_request_payload,
-    decode_wire_response_payload, encoded_len, framed_len,
+    AddressBookUpdate, ApplicationRequest, ApplicationResponse, EncodedFrame, FRAME_PREFIX_BYTES,
+    FRAME_WRITE_CHUNK_BYTES_ENV, HOT_WIRE_CODEC_ENV, HotDispatch, NodeHealth, NodePing, NodePong,
+    ServiceRegistration, WireRequest, WireRequestFrame, WireResponse,
+    configured_frame_write_chunk_bytes, configured_max_frame_size, decode_wire_request_frame,
+    decode_wire_request_payload, decode_wire_response_payload, encoded_len, framed_len,
     hot_dispatch_response_into_request_frame, hot_dispatch_response_to_request_frame,
     hot_wire_codec_enabled, hot_wire_request_framed_len, hot_wire_response_framed_len,
     read_encoded_frame, read_frame, read_wire_request, read_wire_request_frame,
