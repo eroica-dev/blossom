@@ -702,6 +702,8 @@ fn indexed_signed_block(index: usize) -> Block {
 
 fn bench_latency_topology(c: &mut Criterion) {
     let (topology, source, anchors, candidates) = latency_topology_fixture(16, 64);
+    let (three_route_topology, three_route_source, _, three_route_candidates) =
+        latency_topology_fixture(3, 2);
     let now_millis = 10_000;
     let mut observed = topology.clone();
     let mut group = c.benchmark_group("latency_topology");
@@ -742,7 +744,33 @@ fn bench_latency_topology(c: &mut Criterion) {
             )
         });
     });
-    group.bench_function("closest_of_64_16_anchors", |b| {
+    group.bench_function("estimate_one_node_3_routes", |b| {
+        b.iter(|| {
+            black_box(
+                three_route_topology
+                    .estimate(
+                        black_box(three_route_source),
+                        black_box(three_route_candidates[0]),
+                        black_box(now_millis),
+                    )
+                    .unwrap(),
+            )
+        });
+    });
+    group.bench_function("closest_of_2_3_routes", |b| {
+        b.iter(|| {
+            black_box(
+                three_route_topology
+                    .closest_peer(
+                        black_box(three_route_source),
+                        three_route_candidates.iter().copied(),
+                        black_box(now_millis),
+                    )
+                    .unwrap(),
+            )
+        });
+    });
+    group.bench_function("stress_closest_of_64_16_anchors", |b| {
         b.iter(|| {
             black_box(
                 topology

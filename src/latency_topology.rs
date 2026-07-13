@@ -8,7 +8,6 @@ use crate::crypto::PubKey;
 use crate::error::{BlossomError, Result};
 
 const PARTS_PER_MILLION: u64 = 1_000_000;
-const MAX_TRILATERATION_ANCHORS: usize = 8;
 
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LatencyTopologyConfig {
@@ -351,35 +350,23 @@ impl FreshLatencyView {
             return None;
         }
         let (lower, upper) = self.triangle_bounds(source, peer, &common)?;
-        let trilateration_anchors = self.select_trilateration_anchors(source, peer, &common);
+        let trilaterated = self
+            .select_trilateration_anchors(&common)
+            .and_then(|anchors| {
+                self.trilaterated_distance(source, peer, anchors)
+                    .map(|estimate| (estimate, anchors))
+            });
 
-        let mut best = None::<(f64, f64, [PubKey; 3])>;
-        for first in 0..trilateration_anchors.len() {
-            for second in (first + 1)..trilateration_anchors.len() {
-                for third in (second + 1)..trilateration_anchors.len() {
-                    let anchors = [
-                        trilateration_anchors[first],
-                        trilateration_anchors[second],
-                        trilateration_anchors[third],
-                    ];
-                    let Some((estimate, residual)) =
-                        self.trilaterated_distance(source, peer, anchors)
-                    else {
-                        continue;
-                    };
-                    if best.is_none_or(|(_, best_residual, _)| residual < best_residual) {
-                        best = Some((estimate, residual, anchors));
-                    }
-                }
+        let (rtt_micros, method, anchors) = match trilaterated {
+            Some((estimate, anchors)) => {
+                let mut reported_anchors = anchors.to_vec();
+                reported_anchors.sort_unstable();
+                (
+                    f64_to_u64(estimate).clamp(lower, upper),
+                    LatencyEstimateMethod::Trilaterated,
+                    reported_anchors,
+                )
             }
-        }
-
-        let (rtt_micros, method, anchors) = match best {
-            Some((estimate, _, anchors)) => (
-                f64_to_u64(estimate).clamp(lower, upper),
-                LatencyEstimateMethod::Trilaterated,
-                anchors.to_vec(),
-            ),
             None => (upper, LatencyEstimateMethod::TriangleBounds, common),
         };
         Some(LatencyEstimate {
@@ -444,57 +431,45 @@ impl FreshLatencyView {
         (lower <= upper).then_some((lower, upper))
     }
 
-    fn select_trilateration_anchors(
-        &self,
-        source: PubKey,
-        peer: PubKey,
-        common: &[PubKey],
-    ) -> Vec<PubKey> {
-        if common.len() <= MAX_TRILATERATION_ANCHORS {
-            return common.to_vec();
+    fn select_trilateration_anchors(&self, common: &[PubKey]) -> Option<[PubKey; 3]> {
+        let mut baseline = None::<(u64, PubKey, PubKey)>;
+        for first in 0..common.len() {
+            for second in (first + 1)..common.len() {
+                let Some(distance) = self.distance(common[first], common[second]) else {
+                    continue;
+                };
+                let candidate = (distance, common[first], common[second]);
+                if baseline.is_none_or(|current| candidate > current) {
+                    baseline = Some(candidate);
+                }
+            }
+        }
+        let (baseline_distance, first, second) = baseline?;
+        if baseline_distance == 0 {
+            return None;
         }
 
-        let mut remaining = common.to_vec();
-        let first_index = remaining
+        let third = common
             .iter()
-            .enumerate()
-            .max_by(|(_, first), (_, second)| {
-                self.endpoint_span(source, peer, **first)
-                    .cmp(&self.endpoint_span(source, peer, **second))
-                    .then_with(|| second.cmp(first))
+            .copied()
+            .filter(|candidate| *candidate != first && *candidate != second)
+            .filter_map(|candidate| {
+                let first_distance = self.distance(first, candidate)? as f64;
+                let second_distance = self.distance(second, candidate)? as f64;
+                let point = point_from_two_distances(
+                    first_distance,
+                    second_distance,
+                    baseline_distance as f64,
+                )?;
+                (point.1 > f64::EPSILON).then_some((point.1, candidate))
             })
-            .map(|(index, _)| index)
-            .unwrap_or_default();
-        let mut selected = vec![remaining.remove(first_index)];
-
-        while selected.len() < MAX_TRILATERATION_ANCHORS && !remaining.is_empty() {
-            let next_index = remaining
-                .iter()
-                .enumerate()
-                .max_by(|(_, first), (_, second)| {
-                    self.anchor_spread(**first, &selected)
-                        .cmp(&self.anchor_spread(**second, &selected))
-                        .then_with(|| second.cmp(first))
-                })
-                .map(|(index, _)| index)
-                .unwrap_or_default();
-            selected.push(remaining.remove(next_index));
-        }
-        selected
-    }
-
-    fn endpoint_span(&self, source: PubKey, peer: PubKey, anchor: PubKey) -> u64 {
-        self.distance(source, anchor)
-            .unwrap_or_default()
-            .saturating_add(self.distance(peer, anchor).unwrap_or_default())
-    }
-
-    fn anchor_spread(&self, candidate: PubKey, selected: &[PubKey]) -> u64 {
-        selected
-            .iter()
-            .filter_map(|anchor| self.distance(candidate, *anchor))
-            .min()
-            .unwrap_or_default()
+            .max_by(|left, right| {
+                left.0
+                    .total_cmp(&right.0)
+                    .then_with(|| left.1.cmp(&right.1))
+            })?
+            .1;
+        Some([first, second, third])
     }
 
     fn trilaterated_distance(
@@ -502,7 +477,7 @@ impl FreshLatencyView {
         source: PubKey,
         peer: PubKey,
         anchors: [PubKey; 3],
-    ) -> Option<(f64, f64)> {
+    ) -> Option<f64> {
         let ab = self.distance(anchors[0], anchors[1])? as f64;
         let ac = self.distance(anchors[0], anchors[2])? as f64;
         let bc = self.distance(anchors[1], anchors[2])? as f64;
@@ -513,8 +488,7 @@ impl FreshLatencyView {
 
         let source_point = self.locate_against_anchors(source, anchors, ab, anchor_c)?;
         let peer_point = self.locate_against_anchors(peer, anchors, ab, anchor_c)?;
-        let estimate = euclidean(source_point.0, peer_point.0);
-        Some((estimate, source_point.1 + peer_point.1))
+        Some(euclidean(source_point, peer_point))
     }
 
     fn locate_against_anchors(
@@ -523,7 +497,7 @@ impl FreshLatencyView {
         anchors: [PubKey; 3],
         ab: f64,
         anchor_c: (f64, f64),
-    ) -> Option<((f64, f64), f64)> {
+    ) -> Option<(f64, f64)> {
         let distance_a = self.distance(node, anchors[0])? as f64;
         let distance_b = self.distance(node, anchors[1])? as f64;
         let distance_c = self.distance(node, anchors[2])? as f64;
@@ -532,9 +506,9 @@ impl FreshLatencyView {
         let negative = (point.0, -point.1);
         let negative_error = (euclidean(negative, anchor_c) - distance_c).abs();
         if negative_error < positive_error {
-            Some((negative, negative_error))
+            Some(negative)
         } else {
-            Some((point, positive_error))
+            Some(point)
         }
     }
 }
@@ -789,11 +763,7 @@ mod tests {
         let view = FreshLatencyView::from_topology(&topology, 10_000);
         let common = view.common_anchors(source, peer);
         assert_eq!(common.len(), 24);
-        assert_eq!(
-            view.select_trilateration_anchors(source, peer, &common)
-                .len(),
-            MAX_TRILATERATION_ANCHORS
-        );
+        assert_eq!(view.select_trilateration_anchors(&common).unwrap().len(), 3);
 
         let estimate = view.estimate(source, peer).unwrap();
         assert_eq!(estimate.method, LatencyEstimateMethod::Trilaterated);
