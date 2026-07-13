@@ -2,9 +2,9 @@ use std::collections::BTreeMap;
 
 use blossom::algorithm::select_quorums;
 use blossom::{
-    Block, BlockHandle, BlockIndex, Dispatch, DispatchBody, HashType, Keypair, LocalBlock,
-    MessageMatrix, NodeIdentity, Nonce, PubKey, RuntimeConfig, SignatureTree, Transaction,
-    TrustMode, genesis_epoch,
+    Block, BlockHandle, BlockIndex, Dispatch, DispatchBody, HashType, Keypair, LatencyTopology,
+    LocalBlock, MessageMatrix, NodeIdentity, Nonce, PubKey, RuntimeConfig, SignatureTree,
+    Transaction, TrustMode, genesis_epoch,
 };
 use blossom::{
     DoHash, EncodedFrame, NodeRuntime, WireRequest, framed_len, hot_wire_request_framed_len,
@@ -700,6 +700,126 @@ fn indexed_signed_block(index: usize) -> Block {
     block
 }
 
+fn bench_latency_topology(c: &mut Criterion) {
+    let (topology, source, anchors, candidates) = latency_topology_fixture(16, 64);
+    let now_millis = 10_000;
+    let mut observed = topology.clone();
+    let mut group = c.benchmark_group("latency_topology");
+
+    group.bench_function("observe_existing_relationship", |b| {
+        b.iter(|| {
+            black_box(observed.observe(
+                black_box(source),
+                black_box(anchors[0]),
+                black_box(12_345),
+                black_box(now_millis),
+            ))
+        });
+    });
+    group.bench_function("estimate_direct_relationship", |b| {
+        b.iter(|| {
+            black_box(
+                topology
+                    .estimate(
+                        black_box(source),
+                        black_box(anchors[0]),
+                        black_box(now_millis),
+                    )
+                    .unwrap(),
+            )
+        });
+    });
+    group.bench_function("estimate_16_anchors", |b| {
+        b.iter(|| {
+            black_box(
+                topology
+                    .estimate(
+                        black_box(source),
+                        black_box(candidates[0]),
+                        black_box(now_millis),
+                    )
+                    .unwrap(),
+            )
+        });
+    });
+    group.bench_function("closest_of_64_16_anchors", |b| {
+        b.iter(|| {
+            black_box(
+                topology
+                    .closest_peer(
+                        black_box(source),
+                        candidates.iter().copied(),
+                        black_box(now_millis),
+                    )
+                    .unwrap(),
+            )
+        });
+    });
+    group.finish();
+}
+
+fn latency_topology_fixture(
+    anchor_count: usize,
+    candidate_count: usize,
+) -> (LatencyTopology, PubKey, Vec<PubKey>, Vec<PubKey>) {
+    let source = topology_key(1);
+    let anchors = (0..anchor_count)
+        .map(|index| topology_key(2 + index as u64))
+        .collect::<Vec<_>>();
+    let candidates = (0..candidate_count)
+        .map(|index| topology_key(1_000 + index as u64))
+        .collect::<Vec<_>>();
+    let mut points = BTreeMap::new();
+    points.insert(source, (1_000.0, 2_000.0));
+    for (index, anchor) in anchors.iter().enumerate() {
+        let angle = std::f64::consts::TAU * index as f64 / anchor_count as f64;
+        points.insert(*anchor, (20_000.0 * angle.cos(), 20_000.0 * angle.sin()));
+    }
+    for (index, candidate) in candidates.iter().enumerate() {
+        points.insert(
+            *candidate,
+            (
+                -12_000.0 + (index % 16) as f64 * 1_500.0,
+                -8_000.0 + (index / 16) as f64 * 4_000.0,
+            ),
+        );
+    }
+
+    let mut topology = LatencyTopology::default();
+    for anchor in &anchors {
+        observe_topology_distance(&mut topology, &points, source, *anchor);
+    }
+    for candidate in &candidates {
+        for anchor in &anchors {
+            observe_topology_distance(&mut topology, &points, *candidate, *anchor);
+        }
+    }
+    for first in 0..anchors.len() {
+        for second in (first + 1)..anchors.len() {
+            observe_topology_distance(&mut topology, &points, anchors[first], anchors[second]);
+        }
+    }
+    (topology, source, anchors, candidates)
+}
+
+fn observe_topology_distance(
+    topology: &mut LatencyTopology,
+    points: &BTreeMap<PubKey, (f64, f64)>,
+    first: PubKey,
+    second: PubKey,
+) {
+    let first_point = points[&first];
+    let second_point = points[&second];
+    let distance = (first_point.0 - second_point.0).hypot(first_point.1 - second_point.1);
+    topology.observe(first, second, distance.round() as u64, 10_000);
+}
+
+fn topology_key(value: u64) -> PubKey {
+    let mut bytes = [0; 32];
+    bytes[..8].copy_from_slice(&value.to_be_bytes());
+    PubKey(bytes)
+}
+
 criterion_group!(
     benches,
     bench_hash_and_block,
@@ -710,6 +830,7 @@ criterion_group!(
     bench_block_scaling,
     bench_filtered_transactions,
     bench_availability_gossip,
-    bench_fair_block_ordering
+    bench_fair_block_ordering,
+    bench_latency_topology
 );
 criterion_main!(benches);

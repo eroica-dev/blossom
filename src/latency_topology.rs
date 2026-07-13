@@ -8,6 +8,7 @@ use crate::crypto::PubKey;
 use crate::error::{BlossomError, Result};
 
 const PARTS_PER_MILLION: u64 = 1_000_000;
+const MAX_TRILATERATION_ANCHORS: usize = 8;
 
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LatencyTopologyConfig {
@@ -82,6 +83,16 @@ pub struct ClosestPeer {
 pub struct LatencyTopology {
     config: LatencyTopologyConfig,
     relationships: BTreeMap<(PubKey, PubKey), LatencyRelationship>,
+}
+
+/// A request-scoped, symmetric view of fresh RTT observations.
+///
+/// Derived topology is intentionally not retained: observations and metadata
+/// merges stay cheap, while one estimate or source-selection request pays for
+/// exactly one view construction.
+struct FreshLatencyView {
+    distances: BTreeMap<(PubKey, PubKey), u64>,
+    nodes: BTreeSet<PubKey>,
 }
 
 impl Default for LatencyTopology {
@@ -217,68 +228,12 @@ impl LatencyTopology {
         now_millis: u64,
     ) -> Option<LatencyEstimate> {
         if source == peer {
-            return Some(LatencyEstimate {
-                source,
-                peer,
-                rtt_micros: 0,
-                lower_bound_micros: 0,
-                upper_bound_micros: 0,
-                method: LatencyEstimateMethod::Direct,
-                anchors: Vec::new(),
-            });
+            return Some(direct_estimate(source, peer, 0));
         }
-        if let Some(distance) = self.distance(source, peer, now_millis) {
-            return Some(LatencyEstimate {
-                source,
-                peer,
-                rtt_micros: distance,
-                lower_bound_micros: distance,
-                upper_bound_micros: distance,
-                method: LatencyEstimateMethod::Direct,
-                anchors: Vec::new(),
-            });
+        if let Some(distance) = self.fresh_direct_distance(source, peer, now_millis) {
+            return Some(direct_estimate(source, peer, distance));
         }
-
-        let common = self.common_anchors(source, peer, now_millis);
-        if common.is_empty() {
-            return None;
-        }
-        let (lower, upper) = self.triangle_bounds(source, peer, &common, now_millis)?;
-
-        let mut best = None::<(f64, f64, [PubKey; 3])>;
-        for first in 0..common.len() {
-            for second in (first + 1)..common.len() {
-                for third in (second + 1)..common.len() {
-                    let anchors = [common[first], common[second], common[third]];
-                    let Some((estimate, residual)) =
-                        self.trilaterated_distance(source, peer, anchors, now_millis)
-                    else {
-                        continue;
-                    };
-                    if best.is_none_or(|(_, best_residual, _)| residual < best_residual) {
-                        best = Some((estimate, residual, anchors));
-                    }
-                }
-            }
-        }
-
-        let (rtt_micros, method, anchors) = match best {
-            Some((estimate, _, anchors)) => (
-                f64_to_u64(estimate).clamp(lower, upper),
-                LatencyEstimateMethod::Trilaterated,
-                anchors.to_vec(),
-            ),
-            None => (upper, LatencyEstimateMethod::TriangleBounds, common),
-        };
-        Some(LatencyEstimate {
-            source,
-            peer,
-            rtt_micros,
-            lower_bound_micros: lower,
-            upper_bound_micros: upper,
-            method,
-            anchors,
-        })
+        FreshLatencyView::from_topology(self, now_millis).estimate(source, peer)
     }
 
     pub fn closest_peer(
@@ -287,18 +242,18 @@ impl LatencyTopology {
         peers: impl IntoIterator<Item = PubKey>,
         now_millis: u64,
     ) -> Option<ClosestPeer> {
-        peers
-            .into_iter()
-            .filter_map(|peer| {
-                self.estimate(source, peer, now_millis)
-                    .map(|estimate| ClosestPeer { peer, estimate })
-            })
-            .min_by_key(|choice| (choice.estimate.rtt_micros, choice.peer))
+        let mut peers = peers.into_iter().peekable();
+        peers.peek()?;
+        FreshLatencyView::from_topology(self, now_millis).closest_peer(source, peers)
     }
 
-    fn distance(&self, first: PubKey, second: PubKey, now_millis: u64) -> Option<u64> {
-        let forward = self.fresh_relationship(first, second, now_millis);
-        let reverse = self.fresh_relationship(second, first, now_millis);
+    fn fresh_direct_distance(&self, first: PubKey, second: PubKey, now_millis: u64) -> Option<u64> {
+        let fresh = |relationship: &&LatencyRelationship| {
+            now_millis.saturating_sub(relationship.observed_at_millis)
+                <= self.config.max_observation_age_millis
+        };
+        let forward = self.relationships.get(&(first, second)).filter(fresh);
+        let reverse = self.relationships.get(&(second, first)).filter(fresh);
         match (forward, reverse) {
             (Some(forward), Some(reverse)) => Some(
                 ((u128::from(forward.rtt_ewma_micros) + u128::from(reverse.rtt_ewma_micros)) / 2)
@@ -308,101 +263,6 @@ impl LatencyTopology {
                 Some(relationship.rtt_ewma_micros)
             }
             (None, None) => None,
-        }
-    }
-
-    fn fresh_relationship(
-        &self,
-        source: PubKey,
-        peer: PubKey,
-        now_millis: u64,
-    ) -> Option<&LatencyRelationship> {
-        self.relationships
-            .get(&(source, peer))
-            .filter(|relationship| {
-                now_millis.saturating_sub(relationship.observed_at_millis)
-                    <= self.config.max_observation_age_millis
-            })
-    }
-
-    fn common_anchors(&self, source: PubKey, peer: PubKey, now_millis: u64) -> Vec<PubKey> {
-        self.nodes()
-            .into_iter()
-            .filter(|anchor| {
-                *anchor != source
-                    && *anchor != peer
-                    && self.distance(source, *anchor, now_millis).is_some()
-                    && self.distance(peer, *anchor, now_millis).is_some()
-            })
-            .collect()
-    }
-
-    fn nodes(&self) -> BTreeSet<PubKey> {
-        self.relationships
-            .values()
-            .flat_map(|relationship| [relationship.source, relationship.peer])
-            .collect()
-    }
-
-    fn triangle_bounds(
-        &self,
-        source: PubKey,
-        peer: PubKey,
-        anchors: &[PubKey],
-        now_millis: u64,
-    ) -> Option<(u64, u64)> {
-        let mut lower = 0;
-        let mut upper = u64::MAX;
-        for anchor in anchors {
-            let source_distance = self.distance(source, *anchor, now_millis)?;
-            let peer_distance = self.distance(peer, *anchor, now_millis)?;
-            lower = lower.max(source_distance.abs_diff(peer_distance));
-            upper = upper.min(source_distance.saturating_add(peer_distance));
-        }
-        (lower <= upper).then_some((lower, upper))
-    }
-
-    fn trilaterated_distance(
-        &self,
-        source: PubKey,
-        peer: PubKey,
-        anchors: [PubKey; 3],
-        now_millis: u64,
-    ) -> Option<(f64, f64)> {
-        let ab = self.distance(anchors[0], anchors[1], now_millis)? as f64;
-        let ac = self.distance(anchors[0], anchors[2], now_millis)? as f64;
-        let bc = self.distance(anchors[1], anchors[2], now_millis)? as f64;
-        let anchor_c = point_from_two_distances(ac, bc, ab)?;
-        if anchor_c.1 <= f64::EPSILON {
-            return None;
-        }
-
-        let source_point =
-            self.locate_against_anchors(source, anchors, ab, anchor_c, now_millis)?;
-        let peer_point = self.locate_against_anchors(peer, anchors, ab, anchor_c, now_millis)?;
-        let estimate = euclidean(source_point.0, peer_point.0);
-        Some((estimate, source_point.1 + peer_point.1))
-    }
-
-    fn locate_against_anchors(
-        &self,
-        node: PubKey,
-        anchors: [PubKey; 3],
-        ab: f64,
-        anchor_c: (f64, f64),
-        now_millis: u64,
-    ) -> Option<((f64, f64), f64)> {
-        let distance_a = self.distance(node, anchors[0], now_millis)? as f64;
-        let distance_b = self.distance(node, anchors[1], now_millis)? as f64;
-        let distance_c = self.distance(node, anchors[2], now_millis)? as f64;
-        let point = point_from_two_distances(distance_a, distance_b, ab)?;
-        let positive_error = (euclidean(point, anchor_c) - distance_c).abs();
-        let negative = (point.0, -point.1);
-        let negative_error = (euclidean(negative, anchor_c) - distance_c).abs();
-        if negative_error < positive_error {
-            Some((negative, negative_error))
-        } else {
-            Some((point, positive_error))
         }
     }
 
@@ -443,6 +303,250 @@ impl LatencyTopology {
             }
         }
         Ok(())
+    }
+}
+
+impl FreshLatencyView {
+    fn from_topology(topology: &LatencyTopology, now_millis: u64) -> Self {
+        let mut aggregates = BTreeMap::<(PubKey, PubKey), (u128, u8)>::new();
+        let mut nodes = BTreeSet::new();
+        for relationship in topology.relationships.values().filter(|relationship| {
+            now_millis.saturating_sub(relationship.observed_at_millis)
+                <= topology.config.max_observation_age_millis
+        }) {
+            nodes.insert(relationship.source);
+            nodes.insert(relationship.peer);
+            let aggregate = aggregates
+                .entry(ordered_pair(relationship.source, relationship.peer))
+                .or_default();
+            aggregate.0 += u128::from(relationship.rtt_ewma_micros);
+            aggregate.1 += 1;
+        }
+        let distances = aggregates
+            .into_iter()
+            .map(|(pair, (sum, count))| (pair, (sum / u128::from(count)) as u64))
+            .collect();
+        Self { distances, nodes }
+    }
+
+    fn estimate(&self, source: PubKey, peer: PubKey) -> Option<LatencyEstimate> {
+        if source == peer {
+            return Some(direct_estimate(source, peer, 0));
+        }
+        if let Some(distance) = self.distance(source, peer) {
+            return Some(direct_estimate(source, peer, distance));
+        }
+
+        let common = self.common_anchors(source, peer);
+        if common.is_empty() {
+            return None;
+        }
+        let (lower, upper) = self.triangle_bounds(source, peer, &common)?;
+        let trilateration_anchors = self.select_trilateration_anchors(source, peer, &common);
+
+        let mut best = None::<(f64, f64, [PubKey; 3])>;
+        for first in 0..trilateration_anchors.len() {
+            for second in (first + 1)..trilateration_anchors.len() {
+                for third in (second + 1)..trilateration_anchors.len() {
+                    let anchors = [
+                        trilateration_anchors[first],
+                        trilateration_anchors[second],
+                        trilateration_anchors[third],
+                    ];
+                    let Some((estimate, residual)) =
+                        self.trilaterated_distance(source, peer, anchors)
+                    else {
+                        continue;
+                    };
+                    if best.is_none_or(|(_, best_residual, _)| residual < best_residual) {
+                        best = Some((estimate, residual, anchors));
+                    }
+                }
+            }
+        }
+
+        let (rtt_micros, method, anchors) = match best {
+            Some((estimate, _, anchors)) => (
+                f64_to_u64(estimate).clamp(lower, upper),
+                LatencyEstimateMethod::Trilaterated,
+                anchors.to_vec(),
+            ),
+            None => (upper, LatencyEstimateMethod::TriangleBounds, common),
+        };
+        Some(LatencyEstimate {
+            source,
+            peer,
+            rtt_micros,
+            lower_bound_micros: lower,
+            upper_bound_micros: upper,
+            method,
+            anchors,
+        })
+    }
+
+    fn closest_peer(
+        &self,
+        source: PubKey,
+        peers: impl IntoIterator<Item = PubKey>,
+    ) -> Option<ClosestPeer> {
+        peers
+            .into_iter()
+            .filter_map(|peer| {
+                self.estimate(source, peer)
+                    .map(|estimate| ClosestPeer { peer, estimate })
+            })
+            .min_by_key(|choice| (choice.estimate.rtt_micros, choice.peer))
+    }
+
+    fn distance(&self, first: PubKey, second: PubKey) -> Option<u64> {
+        if first == second {
+            return Some(0);
+        }
+        self.distances.get(&ordered_pair(first, second)).copied()
+    }
+
+    fn common_anchors(&self, source: PubKey, peer: PubKey) -> Vec<PubKey> {
+        self.nodes
+            .iter()
+            .copied()
+            .filter(|anchor| {
+                *anchor != source
+                    && *anchor != peer
+                    && self.distance(source, *anchor).is_some()
+                    && self.distance(peer, *anchor).is_some()
+            })
+            .collect()
+    }
+
+    fn triangle_bounds(
+        &self,
+        source: PubKey,
+        peer: PubKey,
+        anchors: &[PubKey],
+    ) -> Option<(u64, u64)> {
+        let mut lower = 0;
+        let mut upper = u64::MAX;
+        for anchor in anchors {
+            let source_distance = self.distance(source, *anchor)?;
+            let peer_distance = self.distance(peer, *anchor)?;
+            lower = lower.max(source_distance.abs_diff(peer_distance));
+            upper = upper.min(source_distance.saturating_add(peer_distance));
+        }
+        (lower <= upper).then_some((lower, upper))
+    }
+
+    fn select_trilateration_anchors(
+        &self,
+        source: PubKey,
+        peer: PubKey,
+        common: &[PubKey],
+    ) -> Vec<PubKey> {
+        if common.len() <= MAX_TRILATERATION_ANCHORS {
+            return common.to_vec();
+        }
+
+        let mut remaining = common.to_vec();
+        let first_index = remaining
+            .iter()
+            .enumerate()
+            .max_by(|(_, first), (_, second)| {
+                self.endpoint_span(source, peer, **first)
+                    .cmp(&self.endpoint_span(source, peer, **second))
+                    .then_with(|| second.cmp(first))
+            })
+            .map(|(index, _)| index)
+            .unwrap_or_default();
+        let mut selected = vec![remaining.remove(first_index)];
+
+        while selected.len() < MAX_TRILATERATION_ANCHORS && !remaining.is_empty() {
+            let next_index = remaining
+                .iter()
+                .enumerate()
+                .max_by(|(_, first), (_, second)| {
+                    self.anchor_spread(**first, &selected)
+                        .cmp(&self.anchor_spread(**second, &selected))
+                        .then_with(|| second.cmp(first))
+                })
+                .map(|(index, _)| index)
+                .unwrap_or_default();
+            selected.push(remaining.remove(next_index));
+        }
+        selected
+    }
+
+    fn endpoint_span(&self, source: PubKey, peer: PubKey, anchor: PubKey) -> u64 {
+        self.distance(source, anchor)
+            .unwrap_or_default()
+            .saturating_add(self.distance(peer, anchor).unwrap_or_default())
+    }
+
+    fn anchor_spread(&self, candidate: PubKey, selected: &[PubKey]) -> u64 {
+        selected
+            .iter()
+            .filter_map(|anchor| self.distance(candidate, *anchor))
+            .min()
+            .unwrap_or_default()
+    }
+
+    fn trilaterated_distance(
+        &self,
+        source: PubKey,
+        peer: PubKey,
+        anchors: [PubKey; 3],
+    ) -> Option<(f64, f64)> {
+        let ab = self.distance(anchors[0], anchors[1])? as f64;
+        let ac = self.distance(anchors[0], anchors[2])? as f64;
+        let bc = self.distance(anchors[1], anchors[2])? as f64;
+        let anchor_c = point_from_two_distances(ac, bc, ab)?;
+        if anchor_c.1 <= f64::EPSILON {
+            return None;
+        }
+
+        let source_point = self.locate_against_anchors(source, anchors, ab, anchor_c)?;
+        let peer_point = self.locate_against_anchors(peer, anchors, ab, anchor_c)?;
+        let estimate = euclidean(source_point.0, peer_point.0);
+        Some((estimate, source_point.1 + peer_point.1))
+    }
+
+    fn locate_against_anchors(
+        &self,
+        node: PubKey,
+        anchors: [PubKey; 3],
+        ab: f64,
+        anchor_c: (f64, f64),
+    ) -> Option<((f64, f64), f64)> {
+        let distance_a = self.distance(node, anchors[0])? as f64;
+        let distance_b = self.distance(node, anchors[1])? as f64;
+        let distance_c = self.distance(node, anchors[2])? as f64;
+        let point = point_from_two_distances(distance_a, distance_b, ab)?;
+        let positive_error = (euclidean(point, anchor_c) - distance_c).abs();
+        let negative = (point.0, -point.1);
+        let negative_error = (euclidean(negative, anchor_c) - distance_c).abs();
+        if negative_error < positive_error {
+            Some((negative, negative_error))
+        } else {
+            Some((point, positive_error))
+        }
+    }
+}
+
+fn ordered_pair(first: PubKey, second: PubKey) -> (PubKey, PubKey) {
+    if first <= second {
+        (first, second)
+    } else {
+        (second, first)
+    }
+}
+
+fn direct_estimate(source: PubKey, peer: PubKey, distance: u64) -> LatencyEstimate {
+    LatencyEstimate {
+        source,
+        peer,
+        rtt_micros: distance,
+        lower_bound_micros: distance,
+        upper_bound_micros: distance,
+        method: LatencyEstimateMethod::Direct,
+        anchors: Vec::new(),
     }
 }
 
@@ -624,5 +728,62 @@ mod tests {
         assert_eq!(target.merge_metadata(key(1), &metadata, 50).unwrap(), 2);
         assert_eq!(target.merge_metadata(key(1), &metadata, 50).unwrap(), 0);
         assert!(target.merge_metadata(key(2), &metadata, 50).is_err());
+    }
+
+    #[test]
+    fn bounds_trilateration_work_with_many_common_anchors() {
+        let mut topology = LatencyTopology::default();
+        let source = PubKey([200; 32]);
+        let peer = PubKey([201; 32]);
+        let source_point = (2_000.0, 3_000.0);
+        let peer_point = (8_000.0, 7_000.0);
+        let anchors = (0..24)
+            .map(|index| {
+                let angle = std::f64::consts::TAU * f64::from(index) / 24.0;
+                (
+                    key(index + 1),
+                    (20_000.0 * angle.cos(), 20_000.0 * angle.sin()),
+                )
+            })
+            .collect::<Vec<_>>();
+
+        for (anchor, point) in &anchors {
+            topology.observe(
+                source,
+                *anchor,
+                f64_to_u64(euclidean(source_point, *point)),
+                10_000,
+            );
+            topology.observe(
+                peer,
+                *anchor,
+                f64_to_u64(euclidean(peer_point, *point)),
+                10_000,
+            );
+        }
+        for first in 0..anchors.len() {
+            for second in (first + 1)..anchors.len() {
+                topology.observe(
+                    anchors[first].0,
+                    anchors[second].0,
+                    f64_to_u64(euclidean(anchors[first].1, anchors[second].1)),
+                    10_000,
+                );
+            }
+        }
+
+        let view = FreshLatencyView::from_topology(&topology, 10_000);
+        let common = view.common_anchors(source, peer);
+        assert_eq!(common.len(), 24);
+        assert_eq!(
+            view.select_trilateration_anchors(source, peer, &common)
+                .len(),
+            MAX_TRILATERATION_ANCHORS
+        );
+
+        let estimate = view.estimate(source, peer).unwrap();
+        assert_eq!(estimate.method, LatencyEstimateMethod::Trilaterated);
+        assert_eq!(estimate.anchors.len(), 3);
+        assert!(estimate.rtt_micros.abs_diff(7_211) <= 2);
     }
 }
