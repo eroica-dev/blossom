@@ -1,3 +1,5 @@
+use std::time::{Duration, Instant};
+
 use crate::address_book::Service;
 #[cfg(feature = "availability-gossip")]
 use crate::availability::{
@@ -14,6 +16,12 @@ use crate::wire::{
 
 #[derive(Clone, Debug, Default)]
 pub struct TcpServiceClient;
+
+#[derive(Clone, Debug)]
+pub struct TimedNodePong {
+    pub pong: NodePong,
+    pub rtt: Duration,
+}
 
 impl TcpServiceClient {
     pub fn new() -> Self {
@@ -33,6 +41,15 @@ impl TcpServiceClient {
                 response.kind()
             ))),
         }
+    }
+
+    pub async fn timed_ping(&self, service: &Service, ping: NodePing) -> Result<TimedNodePong> {
+        let started = Instant::now();
+        let pong = self.ping(service, ping).await?;
+        Ok(TimedNodePong {
+            pong,
+            rtt: started.elapsed(),
+        })
     }
 
     pub async fn application(

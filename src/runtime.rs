@@ -33,6 +33,9 @@ use crate::encounter::{EncounterOutcome, EncounterPhase, EncounterRecord, Encoun
 use crate::error::{BlossomError, Result};
 use crate::group::ConsensusGroupId;
 use crate::hash::{DoHash, HashType};
+use crate::latency_topology::{
+    ClosestPeer, LatencyEstimate, LatencyTopology, LatencyTopologyMetadataV1, unix_time_millis,
+};
 use crate::local_block::LocalBlock;
 use crate::membership::ConsensusNodeRemovalPolicy;
 use crate::messages::{MSGKey, Msg};
@@ -46,13 +49,14 @@ use crate::round_skip::{
     DataDisseminationManifest, FutureRoundAssistDecision, FutureRoundAssistInput,
     FutureRoundAssistKind, RoundSkipVote,
 };
+use crate::service_client::TcpServiceClient;
 use crate::state::{
     Epoch, EpochBody, EpochChain, LocalState, PendingDispatch, RoundSkipKey, TempQuorum,
     configured_max_pending_raw_dispatch_bytes,
     configured_max_pending_raw_dispatch_bytes_per_sender,
 };
 use crate::telemetry::{TelemetryEvent, TelemetryHandle};
-use crate::wire::{HotDispatch, WireRequest};
+use crate::wire::{HotDispatch, NodePing, NodePong, WireRequest};
 
 #[derive(Debug, Clone)]
 pub struct RuntimeConfig {
@@ -166,6 +170,7 @@ struct RuntimeInner {
     #[cfg(feature = "availability-gossip")]
     availability: RwLock<AvailabilityStore>,
     address_book: RwLock<AddressBook>,
+    latency_topology: RwLock<LatencyTopology>,
     signer: Option<SecretSigner>,
     trust_mode: TrustMode,
     mode: RuntimeMode,
@@ -473,6 +478,7 @@ impl NodeRuntime {
                 #[cfg(feature = "availability-gossip")]
                 availability: RwLock::new(AvailabilityStore::default()),
                 address_book: RwLock::new(config.address_book),
+                latency_topology: RwLock::new(LatencyTopology::default()),
                 signer,
                 trust_mode: config.trust_mode,
                 mode: config.mode,
@@ -556,6 +562,82 @@ impl NodeRuntime {
             .expect("address book lock poisoned")
             .clone()
             .into_services()
+    }
+
+    /// Records a direct RTT measurement owned by this node.
+    pub fn observe_peer_latency(
+        &self,
+        peer: PubKey,
+        rtt_micros: u64,
+        observed_at_millis: u64,
+    ) -> bool {
+        let source = self.self_node().public_key();
+        self.inner
+            .latency_topology
+            .write()
+            .expect("latency topology lock poisoned")
+            .observe(source, peer, rtt_micros, observed_at_millis)
+    }
+
+    /// Measures a live peer RTT and records it after checking endpoint identity.
+    pub async fn ping_and_observe_latency(
+        &self,
+        client: &TcpServiceClient,
+        service: &Service,
+        ping: NodePing,
+    ) -> Result<NodePong> {
+        let timed = client.timed_ping(service, ping).await?;
+        if timed.pong.public_key != service.public_key {
+            return Err(BlossomError::KeyMismatch);
+        }
+        self.observe_peer_latency(
+            timed.pong.public_key,
+            timed.rtt.as_micros().min(u128::from(u64::MAX)) as u64,
+            unix_time_millis(),
+        );
+        Ok(timed.pong)
+    }
+
+    /// Exports bounded, reporter-owned topology metadata.
+    pub fn latency_topology_metadata(&self) -> LatencyTopologyMetadataV1 {
+        let reporter = self.self_node().public_key();
+        self.inner
+            .latency_topology
+            .read()
+            .expect("latency topology lock poisoned")
+            .metadata(reporter, unix_time_millis())
+    }
+
+    /// Merges topology metadata after binding it to an authenticated peer key.
+    pub fn merge_latency_topology_metadata(
+        &self,
+        authenticated_reporter: PubKey,
+        metadata: &LatencyTopologyMetadataV1,
+    ) -> Result<usize> {
+        self.inner
+            .latency_topology
+            .write()
+            .expect("latency topology lock poisoned")
+            .merge_metadata(authenticated_reporter, metadata, unix_time_millis())
+    }
+
+    /// Returns a direct, trilaterated, or bounded RTT estimate.
+    pub fn estimate_peer_latency(&self, source: PubKey, peer: PubKey) -> Option<LatencyEstimate> {
+        self.inner
+            .latency_topology
+            .read()
+            .expect("latency topology lock poisoned")
+            .estimate(source, peer, unix_time_millis())
+    }
+
+    /// Selects the closest candidate according to the live geometric map.
+    pub fn closest_peer(&self, peers: impl IntoIterator<Item = PubKey>) -> Option<ClosestPeer> {
+        let source = self.self_node().public_key();
+        self.inner
+            .latency_topology
+            .read()
+            .expect("latency topology lock poisoned")
+            .closest_peer(source, peers, unix_time_millis())
     }
 
     pub fn epochchain(&self) -> EpochChain {

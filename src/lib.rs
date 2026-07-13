@@ -28,6 +28,7 @@ pub mod error;
 pub mod group;
 pub mod harness;
 pub mod hash;
+pub mod latency_topology;
 pub mod local_block;
 pub mod membership;
 pub mod messages;
@@ -104,6 +105,10 @@ pub use hash::{
     validate_protocol_feature_registry,
 };
 pub use indextreemap::{IndexTreeMap, SharedIndexTreeMap};
+pub use latency_topology::{
+    ClosestPeer, LatencyEstimate, LatencyEstimateMethod, LatencyRelationship, LatencyTopology,
+    LatencyTopologyConfig, LatencyTopologyMetadataV1, unix_time_millis,
+};
 pub use local_block::LocalBlock;
 pub use membership::{
     ConsensusNodeAdmissionPlan, ConsensusNodeRemovalDecision, ConsensusNodeRemovalPlan,
@@ -128,7 +133,7 @@ pub use runtime::{
     PrefillDispatchPlan, ReconnectAdmissionDecision, ReconnectAdmissionEvidence, RuntimeConfig,
     RuntimeMode, RuntimeSnapshotV1, TrustMode, genesis_epoch, genesis_epoch_for_group,
 };
-pub use service_client::TcpServiceClient;
+pub use service_client::{TcpServiceClient, TimedNodePong};
 pub use state::{
     DEFAULT_MAX_PENDING_RAW_DISPATCH_BYTES, DEFAULT_MAX_PENDING_RAW_DISPATCH_BYTES_PER_SENDER,
     Epoch, EpochBody, EpochChain, EpochNonce, LocalState, MAX_PENDING_RAW_DISPATCH_BYTES_ENV,
