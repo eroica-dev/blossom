@@ -579,6 +579,17 @@ impl NodeRuntime {
             .observe(source, peer, rtt_micros, observed_at_millis)
     }
 
+    /// Returns the fresh directly observed RTT to `peer`, if one exists.
+    /// This lookup never performs topology reconstruction.
+    pub fn direct_peer_latency_micros(&self, peer: PubKey) -> Option<u64> {
+        let source = self.self_node().public_key();
+        self.inner
+            .latency_topology
+            .read()
+            .expect("latency topology lock poisoned")
+            .direct_rtt_micros(source, peer, unix_time_millis())
+    }
+
     /// Measures a live peer RTT and records it after checking endpoint identity.
     pub async fn ping_and_observe_latency(
         &self,

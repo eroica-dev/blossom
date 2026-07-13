@@ -236,6 +236,15 @@ impl LatencyTopology {
         FreshLatencyView::from_topology(self, now_millis).estimate(source, peer)
     }
 
+    /// Returns a fresh measured relationship without constructing a geometric
+    /// view or inferring an unmeasured path.
+    pub fn direct_rtt_micros(&self, source: PubKey, peer: PubKey, now_millis: u64) -> Option<u64> {
+        if source == peer {
+            return Some(0);
+        }
+        self.fresh_direct_distance(source, peer, now_millis)
+    }
+
     pub fn closest_peer(
         &self,
         source: PubKey,
@@ -697,7 +706,12 @@ mod tests {
     fn stale_relationships_do_not_inform_estimates() {
         let mut topology = LatencyTopology::default();
         topology.observe(key(1), key(2), 1_000, 1_000);
+        assert_eq!(
+            topology.direct_rtt_micros(key(1), key(2), 31_000),
+            Some(1_000)
+        );
         assert!(topology.estimate(key(1), key(2), 31_000).is_some());
+        assert_eq!(topology.direct_rtt_micros(key(1), key(2), 31_001), None);
         assert!(topology.estimate(key(1), key(2), 31_001).is_none());
         assert_eq!(topology.prune_stale(31_001), 1);
     }
