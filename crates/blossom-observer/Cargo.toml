@@ -1,0 +1,16 @@
+[package]
+name = "blossom-observer"
+version = "2.0.0-pre-release"
+edition = "2024"
+description = "Telemetry collector and analyzer for distributed Blossom protocol runs."
+license = "MIT"
+repository = "https://github.com/eden-dev-inc/blossom"
+homepage = "https://github.com/eden-dev-inc/blossom"
+documentation = "https://docs.rs/blossom-observer"
+
+[dependencies]
+blossom = { version = "2.0.0-pre-release", path = "../.." }
+clap = { version = "4.5", features = ["derive", "env"] }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.145"
+tokio = { version = "1.48", features = ["io-util", "macros", "net", "rt-multi-thread", "signal", "sync"] }

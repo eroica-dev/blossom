@@ -1,0 +1,10 @@
+[package]
+name = "blossom-creusot-threshold-proofs"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+creusot-std = "0.11"
+
+[workspace]

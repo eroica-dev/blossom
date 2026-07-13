@@ -1,0 +1,15 @@
+[package]
+name = "blossom-propagation"
+version = "2.0.0-pre-release"
+edition = "2024"
+description = "Feature-gated Blossom data-plane propagation policy primitives."
+license = "MIT"
+repository = "https://github.com/eden-dev-inc/blossom"
+homepage = "https://github.com/eden-dev-inc/blossom"
+documentation = "https://docs.rs/blossom-propagation"
+
+[features]
+default = ["latency-push"]
+adaptive = ["latency-push", "bandwidth-inventory"]
+bandwidth-inventory = []
+latency-push = []
