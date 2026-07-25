@@ -11,7 +11,7 @@ mod bench {
     use std::path::PathBuf;
 
     use blossom::{
-        SubsetGossipConfig, SubsetGossipEpochRow, SubsetGossipProtocolVersion,
+        QuorumSize, SubsetGossipConfig, SubsetGossipEpochRow, SubsetGossipProtocolVersion,
         SubsetLatencyDistribution, SubsetLatencyProfile, SubsetPrefillMode, run_subset_gossip,
     };
     use clap::{Parser, ValueEnum};
@@ -133,6 +133,7 @@ mod bench {
 
     pub fn main() -> MainResult<()> {
         let args = Args::parse();
+        QuorumSize::new(args.quorum_size)?;
         let base_config = SubsetGossipConfig::for_protocol_version(args.protocol_version.into());
         let config = SubsetGossipConfig {
             seed: args.seed,

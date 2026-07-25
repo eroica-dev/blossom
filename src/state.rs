@@ -9,8 +9,10 @@ use indextreemap::IndexTreeMap;
 use rs_merkle::{MerkleTree, algorithms::Sha256};
 use serde::{Deserialize, Deserializer, Serialize, Serializer, ser::SerializeStruct};
 
-use crate::algorithm::{select_quorums_from_index_tree, supermajority_count};
-use crate::block::Block;
+use crate::algorithm::{
+    ConsensusParameters, select_quorums_from_index_tree_with_size, supermajority_count,
+};
+use crate::block::{Block, Transaction};
 #[cfg(feature = "fair-block-ordering")]
 use crate::block::{fair_ordered_block_commitments, fair_ordered_blocks};
 use crate::blossom::{
@@ -219,7 +221,28 @@ impl LocalState {
         }
 
         if current_consensus.peers.len() > current_round as usize + 1 {
-            current_consensus.round = current_round + 1;
+            let next_round = current_round + 1;
+            let carried_blocks = current_consensus
+                .quorum
+                .get(&current_round)
+                .map(TempQuorum::canonical_verified_blocks)
+                .unwrap_or_default();
+            let next_peers = current_consensus.peers_with_us(next_round);
+            let next_quorum = current_consensus
+                .quorum
+                .entry(next_round)
+                .or_insert_with(|| {
+                    init_quorum(
+                        next_peers.len() as u32,
+                        &next_peers,
+                        &current_consensus.self_key,
+                    )
+                });
+            for (hash, block) in carried_blocks {
+                next_quorum.record_verified_block(hash, block);
+            }
+            next_quorum.verified_blocks_hash = Some(next_quorum.verified_blocks_hash());
+            current_consensus.round = next_round;
             return true;
         }
 
@@ -243,9 +266,11 @@ impl LocalState {
                     group_id: last_epoch.body.group_id,
                     verifiers,
                     last_epoch: *proposed_last_epoch_hash,
+                    previous_nonce: Some(last_epoch.body.nonce),
                     nonce: expected_nonce,
                     merkle_root: block_merkle_root(&blocks),
                     blocks,
+                    consensus_parameters: Some(last_epoch.body.effective_consensus_parameters()),
                 },
             }
         } else {
@@ -256,9 +281,11 @@ impl LocalState {
                     group_id: last_epoch.body.group_id,
                     verifiers: last_epoch.body.verifiers.clone(),
                     last_epoch: last_epoch.hash,
+                    previous_nonce: Some(last_epoch.body.nonce),
                     nonce: expected_nonce,
                     merkle_root: HashType::default(),
                     blocks: BTreeMap::default(),
+                    consensus_parameters: Some(last_epoch.body.effective_consensus_parameters()),
                 },
             }
         };
@@ -275,11 +302,12 @@ impl LocalState {
             return Vec::new();
         };
 
-        let peer_rounds = select_quorums_from_index_tree(
+        let peer_rounds = select_quorums_from_index_tree_with_size(
             &last_epoch.body.verifiers,
             &self.self_node.public_key(),
             *epoch_hash,
             self.self_node.shuffle,
+            last_epoch.body.effective_consensus_parameters().quorum_size,
         );
 
         peer_rounds
@@ -307,6 +335,23 @@ pub struct Epoch {
     pub body: EpochBody,
 }
 
+/// One opaque application transaction in a trusted epoch's deterministic
+/// BTree block-hash order.
+///
+/// The caller must obtain the epoch from its local trusted
+/// [`crate::NodeRuntime`] committed chain. This value is a replay/apply cursor,
+/// not a portable consensus certificate.
+#[derive(Debug, Clone)]
+pub struct TrustedOrderedTransaction {
+    pub epoch_hash: HashType,
+    pub epoch_nonce: Nonce,
+    pub previous_epoch_nonce: Option<Nonce>,
+    pub block_hash: HashType,
+    pub writer: PubKey,
+    pub transaction_index: u32,
+    pub transaction: Transaction,
+}
+
 impl Epoch {
     pub fn set_hash(&mut self) {
         self.hash = HashType::hash(&self.body.to_bytes());
@@ -330,6 +375,43 @@ impl Epoch {
 
         Ok(())
     }
+
+    /// Returns trusted application payloads in their immutable order.
+    ///
+    /// Trusted mode requires no block signatures or epoch certificate. Block
+    /// hashes, Merkle roots, and the epoch hash are still checked so accidental
+    /// corruption cannot silently alter the local order.
+    pub fn trusted_ordered_transactions(&self) -> Result<Vec<TrustedOrderedTransaction>> {
+        if self.hash != HashType::hash(&self.body.to_bytes()) {
+            return Err(BlossomError::InvalidBlockHash);
+        }
+        let transaction_count = self
+            .body
+            .blocks
+            .values()
+            .map(|block| block.body.txs.len())
+            .sum();
+        let mut ordered = Vec::with_capacity(transaction_count);
+        for (block_hash, block) in self.body.ordered_blocks() {
+            block.verify_unsigned_integrity_with_hash(*block_hash)?;
+            for (transaction_index, transaction) in block.body.txs.iter().enumerate() {
+                ordered.push(TrustedOrderedTransaction {
+                    epoch_hash: self.hash,
+                    epoch_nonce: self.body.nonce,
+                    previous_epoch_nonce: self.body.previous_nonce,
+                    block_hash: *block_hash,
+                    writer: block.body.validator,
+                    transaction_index: u32::try_from(transaction_index).map_err(|_| {
+                        BlossomError::InvalidConfiguration(
+                            "trusted block contains more than u32::MAX transactions".to_string(),
+                        )
+                    })?,
+                    transaction: transaction.clone(),
+                });
+            }
+        }
+        Ok(ordered)
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -337,9 +419,17 @@ pub struct EpochBody {
     pub group_id: ConsensusGroupId,
     pub verifiers: IndexTreeMap<PubKey, NodeIdentity>,
     pub last_epoch: HashType,
+    /// Explicit nonce linkage for every non-genesis epoch.
+    ///
+    /// `None` is retained only while decoding legacy epochs whose hash predates
+    /// this field. Newly-created non-genesis epochs always store `Some`.
+    pub previous_nonce: Option<Nonce>,
     pub nonce: Nonce,
     pub merkle_root: HashType,
     pub blocks: BTreeMap<HashType, Block>,
+    /// `None` is reserved for pre-parameter snapshots and means the legacy
+    /// branching factor of six. Newly-created epochs always store `Some`.
+    pub consensus_parameters: Option<ConsensusParameters>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -347,9 +437,13 @@ struct EpochBodySerde {
     group_id: ConsensusGroupId,
     verifiers: Vec<NodeIdentity>,
     last_epoch: HashType,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    previous_nonce: Option<Nonce>,
     nonce: Nonce,
     merkle_root: HashType,
     blocks: BTreeMap<HashType, Block>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    consensus_parameters: Option<ConsensusParameters>,
 }
 
 impl Serialize for EpochBody {
@@ -358,9 +452,11 @@ impl Serialize for EpochBody {
             group_id: self.group_id,
             verifiers: self.verifiers.values().cloned().collect(),
             last_epoch: self.last_epoch,
+            previous_nonce: self.previous_nonce,
             nonce: self.nonce,
             merkle_root: self.merkle_root,
             blocks: self.blocks.clone(),
+            consensus_parameters: self.consensus_parameters,
         }
         .serialize(serializer)
     }
@@ -377,9 +473,11 @@ impl<'de> Deserialize<'de> for EpochBody {
             group_id: decoded.group_id,
             verifiers,
             last_epoch: decoded.last_epoch,
+            previous_nonce: decoded.previous_nonce,
             nonce: decoded.nonce,
             merkle_root: decoded.merkle_root,
             blocks: decoded.blocks,
+            consensus_parameters: decoded.consensus_parameters,
         })
     }
 }
@@ -390,9 +488,11 @@ impl BorshSerialize for EpochBody {
         let verifiers = self.verifiers.values().cloned().collect::<Vec<_>>();
         BorshSerialize::serialize(&verifiers, writer)?;
         BorshSerialize::serialize(&self.last_epoch, writer)?;
+        BorshSerialize::serialize(&self.previous_nonce, writer)?;
         BorshSerialize::serialize(&self.nonce, writer)?;
         BorshSerialize::serialize(&self.merkle_root, writer)?;
-        BorshSerialize::serialize(&self.blocks, writer)
+        BorshSerialize::serialize(&self.blocks, writer)?;
+        BorshSerialize::serialize(&self.consensus_parameters, writer)
     }
 }
 
@@ -405,21 +505,29 @@ impl BorshDeserialize for EpochBody {
             verifiers.insert(node.public_key(), node);
         }
         let last_epoch = HashType::deserialize_reader(reader)?;
+        let previous_nonce = Option::<Nonce>::deserialize_reader(reader)?;
         let nonce = Nonce::deserialize_reader(reader)?;
         let merkle_root = HashType::deserialize_reader(reader)?;
         let blocks = BTreeMap::<HashType, Block>::deserialize_reader(reader)?;
+        let consensus_parameters = Option::<ConsensusParameters>::deserialize_reader(reader)?;
         Ok(Self {
             group_id,
             verifiers,
             last_epoch,
+            previous_nonce,
             nonce,
             merkle_root,
             blocks,
+            consensus_parameters,
         })
     }
 }
 
 impl EpochBody {
+    pub fn effective_consensus_parameters(&self) -> ConsensusParameters {
+        self.consensus_parameters.unwrap_or_default()
+    }
+
     pub fn application_states(&self) -> impl Iterator<Item = (&HashType, &PubKey, &[u8])> {
         #[cfg(feature = "fair-block-ordering")]
         {
@@ -463,6 +571,10 @@ impl EpochBody {
         let mut bytes = Vec::new();
         bytes.extend_from_slice(self.group_id.as_ref());
         bytes.extend_from_slice(self.last_epoch.as_ref());
+        if let Some(previous_nonce) = self.previous_nonce {
+            bytes.extend_from_slice(b"blossom/epoch-previous-nonce/v1");
+            bytes.extend_from_slice(&previous_nonce.to_le_bytes());
+        }
         bytes.extend_from_slice(&self.nonce.to_le_bytes());
         bytes.extend_from_slice(self.merkle_root.as_ref());
         for key in self.verifiers.keys() {
@@ -470,6 +582,11 @@ impl EpochBody {
         }
         for key in self.blocks.keys() {
             bytes.extend_from_slice(key.as_ref());
+        }
+        if let Some(parameters) = self.consensus_parameters {
+            bytes.extend_from_slice(b"blossom/epoch-consensus-parameters/v1");
+            bytes.extend_from_slice(&parameters.version.to_le_bytes());
+            bytes.extend_from_slice(&(parameters.quorum_size.get() as u64).to_le_bytes());
         }
         bytes
     }
@@ -597,6 +714,8 @@ pub struct TempQuorum {
     pub verification_sent: bool,
     pub proposals: PropCount,
     pub proposal_sent: bool,
+    pub pending_proposals: BTreeMap<PubKey, Proposal>,
+    pub pending_commits: BTreeMap<PubKey, Commit>,
     pub commit_senders: BTreeSet<PubKey>,
     pub commit_true_senders: BTreeSet<PubKey>,
     pub commit_sent: bool,
@@ -879,6 +998,22 @@ impl VerifCount {
             .iter()
             .find_map(|(hash, count)| (*count as u32 >= self.supermajority).then_some(*hash))
     }
+
+    /// Returns true while some verification hash can still reach the required
+    /// supermajority after every validator that has not voted casts a vote.
+    pub fn consensus_is_still_possible(&self) -> bool {
+        if self.consensus_hash().is_some() {
+            return true;
+        }
+        let received = self.verifications.len() as u32;
+        let remaining = self.quorum.saturating_sub(received);
+        if self.count.is_empty() {
+            return remaining >= self.supermajority;
+        }
+        self.count
+            .values()
+            .any(|count| u32::from(*count).saturating_add(remaining) >= self.supermajority)
+    }
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
@@ -1095,6 +1230,8 @@ pub fn init_quorum(quorum: u32, peers: &[PubKey], self_key: &PubKey) -> TempQuor
         verification_sent: false,
         proposals: init_proposals(quorum),
         proposal_sent: false,
+        pending_proposals: BTreeMap::new(),
+        pending_commits: BTreeMap::new(),
         commit_senders: BTreeSet::new(),
         commit_true_senders: BTreeSet::new(),
         commit_sent: false,
@@ -1670,8 +1807,28 @@ mod tests {
         assert!(state.advance_epoch(&genesis.hash, next_nonce, 0, true));
         let latest = state.epochchain.epochchain.last().unwrap();
         assert_eq!(latest.body.last_epoch, genesis.hash);
+        assert_eq!(latest.body.previous_nonce, Some(genesis.body.nonce));
         assert_eq!(latest.body.nonce, next_nonce);
         assert!(latest.body.blocks.contains_key(&block_hash));
+    }
+
+    #[test]
+    fn epoch_hash_commits_the_previous_nonce() {
+        let mut epoch = Epoch {
+            body: EpochBody {
+                last_epoch: HashType([1; 32]),
+                previous_nonce: Some(Nonce::new(7)),
+                nonce: Nonce::new(8),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        epoch.set_hash();
+        let first_hash = epoch.hash;
+
+        epoch.body.previous_nonce = Some(Nonce::new(6));
+        epoch.set_hash();
+        assert_ne!(epoch.hash, first_hash);
     }
 
     #[test]
@@ -1788,6 +1945,41 @@ mod tests {
         }
 
         assert_eq!(count.consensus_hash(), Some(blocks_hash));
+    }
+
+    #[test]
+    fn verification_count_only_becomes_impossible_after_enough_conflicting_votes() {
+        let first = HashType([3; 32]);
+        let second = HashType([4; 32]);
+        let mut count = init_verifications(9);
+
+        for index in 0..4 {
+            count.record(Verification {
+                header: Header {
+                    sender: PubKey([index; 32]),
+                    ..Default::default()
+                },
+                body: VerificationBody {
+                    blocks_hash: first,
+                    blocks: BTreeMap::new(),
+                },
+            });
+        }
+        assert!(count.consensus_is_still_possible());
+
+        for index in 4..9 {
+            count.record(Verification {
+                header: Header {
+                    sender: PubKey([index; 32]),
+                    ..Default::default()
+                },
+                body: VerificationBody {
+                    blocks_hash: second,
+                    blocks: BTreeMap::new(),
+                },
+            });
+        }
+        assert!(!count.consensus_is_still_possible());
     }
 
     #[test]

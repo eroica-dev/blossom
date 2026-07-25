@@ -33,21 +33,22 @@ pub enum BlossomError {
     ExternalService(String),
     Io(String),
     InvalidFrameSize(usize),
-    #[cfg(feature = "high-availability")]
+    InvalidQuorumSize(usize),
     InvalidHighAvailabilityNodeCount(usize),
-    #[cfg(feature = "high-availability")]
     EpochSealed {
         target: crate::nonce::Nonce,
         sealed: crate::nonce::Nonce,
         writable: crate::nonce::Nonce,
     },
-    #[cfg(feature = "high-availability")]
     WatermarkNotSealed {
         required: u64,
         sealed: u64,
     },
-    #[cfg(feature = "high-availability")]
     InvalidConfiguration(String),
+    ConsensusParametersMismatch {
+        configured: usize,
+        committed: usize,
+    },
     WireProtocol(String),
     FailedConsensus,
 }
@@ -84,12 +85,14 @@ impl fmt::Display for BlossomError {
             Self::ExternalService(message) => write!(f, "external service error: {message}"),
             Self::Io(message) => write!(f, "io error: {message}"),
             Self::InvalidFrameSize(size) => write!(f, "invalid frame size: {size} bytes"),
-            #[cfg(feature = "high-availability")]
+            Self::InvalidQuorumSize(size) => write!(
+                f,
+                "invalid Blossom quorum size {size}: expected an integer >= 3 divisible by 3"
+            ),
             Self::InvalidHighAvailabilityNodeCount(size) => write!(
                 f,
                 "invalid Blossom HA node count {size}: expected 2..=7 fixed identities"
             ),
-            #[cfg(feature = "high-availability")]
             Self::EpochSealed {
                 target,
                 sealed,
@@ -98,15 +101,18 @@ impl fmt::Display for BlossomError {
                 f,
                 "target epoch {target} is sealed at {sealed}; resubmit explicitly at writable epoch {writable}"
             ),
-            #[cfg(feature = "high-availability")]
             Self::WatermarkNotSealed { required, sealed } => write!(
                 f,
                 "required watermark {required} is not sealed; current sealed watermark is {sealed}"
             ),
-            #[cfg(feature = "high-availability")]
-            Self::InvalidConfiguration(message) => {
-                write!(f, "invalid configuration: {message}")
-            }
+            Self::InvalidConfiguration(message) => write!(f, "invalid configuration: {message}"),
+            Self::ConsensusParametersMismatch {
+                configured,
+                committed,
+            } => write!(
+                f,
+                "configured quorum size {configured} conflicts with committed quorum size {committed}"
+            ),
             Self::WireProtocol(message) => write!(f, "wire protocol error: {message}"),
             Self::FailedConsensus => write!(f, "failed consensus"),
         }

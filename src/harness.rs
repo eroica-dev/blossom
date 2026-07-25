@@ -5,12 +5,16 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::task::JoinHandle;
 
 use crate::address_book::{Service, ServiceKind};
+use crate::algorithm::{ConsensusParameters, QuorumSize};
 use crate::block::{Block, Transaction};
 use crate::crypto::{Keypair, SecKey};
 use crate::error::{BlossomError, Result};
+use crate::group::ConsensusGroupId;
 use crate::node::NodeIdentity;
 use crate::nonce::Nonce;
-use crate::runtime::{EpochTarget, RuntimeConfig, TrustMode, genesis_epoch};
+use crate::runtime::{
+    EpochTarget, RuntimeConfig, TrustMode, genesis_epoch_for_group_with_parameters,
+};
 use crate::tcp::{
     ConsensusDriverConfig, TcpConnection, TcpNode, TcpNodeMetrics, TcpNodeMetricsSnapshot,
     send_wire_frame, send_wire_request, send_wire_request_raw_response,
@@ -28,6 +32,8 @@ pub struct SimulatedNode {
     pub service: Service,
     pub keypair: Keypair,
     pub metrics: TcpNodeMetrics,
+    pub runtime: crate::NodeRuntime,
+    client: crate::TcpServiceClient,
     handle: JoinHandle<()>,
 }
 
@@ -56,7 +62,7 @@ impl SimulatedCluster {
     }
 
     pub async fn spawn_with_trust_mode(count: usize, trust_mode: TrustMode) -> Result<Self> {
-        Self::spawn_with_options(count, trust_mode, None).await
+        Self::spawn_with_options(count, trust_mode, None, QuorumSize::DEFAULT).await
     }
 
     pub async fn spawn_autonomous(count: usize) -> Result<Self> {
@@ -67,13 +73,37 @@ impl SimulatedCluster {
         count: usize,
         driver: ConsensusDriverConfig,
     ) -> Result<Self> {
-        Self::spawn_with_options(count, TrustMode::Verified, Some(driver)).await
+        Self::spawn_autonomous_with_config_and_quorum(count, driver, QuorumSize::DEFAULT).await
+    }
+
+    pub async fn spawn_autonomous_with_config_and_quorum(
+        count: usize,
+        driver: ConsensusDriverConfig,
+        quorum_size: QuorumSize,
+    ) -> Result<Self> {
+        Self::spawn_autonomous_with_config_trust_mode_and_quorum(
+            count,
+            driver,
+            TrustMode::Verified,
+            quorum_size,
+        )
+        .await
+    }
+
+    pub async fn spawn_autonomous_with_config_trust_mode_and_quorum(
+        count: usize,
+        driver: ConsensusDriverConfig,
+        trust_mode: TrustMode,
+        quorum_size: QuorumSize,
+    ) -> Result<Self> {
+        Self::spawn_with_options(count, trust_mode, Some(driver), quorum_size).await
     }
 
     async fn spawn_with_options(
         count: usize,
         trust_mode: TrustMode,
         driver: Option<ConsensusDriverConfig>,
+        quorum_size: QuorumSize,
     ) -> Result<Self> {
         if count == 0 {
             return Err(BlossomError::WireProtocol(
@@ -102,16 +132,20 @@ impl SimulatedCluster {
             entries.push((index, listener, keypair, identity));
         }
 
-        let genesis = genesis_epoch(entries.iter().map(|(_, _, _, identity)| {
-            NodeIdentity::new(
-                identity.public_key(),
-                None,
-                identity.protocol.clone(),
-                identity.host.clone(),
-                identity.port,
-                identity.shuffle,
-            )
-        }));
+        let genesis = genesis_epoch_for_group_with_parameters(
+            ConsensusGroupId::root(),
+            entries.iter().map(|(_, _, _, identity)| {
+                NodeIdentity::new(
+                    identity.public_key(),
+                    None,
+                    identity.protocol.clone(),
+                    identity.host.clone(),
+                    identity.port,
+                    identity.shuffle,
+                )
+            }),
+            ConsensusParameters::new(quorum_size),
+        );
         let services = entries
             .iter()
             .map(|(_, _, _, identity)| {
@@ -127,7 +161,7 @@ impl SimulatedCluster {
 
         let mut nodes = Vec::with_capacity(count);
         for (index, listener, keypair, identity) in entries {
-            let mut config = RuntimeConfig::new(identity.clone());
+            let mut config = RuntimeConfig::new(identity.clone()).with_quorum_size(quorum_size);
             config.genesis = Some(genesis.clone());
             config.trust_mode = trust_mode;
             if driver.is_some() {
@@ -138,6 +172,7 @@ impl SimulatedCluster {
             let runtime = crate::NodeRuntime::new(config);
             let metrics = TcpNodeMetrics::default();
             let node = TcpNode::with_metrics(runtime, metrics.clone());
+            let node_runtime = node.runtime.clone();
             let node_driver = driver.clone();
             let handle = tokio::spawn(async move {
                 let result = match node_driver {
@@ -154,6 +189,8 @@ impl SimulatedCluster {
                 service,
                 keypair,
                 metrics,
+                runtime: node_runtime,
+                client: crate::TcpServiceClient::new(),
                 handle,
             });
         }
@@ -185,7 +222,19 @@ impl SimulatedCluster {
     }
 
     pub async fn request(&self, index: usize, request: WireRequest) -> Result<WireResponse> {
-        self.nodes[index].request(request).await
+        self.nodes[index]
+            .client
+            .request(&self.nodes[index].service, &request)
+            .await
+    }
+
+    /// Returns an owned persistent client and service handle for concurrent
+    /// fanout without opening a fresh TCP connection for every request.
+    pub fn request_handle(&self, index: usize) -> (crate::TcpServiceClient, Service) {
+        (
+            self.nodes[index].client.clone(),
+            self.nodes[index].service.clone(),
+        )
     }
 
     pub async fn request_frame(&self, index: usize, frame: &EncodedFrame) -> Result<WireResponse> {
@@ -442,6 +491,10 @@ fn request_kind(request: &WireRequest) -> &'static str {
         WireRequest::Dispatch { .. } => "dispatch",
         WireRequest::PrefillDispatch(_) => "prefill_dispatch",
         WireRequest::Message(_) => "message",
+        #[cfg(feature = "high-availability")]
+        WireRequest::HighAvailability(_) => "high_availability",
+        #[cfg(feature = "high-availability")]
+        WireRequest::HighAvailabilityStatus => "high_availability_status",
         WireRequest::SendNonce(_) => "send_nonce",
         WireRequest::BlockNonce(_) => "block_nonce",
         WireRequest::GetBlock(_) => "get_block",
@@ -492,6 +545,25 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn autonomous_cluster_commits_configurable_quorum_parameters() {
+        let cluster = SimulatedCluster::spawn_autonomous_with_config_and_quorum(
+            3,
+            ConsensusDriverConfig::default(),
+            QuorumSize::new(9).unwrap(),
+        )
+        .await
+        .unwrap();
+        let response = cluster
+            .request(0, WireRequest::Ping(crate::NodePing::new(7)))
+            .await
+            .unwrap();
+        let WireResponse::Pong(pong) = response else {
+            panic!("expected pong");
+        };
+        assert_eq!(pong.quorum_size, 9);
+    }
+
+    #[tokio::test]
     async fn simulated_cluster_records_per_node_tcp_metrics() {
         let cluster = SimulatedCluster::spawn(2).await.unwrap();
 
@@ -499,13 +571,17 @@ mod tests {
             .request(1, WireRequest::Ping(crate::NodePing::new(7)))
             .await
             .unwrap();
+        cluster
+            .request(1, WireRequest::Ping(crate::NodePing::new(8)))
+            .await
+            .unwrap();
 
         let metrics = cluster.node_metrics();
         assert_eq!(metrics.len(), 2);
         assert_eq!(metrics[0].requests, 0);
         assert_eq!(metrics[1].connections, 1);
-        assert_eq!(metrics[1].requests, 1);
-        assert_eq!(metrics[1].responses, 1);
+        assert_eq!(metrics[1].requests, 2);
+        assert_eq!(metrics[1].responses, 2);
         assert_eq!(metrics[1].errors, 0);
         assert!(metrics[1].handler_nanos > 0);
     }

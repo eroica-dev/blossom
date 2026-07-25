@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, RwLock};
 
 use crate::address_book::{AddressBook, Service, ServiceKind};
-use crate::algorithm::select_quorums;
+use crate::algorithm::{QuorumSize, select_quorums_with_size};
 use crate::crypto::PubKey;
 use crate::error::{BlossomError, Result};
 use crate::hash::HashType;
@@ -107,6 +107,7 @@ pub struct OverlayRuntime {
 struct OverlayInner {
     self_node: NodeIdentity,
     address_book: RwLock<AddressBook>,
+    quorum_size: QuorumSize,
 }
 
 impl OverlayRuntime {
@@ -122,6 +123,7 @@ impl OverlayRuntime {
             inner: Arc::new(OverlayInner {
                 self_node: config.self_node,
                 address_book: RwLock::new(config.address_book),
+                quorum_size: config.quorum_size,
             }),
         }
     }
@@ -157,7 +159,12 @@ impl OverlayRuntime {
             .address_book
             .read()
             .expect("address book lock poisoned");
-        select_fanout_targets(&self.inner.self_node, &address_book, strategy)
+        select_fanout_targets_with_size(
+            &self.inner.self_node,
+            &address_book,
+            strategy,
+            self.inner.quorum_size,
+        )
     }
 
     pub async fn broadcast(&self, msg: Msg, strategy: FanOutStrategy) -> Result<BroadcastReport> {
@@ -185,10 +192,20 @@ pub(crate) fn add_self_consensus_service(address_book: &mut AddressBook, self_no
     ));
 }
 
+#[allow(dead_code)]
 pub(crate) fn select_fanout_targets(
     self_node: &NodeIdentity,
     address_book: &AddressBook,
     strategy: &FanOutStrategy,
+) -> Vec<Service> {
+    select_fanout_targets_with_size(self_node, address_book, strategy, QuorumSize::DEFAULT)
+}
+
+pub(crate) fn select_fanout_targets_with_size(
+    self_node: &NodeIdentity,
+    address_book: &AddressBook,
+    strategy: &FanOutStrategy,
+    quorum_size: QuorumSize,
 ) -> Vec<Service> {
     let self_key = self_node.public_key();
     let services = address_book
@@ -207,7 +224,7 @@ pub(crate) fn select_fanout_targets(
         } => {
             let mut keys = services.keys().copied().collect::<BTreeSet<_>>();
             keys.insert(self_key);
-            let quorums = select_quorums(keys, &self_key, *seed, *shuffle);
+            let quorums = select_quorums_with_size(keys, &self_key, *seed, *shuffle, quorum_size);
             match round {
                 Some(round) => quorums
                     .get(*round)
@@ -231,16 +248,29 @@ pub(crate) async fn broadcast_wire_request(
     request: WireRequest,
     targets: Vec<Service>,
 ) -> Result<BroadcastReport> {
+    const TRANSPORT_ATTEMPTS: usize = 3;
+
     let frame = EncodedFrame::encode_wire_request(&request)?;
     let mut handles = Vec::with_capacity(targets.len());
 
     for service in targets {
         let frame = frame.clone();
         let service_for_task = service.clone();
-        let handle =
-            tokio::spawn(
-                async move { send_wire_frame(service_for_task.socket_addr(), &frame).await },
-            );
+        let handle = tokio::spawn(async move {
+            let mut last_error = None;
+            for attempt in 0..TRANSPORT_ATTEMPTS {
+                match send_wire_frame(service_for_task.socket_addr(), &frame).await {
+                    Ok(response) => return Ok(response),
+                    Err(error) => {
+                        last_error = Some(error);
+                        if attempt + 1 < TRANSPORT_ATTEMPTS {
+                            tokio::task::yield_now().await;
+                        }
+                    }
+                }
+            }
+            Err(last_error.expect("at least one transport attempt is configured"))
+        });
         handles.push((service, handle));
     }
 

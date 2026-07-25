@@ -7,8 +7,8 @@ use tokio::net::TcpListener;
 
 use blossom::{
     AddressBook, BlossomError, ConsensusDriverConfig, NodeIdentity, NodeRuntime, PubKey,
-    Result as BlossomResult, RuntimeConfig, RuntimeSnapshotV1, SecKey, Service, TcpNode,
-    TelemetryHandle, TrustMode,
+    QuorumSize, Result as BlossomResult, RuntimeConfig, RuntimeSnapshotV1, SecKey, Service,
+    TcpNode, TelemetryHandle, TrustMode,
 };
 
 type MainResult<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
@@ -28,6 +28,8 @@ struct Args {
     secret_key: Option<String>,
     #[arg(long, env = "BLOSSOM_BLOCK_CAP", default_value_t = 100)]
     block_cap: usize,
+    #[arg(long, env = "BLOSSOM_QUORUM_SIZE")]
+    quorum_size: Option<QuorumSize>,
     #[arg(long, env = "BLOSSOM_TRUSTED", default_value_t = false)]
     trusted: bool,
     #[arg(long, value_name = "KIND:PUBKEY@HOST:PORT")]
@@ -68,8 +70,13 @@ async fn main() -> MainResult<()> {
     };
     let restored_from_snapshot = loaded_snapshot.is_some();
     let mut config = match loaded_snapshot {
-        Some(snapshot) => RuntimeConfig::from_snapshot(snapshot, self_node)?,
-        None => RuntimeConfig::new(self_node),
+        Some(snapshot) => RuntimeConfig::from_snapshot_with_quorum_override(
+            snapshot,
+            self_node,
+            args.quorum_size,
+        )?,
+        None => RuntimeConfig::new(self_node)
+            .with_quorum_size(args.quorum_size.unwrap_or(QuorumSize::DEFAULT)),
     };
     config.snapshot_path = args.state_snapshot.clone();
     config.block_store_path = args.block_store.clone();
@@ -100,7 +107,7 @@ async fn main() -> MainResult<()> {
         config.telemetry =
             TelemetryHandle::new(Arc::new(blossom::JsonlTcpTelemetrySink::connect(addr)?));
     }
-    let runtime = NodeRuntime::new(config);
+    let runtime = NodeRuntime::try_new(config)?;
 
     for spec in &args.service {
         let service = parse_service_spec(spec, &args.protocol)
@@ -114,6 +121,10 @@ async fn main() -> MainResult<()> {
 
     println!("blossom node listening on tcp://{bind}");
     println!("public key: {}", node.runtime.self_node().public_key());
+    println!(
+        "quorum branching factor: {}",
+        node.runtime.consensus_parameters().quorum_size
+    );
     if args.auto_consensus {
         let driver = ConsensusDriverConfig {
             interval: std::time::Duration::from_millis(args.consensus_driver_interval_ms),

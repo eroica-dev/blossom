@@ -14,6 +14,7 @@
 //! for topology-aware fan-out without epoch state, [`WireRequest`] for TCP
 //! integration, and [`Transaction`] plus [`Block`] for application bytes.
 
+pub mod active_active;
 pub mod address_book;
 pub mod admission;
 pub mod algorithm;
@@ -40,6 +41,7 @@ pub mod overlay;
 pub mod register;
 pub mod round_skip;
 pub mod runtime;
+pub mod safety;
 pub mod service_client;
 pub mod state;
 #[cfg(feature = "availability-gossip")]
@@ -55,16 +57,33 @@ pub mod wire;
 ))]
 pub use blossom_propagation as propagation;
 
+pub use active_active::{
+    ActiveActiveCommand, ActiveActiveConsistencyMode, AdmissionReceipt, AdmissionReceiptBody,
+    AdmittedCommand, AppliedBy, AppliedByTracker, ApplyProgress, AuthenticatedAvailabilityReceipt,
+    AvailabilityCertificate, AvailabilityReceiptBody, AvailabilityTrust, BatchReference,
+    BatchReferenceMetadata, ClientEpoch, ClientId, CommandBatch, CommandIdentity, CommandOperation,
+    CommandResult, DedupDecision, DeduplicationWindow, DurableAdmissionStore, GlobalOrderedEngine,
+    HolderMembership, LocalAdmissionCertificate, LocalAdmissionPolicy,
+    MAX_PIPELINED_AVAILABILITY_WINDOWS, MAX_REFERENCES_PER_ORDERING_WINDOW,
+    MembershipCutoverDisposition, Milestone, MilestoneEvent, OrderCertificate, OrderStatement,
+    OrderVote, OrderedApplication, OrderedBatch, ReadConsistency, ReplicaMembershipEpoch,
+    RetentionEvidence, SharedStateMachine, StoreGeneration, ValidatorGeneration, Watermark,
+    WriteMode, ordered_batch_references, ordered_batch_references_trusted,
+    required_cutover_disposition,
+};
 pub use address_book::{AddressBook, Service, ServiceKind};
 pub use admission::{
     NODE_ADMISSION_DOMAIN, NodeAdmission, NodeAdmissionBody, RECONNECT_VOTE_DOMAIN, ReconnectVote,
     ReconnectVoteBody,
 };
 pub use algorithm::{
-    QUORUM_SIZE, SUPERMAJORITY, byzantine_fault_bound, distinct_current_validator_count,
-    has_distinct_supermajority, has_supermajority, max_liveness_omissions,
-    min_supermajority_intersection, select_prefill_recipients, supermajority_count,
-    supermajority_has_honest_overlap, supermajority_order_statistic,
+    BLOSSOM_QUORUM_SIZE_ENV, CONSENSUS_PARAMETERS_VERSION, ConsensusParameters, QUORUM_SIZE,
+    QuorumSize, SUPERMAJORITY, byzantine_fault_bound, distinct_current_validator_count,
+    find_round_number_with_size, has_distinct_supermajority, has_supermajority,
+    max_liveness_omissions, min_supermajority_intersection, select_prefill_recipients,
+    select_prefill_recipients_with_size, select_quorums, select_quorums_from_index_tree_with_size,
+    select_quorums_with_size, supermajority_count, supermajority_has_honest_overlap,
+    supermajority_order_statistic,
 };
 #[cfg(feature = "availability-gossip")]
 pub use availability::{
@@ -99,7 +118,8 @@ pub use group::ConsensusGroupId;
 pub use harness::{MockBlockService, SimulatedCluster, SimulatedNode, signed_block};
 pub use hash::{
     DoHash, FAIR_BLOCK_ORDERING_PROTOCOL_FEATURE, FAIR_BLOCK_ORDERING_PROTOCOL_FEATURE_CODE,
-    HashType, PROTOCOL_FEATURE_CODE_VERSION, PROTOCOL_FEATURE_CODES, PROTOCOL_FEATURE_REGISTRY,
+    HIGH_AVAILABILITY_PROTOCOL_FEATURE, HIGH_AVAILABILITY_PROTOCOL_FEATURE_CODE, HashType,
+    PROTOCOL_FEATURE_CODE_VERSION, PROTOCOL_FEATURE_CODES, PROTOCOL_FEATURE_REGISTRY,
     ProtocolConsensusSurface, ProtocolFeatureCode, ProtocolFeatureRegistryEntry,
     RESERVED_PROTOCOL_FEATURE_CODE, SHA256_PROTOCOL_HASH_ALGORITHM, XXH3_PROTOCOL_HASH_ALGORITHM,
     protocol_feature_code_bytes, protocol_feature_registry_entry, protocol_hash_algorithm,
@@ -132,17 +152,23 @@ pub use round_skip::{
     skipped_round_assist_decision,
 };
 pub use runtime::{
-    AcceptedBlock, EpochTarget, MessageReceipt, MultiGroupRuntime, NodeRuntime, NodeStatus,
-    ObservedEncounterRecord, PeerApplicationState, PrefillDispatchBroadcastReport,
-    PrefillDispatchPlan, ReconnectAdmissionDecision, ReconnectAdmissionEvidence, RuntimeConfig,
-    RuntimeMode, RuntimeSnapshotV1, TrustMode, genesis_epoch, genesis_epoch_for_group,
+    AcceptedBlock, ConsensusRoundStatus, EpochTarget, MessageReceipt, MultiGroupRuntime,
+    NodeRuntime, NodeStatus, ObservedEncounterRecord, PeerApplicationState,
+    PrefillDispatchBroadcastReport, PrefillDispatchPlan, ReconnectAdmissionDecision,
+    ReconnectAdmissionEvidence, RuntimeConfig, RuntimeMode, RuntimeSnapshotV1, TrustMode,
+    genesis_epoch, genesis_epoch_for_group, genesis_epoch_for_group_with_parameters,
+};
+pub use safety::{
+    CommitteeLayout, CommitteeParticipant, SafetyManifest, SiteId, generate_safety_manifest,
+    select_site_balanced_committee,
 };
 pub use service_client::{TcpServiceClient, TimedNodePong};
 pub use state::{
     DEFAULT_MAX_PENDING_RAW_DISPATCH_BYTES, DEFAULT_MAX_PENDING_RAW_DISPATCH_BYTES_PER_SENDER,
     Epoch, EpochBody, EpochChain, EpochNonce, LocalState, MAX_PENDING_RAW_DISPATCH_BYTES_ENV,
     MAX_PENDING_RAW_DISPATCH_BYTES_PER_SENDER_ENV, PendingDispatch, PrefillDispatchRecord,
-    TempConsensus, TempQuorum, configured_max_pending_raw_dispatch_bytes,
+    TempConsensus, TempQuorum, TrustedOrderedTransaction,
+    configured_max_pending_raw_dispatch_bytes,
     configured_max_pending_raw_dispatch_bytes_per_sender,
 };
 #[cfg(feature = "availability-gossip")]

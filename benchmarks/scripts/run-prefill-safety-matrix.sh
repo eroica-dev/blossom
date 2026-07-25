@@ -133,7 +133,8 @@ run_case() {
 
 for repeat in $(seq 1 "$repeat_runs"); do
   for nodes in ${NODES:-36 64 72}; do
-    for quorum_size in ${QUORUM_SIZES:-6}; do
+    quorum_sizes="${BLOSSOM_QUORUM_SIZES:-${QUORUM_SIZES:-6}}"
+    for quorum_size in $quorum_sizes; do
       for targets in ${TARGETS_PER_COMMAND:-3 6}; do
         for architecture in ${ARCHITECTURES:-verified}; do
           for withholders in ${WITHHOLDERS_PER_BRANCH:-1}; do

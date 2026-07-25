@@ -1,0 +1,133 @@
+use blossom::{
+    ActiveActiveCommand, ClientEpoch, ClientId, CommandIdentity, CommandOperation, CommandResult,
+    ConsensusGroupId, DurableAdmissionStore, HashType, Keypair, MembershipCutoverDisposition,
+    OrderStatement, SharedStateMachine, SiteId, StoreGeneration, ValidatorGeneration, Watermark,
+    required_cutover_disposition,
+};
+use hegel::TestCase;
+use hegel::generators as gs;
+
+fn command(client: u8, sequence: u64, value: u8) -> ActiveActiveCommand {
+    ActiveActiveCommand {
+        identity: CommandIdentity {
+            client_id: ClientId([client; 16]),
+            client_epoch: ClientEpoch(1),
+            sequence,
+        },
+        operation: CommandOperation::BlindWrite {
+            key: sequence.to_le_bytes().to_vec(),
+            value: vec![value],
+        },
+    }
+}
+
+#[hegel::test(test_cases = 200)]
+fn reordered_sequences_and_replays_execute_once(tc: TestCase) {
+    let last = tc.draw(gs::integers::<u8>().min_value(2).max_value(48)) as u64;
+    let reverse = tc.draw(gs::booleans());
+    let mut order = (1..=last).collect::<Vec<_>>();
+    if reverse {
+        order.reverse();
+    } else {
+        order.sort_by_key(|sequence| (sequence % 2, *sequence));
+    }
+    let mut state = SharedStateMachine::new(64).unwrap();
+    for sequence in &order {
+        assert_eq!(
+            state
+                .apply(&command(1, *sequence, *sequence as u8))
+                .unwrap(),
+            CommandResult::Written
+        );
+    }
+    for sequence in order {
+        assert_eq!(
+            state.apply(&command(1, sequence, sequence as u8)).unwrap(),
+            CommandResult::Written
+        );
+    }
+    assert_eq!(
+        state
+            .deduplication()
+            .contiguous_sequence(ClientId([1; 16]), ClientEpoch(1)),
+        last
+    );
+}
+
+#[hegel::test(test_cases = 150)]
+fn command_identity_equivocation_is_always_rejected(tc: TestCase) {
+    let sequence = tc.draw(gs::integers::<u8>().min_value(1).max_value(32)) as u64;
+    let first = tc.draw(gs::integers::<u8>());
+    let mut second = tc.draw(gs::integers::<u8>());
+    if second == first {
+        second = second.wrapping_add(1);
+    }
+    let mut state = SharedStateMachine::new(64).unwrap();
+    state.apply(&command(2, sequence, first)).unwrap();
+    assert!(state.apply(&command(2, sequence, second)).is_err());
+}
+
+#[hegel::test(test_cases = 40)]
+fn durable_order_votes_never_sign_two_references_at_one_position(tc: TestCase) {
+    let position = tc.draw(gs::integers::<u16>().min_value(1)) as u64;
+    let first = tc.draw(gs::integers::<u8>());
+    let mut second = tc.draw(gs::integers::<u8>());
+    if second == first {
+        second = second.wrapping_add(1);
+    }
+    let keypair = Keypair::generate();
+    let path = std::env::temp_dir().join(format!(
+        "blossom-hegel-order-vote-{}-{position}-{}",
+        std::process::id(),
+        keypair.public
+    ));
+    let store = DurableAdmissionStore::open(
+        &path,
+        SiteId("site-a".to_string()),
+        StoreGeneration(1),
+        keypair.signer(),
+    )
+    .unwrap();
+    let statement = |reference_byte| OrderStatement {
+        consensus_group_id: ConsensusGroupId::root(),
+        blossom_epoch_hash: HashType([0x44; 32]),
+        position: Watermark { position },
+        reference_hash: HashType([reference_byte; 32]),
+        previous_order_certificate_hash: HashType::default(),
+        validator_generation: ValidatorGeneration(1),
+    };
+
+    let first_statement = statement(first);
+    assert_eq!(
+        store
+            .sign_order_statement(&first_statement)
+            .unwrap()
+            .statement,
+        first_statement
+    );
+    store.sign_order_statement(&first_statement).unwrap();
+    assert!(store.sign_order_statement(&statement(second)).is_err());
+    drop(store);
+    std::fs::remove_file(path).ok();
+}
+
+#[hegel::test(test_cases = 80)]
+fn membership_cutover_always_resolves_accepted_work(tc: TestCase) {
+    let accepted = tc.draw(gs::booleans());
+    let available = tc.draw(gs::booleans());
+    let can_recertify = tc.draw(gs::booleans());
+    let disposition = required_cutover_disposition(accepted, available, can_recertify);
+    if accepted && available {
+        assert_eq!(
+            disposition,
+            MembershipCutoverDisposition::FinalizeUnderOldMembership
+        );
+    } else if accepted && can_recertify {
+        assert_eq!(
+            disposition,
+            MembershipCutoverDisposition::RecertifyUnderNewMembership
+        );
+    } else {
+        assert_eq!(disposition, MembershipCutoverDisposition::ExplicitAbort);
+    }
+}

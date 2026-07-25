@@ -7,7 +7,8 @@
 #   EPOCHS=100
 #   COMMANDS_PER_NODE=256
 #   COMMAND_BYTES=1024
-#   QUORUM_SIZE=6
+#   BLOSSOM_QUORUM_SIZE=6
+#   QUORUM_SIZE=6              temporary compatibility alias
 #   PROTOCOL_VERSIONS="v1 v2"
 
 set -euo pipefail
@@ -32,7 +33,7 @@ repeat_runs="${REPEAT_RUNS:-3}"
 epochs="${EPOCHS:-100}"
 commands_per_node="${COMMANDS_PER_NODE:-256}"
 command_bytes="${COMMAND_BYTES:-1024}"
-quorum_size="${QUORUM_SIZE:-6}"
+quorum_size="${BLOSSOM_QUORUM_SIZE:-${QUORUM_SIZE:-6}}"
 seed_base="${SEED_BASE:-708026904833}"
 latency_seed_base="${LATENCY_SEED_BASE:-918273645}"
 

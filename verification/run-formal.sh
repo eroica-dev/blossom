@@ -25,6 +25,10 @@ if cargo kani --version >/dev/null 2>&1; then
     cargo kani --harness one_below_supermajority_loses_honest_overlap_for_small_validator_sets
   run_step "kani supermajority boundary" \
     cargo kani --harness supermajority_count_matches_expected_boundary_for_small_validator_sets
+  run_step "kani configurable q=3k bounds" \
+    cargo kani --harness configurable_quorum_effective_size_is_bounded
+  run_step "kani HA strict-majority intersection" \
+    cargo kani --features high-availability --harness ha_strict_majorities_intersect
 else
   echo "skip: cargo kani is not installed"
 fi
@@ -53,6 +57,12 @@ if command -v quint >/dev/null 2>&1; then
     quint run verification/quint/blossom_thresholds.qnt --invariant=unsafe_boundary
   run_step "quint q=6 thresholds" \
     quint run verification/quint/blossom_thresholds.qnt --invariant=six_node_thresholds
+  run_step "quint configurable q=3k bounds" \
+    quint run verification/quint/blossom_thresholds.qnt --invariant=configurable_branching_factors
+  run_step "quint HA 2-7 threshold table" \
+    quint run verification/quint/blossom_thresholds.qnt --invariant=ha_two_through_seven_thresholds
+  run_step "quint HA strict-majority intersection" \
+    quint run verification/quint/blossom_thresholds.qnt --invariant=ha_strict_majorities_intersect
 else
   echo "skip: quint is not installed"
 fi

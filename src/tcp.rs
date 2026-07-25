@@ -5,6 +5,7 @@ use std::time::{Duration, Instant};
 
 use fast_telemetry::Counter;
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::Notify;
 
 use crate::address_book::{Service, ServiceKind};
 #[cfg(feature = "availability-gossip")]
@@ -13,7 +14,7 @@ use crate::error::{BlossomError, Result};
 use crate::group::ConsensusGroupId;
 use crate::hash::HashType;
 use crate::messages::Msg;
-use crate::overlay::{BroadcastReport, broadcast_wire_request};
+use crate::overlay::{BroadcastReceipt, BroadcastReport};
 use crate::runtime::{MultiGroupRuntime, NodeRuntime};
 use crate::service_client::TcpServiceClient;
 use crate::wire::{
@@ -34,23 +35,44 @@ pub struct TcpNode {
     pub services: TcpServiceClient,
     metrics: Option<TcpNodeMetrics>,
     application_handler: Option<ApplicationHandler>,
+    driver_notify: Arc<Notify>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConsensusDriverConfig {
     pub interval: Duration,
+    /// Wake the driver immediately when a state-changing protocol message is
+    /// received. Request-driven deployments should combine this with
+    /// `require_local_pending_block` so notifications cannot create idle
+    /// epochs.
+    pub event_driven: bool,
     pub max_round: u8,
     pub drive_prefill: bool,
     pub drive_dispatch: bool,
+    /// Do not initiate an epoch until this node has a locally submitted block.
+    ///
+    /// This is useful for request-driven deployments and benchmarks that must
+    /// not create empty epochs while idle. The compatibility default remains
+    /// `false`.
+    pub require_local_pending_block: bool,
+    /// Keep serving and retry the next driver tick after a transient error.
+    ///
+    /// Production callers retain fail-fast behavior by default. Controlled
+    /// benchmark clusters enable retries so one connection race cannot tear
+    /// down the node's TCP listener.
+    pub continue_after_error: bool,
 }
 
 impl Default for ConsensusDriverConfig {
     fn default() -> Self {
         Self {
             interval: Duration::from_millis(25),
+            event_driven: false,
             max_round: 0,
-            drive_prefill: true,
+            drive_prefill: false,
             drive_dispatch: true,
+            require_local_pending_block: false,
+            continue_after_error: false,
         }
     }
 }
@@ -87,6 +109,7 @@ impl TcpNode {
             services: TcpServiceClient::new(),
             metrics: None,
             application_handler: None,
+            driver_notify: Arc::new(Notify::new()),
         }
     }
 
@@ -96,6 +119,7 @@ impl TcpNode {
             services,
             metrics: None,
             application_handler: None,
+            driver_notify: Arc::new(Notify::new()),
         }
     }
 
@@ -105,6 +129,7 @@ impl TcpNode {
             services: TcpServiceClient::new(),
             metrics: Some(metrics),
             application_handler: None,
+            driver_notify: Arc::new(Notify::new()),
         }
     }
 
@@ -117,6 +142,7 @@ impl TcpNode {
             services: TcpServiceClient::new(),
             metrics: None,
             application_handler: Some(Arc::new(handler)),
+            driver_notify: Arc::new(Notify::new()),
         }
     }
 
@@ -160,10 +186,36 @@ impl TcpNode {
 
     pub async fn run_consensus_driver(self, config: ConsensusDriverConfig) -> Result<()> {
         let mut interval = tokio::time::interval(config.interval);
+        let mut active_nonce = None;
         interval.tick().await;
         loop {
-            interval.tick().await;
-            self.drive_consensus_once(&config).await?;
+            if config.event_driven {
+                tokio::select! {
+                    _ = interval.tick() => {}
+                    _ = self.driver_notify.notified() => {}
+                }
+            } else {
+                interval.tick().await;
+            }
+            if config.require_local_pending_block {
+                let status = self.runtime.status()?;
+                if active_nonce.is_some_and(|nonce| nonce != status.next_nonce) {
+                    active_nonce = None;
+                }
+                if active_nonce.is_none() {
+                    if status.pending_blocks == 0 {
+                        continue;
+                    }
+                    active_nonce = Some(status.next_nonce);
+                }
+            }
+            if let Err(error) = self.drive_consensus_once(&config).await {
+                if config.continue_after_error {
+                    log::warn!("consensus driver tick failed and will be retried: {error}");
+                } else {
+                    return Err(error);
+                }
+            }
         }
     }
 
@@ -183,42 +235,62 @@ impl TcpNode {
             tick.prefill_broadcasts += 1;
         }
 
-        let start_round = match config.drive_prefill && self.runtime.has_local_prefill_dispatch()? {
-            true => 1,
-            false => 0,
-        };
+        if config.drive_prefill
+            && config.max_round > 0
+            && !self.runtime.try_activate_prefill_round()?
+        {
+            return Ok(tick);
+        }
 
-        for round in start_round..=config.max_round {
-            for message in self.runtime.drain_buffered_current_round_messages()? {
-                self.runtime.receive_message(message)?;
+        let round = self.runtime.current_consensus_round()?;
+        if round > config.max_round {
+            return Err(crate::BlossomError::WireProtocol(format!(
+                "consensus advanced to round {round}, beyond configured maximum {}",
+                config.max_round
+            )));
+        }
+        for message in self.runtime.drain_buffered_current_round_messages()? {
+            self.runtime.receive_message(message)?;
+        }
+        if config.drive_dispatch
+            && let Some(dispatch) = self.runtime.try_produce_dispatch(round)?
+        {
+            self.broadcast_round_message(round, Msg::Dispatch(dispatch))
+                .await?;
+            tick.dispatch_broadcasts += 1;
+        }
+        if let Some(verification) = self.runtime.try_produce_verification(round)? {
+            let blocks_hash = verification.body.blocks_hash;
+            self.broadcast_round_message(round, Msg::Verification(verification))
+                .await?;
+            tick.verification_broadcasts += 1;
+            if self.runtime.trust_mode().is_trusted() {
+                self.runtime
+                    .complete_trusted_verification(round, blocks_hash)?;
             }
-            if config.drive_dispatch
-                && let Some(dispatch) = self.runtime.try_produce_dispatch(round)?
-            {
-                self.broadcast_round_message(round, Msg::Dispatch(dispatch))
+        }
+        if self.runtime.trust_mode().is_trusted() {
+            if let Some(epoch_started) = self.runtime.try_produce_epoch_started()? {
+                self.broadcast_round_message(0, Msg::EpochStarted(epoch_started))
                     .await?;
-                tick.dispatch_broadcasts += 1;
+                tick.epoch_started_broadcasts += 1;
             }
-            if let Some(verification) = self.runtime.try_produce_verification(round)? {
-                self.broadcast_round_message(round, Msg::Verification(verification))
-                    .await?;
-                tick.verification_broadcasts += 1;
-            }
-            if let Some(proposal) = self.runtime.try_produce_proposal(round)? {
-                self.broadcast_round_message(round, Msg::Proposal(proposal))
-                    .await?;
-                tick.proposal_broadcasts += 1;
-            }
-            if let Some(proposal) = self.runtime.try_produce_false_proposal(round)? {
-                self.broadcast_round_message(round, Msg::Proposal(proposal))
-                    .await?;
-                tick.proposal_broadcasts += 1;
-            }
-            if let Some(commit) = self.runtime.try_produce_commit(round)? {
-                self.broadcast_round_message(round, Msg::Commit(commit))
-                    .await?;
-                tick.commit_broadcasts += 1;
-            }
+            return Ok(tick);
+        }
+        if let Some(proposal) = self.runtime.try_produce_proposal(round)? {
+            self.broadcast_round_message(round, Msg::Proposal(proposal))
+                .await?;
+            tick.proposal_broadcasts += 1;
+        }
+        if let Some(proposal) = self.runtime.try_produce_false_proposal(round)? {
+            self.broadcast_round_message(round, Msg::Proposal(proposal))
+                .await?;
+            tick.proposal_broadcasts += 1;
+        }
+        if let Some(commit) = self.runtime.try_produce_commit(round)? {
+            self.broadcast_round_message(round, Msg::Commit(commit))
+                .await?;
+            tick.commit_broadcasts += 1;
         }
         if let Some(epoch_started) = self.runtime.try_produce_epoch_started()? {
             self.broadcast_round_message(0, Msg::EpochStarted(epoch_started))
@@ -306,7 +378,32 @@ impl TcpNode {
 
     async fn broadcast_round_message(&self, round: u8, msg: Msg) -> Result<BroadcastReport> {
         let targets = self.runtime.round_consensus_services(round)?;
-        broadcast_wire_request(WireRequest::Message(msg), targets).await
+        let frame = EncodedFrame::encode_wire_request(&WireRequest::Message(msg))?;
+        let mut handles = Vec::with_capacity(targets.len());
+        for service in targets {
+            let client = self.services.clone();
+            let frame = frame.clone();
+            let service_for_task = service.clone();
+            handles.push((
+                service,
+                tokio::spawn(async move { client.request_frame(&service_for_task, &frame).await }),
+            ));
+        }
+        let mut receipts = Vec::with_capacity(handles.len());
+        for (service, handle) in handles {
+            let response = match handle.await {
+                Ok(response) => response,
+                Err(error) => Err(BlossomError::Io(format!(
+                    "persistent broadcast task failed: {error}"
+                ))),
+            };
+            receipts.push(BroadcastReceipt {
+                target: service.public_key,
+                service,
+                response,
+            });
+        }
+        Ok(BroadcastReport { receipts })
     }
 
     pub async fn handle_connection(&self, mut stream: TcpStream) -> Result<()> {
@@ -328,10 +425,20 @@ impl TcpNode {
 
     pub async fn handle_request_frame(&self, request: WireRequestFrame) -> Result<WireResponse> {
         match request {
-            WireRequestFrame::Request(request) => self.handle_request(request).await,
-            WireRequestFrame::HotDispatch(dispatch) => Ok(WireResponse::MessageReceipt(
-                self.runtime.receive_hot_dispatch(dispatch)?,
-            )),
+            WireRequestFrame::Request(request) => {
+                let drives_consensus = request_drives_consensus(&request);
+                let response = self.handle_request(request).await;
+                if drives_consensus && response.is_ok() {
+                    self.driver_notify.notify_one();
+                }
+                response
+            }
+            WireRequestFrame::HotDispatch(dispatch) => {
+                let response =
+                    WireResponse::MessageReceipt(self.runtime.receive_hot_dispatch(dispatch)?);
+                self.driver_notify.notify_one();
+                Ok(response)
+            }
         }
     }
 
@@ -353,6 +460,20 @@ impl TcpNode {
             }
             request => handle_runtime_request(&self.runtime, &self.services, request).await,
         }
+    }
+}
+
+fn request_drives_consensus(request: &WireRequest) -> bool {
+    match request {
+        WireRequest::Group { request, .. } => request_drives_consensus(request),
+        WireRequest::RegisterService(_)
+        | WireRequest::SubmitBlock(_)
+        | WireRequest::PrefillDispatch(_)
+        | WireRequest::Message(_)
+        | WireRequest::SendNonce(_)
+        | WireRequest::BlockNonce(_)
+        | WireRequest::SendBlock(_) => true,
+        _ => false,
     }
 }
 
@@ -510,9 +631,10 @@ async fn handle_runtime_request(
             "ok",
             runtime.self_node().public_key(),
         ))),
-        WireRequest::Ping(ping) => Ok(WireResponse::Pong(NodePong::new(
+        WireRequest::Ping(ping) => Ok(WireResponse::Pong(NodePong::new_with_consensus_parameters(
             runtime.group_id(),
             runtime.self_node().public_key(),
+            runtime.consensus_parameters(),
             ping.nonce,
             ping.payload,
         ))),
@@ -598,6 +720,10 @@ async fn handle_runtime_request(
                 runtime.receive_message(message)?,
             )),
         },
+        #[cfg(feature = "high-availability")]
+        WireRequest::HighAvailability(_) | WireRequest::HighAvailabilityStatus => Err(
+            BlossomError::WireProtocol("HA messages require HighAvailabilityTcpNode".to_string()),
+        ),
         WireRequest::SendNonce(_) | WireRequest::BlockNonce(_) => Ok(WireResponse::Ok),
         WireRequest::GetBlock(nonce) => match runtime.durable_block_by_nonce(nonce)? {
             Some(block) => Ok(WireResponse::Block(block)),
@@ -999,6 +1125,7 @@ mod tests {
         let node = TcpNode::new(runtime.clone());
         let driver = ConsensusDriverConfig {
             max_round: 1,
+            drive_prefill: true,
             drive_dispatch: false,
             ..ConsensusDriverConfig::default()
         };

@@ -31,10 +31,13 @@ impl ProtocolFeatureCode {
 
 pub const FAIR_BLOCK_ORDERING_PROTOCOL_FEATURE_CODE: ProtocolFeatureCode =
     ProtocolFeatureCode::new(0x0001, "fair-block-ordering");
+pub const HIGH_AVAILABILITY_PROTOCOL_FEATURE_CODE: ProtocolFeatureCode =
+    ProtocolFeatureCode::new(0x0002, "high-availability");
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProtocolConsensusSurface {
     EpochBlockOrdering,
+    HighAvailabilityFinality,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -52,14 +55,34 @@ pub const FAIR_BLOCK_ORDERING_PROTOCOL_FEATURE: ProtocolFeatureRegistryEntry =
         conflicts: &[],
         consensus_surface: ProtocolConsensusSurface::EpochBlockOrdering,
     };
+pub const HIGH_AVAILABILITY_PROTOCOL_FEATURE: ProtocolFeatureRegistryEntry =
+    ProtocolFeatureRegistryEntry {
+        code: HIGH_AVAILABILITY_PROTOCOL_FEATURE_CODE,
+        dependencies: &[],
+        conflicts: &[],
+        consensus_surface: ProtocolConsensusSurface::HighAvailabilityFinality,
+    };
 
-pub const PROTOCOL_FEATURE_REGISTRY: &[ProtocolFeatureRegistryEntry] =
-    &[FAIR_BLOCK_ORDERING_PROTOCOL_FEATURE];
+pub const PROTOCOL_FEATURE_REGISTRY: &[ProtocolFeatureRegistryEntry] = &[
+    FAIR_BLOCK_ORDERING_PROTOCOL_FEATURE,
+    HIGH_AVAILABILITY_PROTOCOL_FEATURE,
+];
 
-#[cfg(feature = "fair-block-ordering")]
+#[cfg(all(feature = "fair-block-ordering", feature = "high-availability"))]
+pub const PROTOCOL_FEATURE_CODES: &[ProtocolFeatureCode] = &[
+    FAIR_BLOCK_ORDERING_PROTOCOL_FEATURE_CODE,
+    HIGH_AVAILABILITY_PROTOCOL_FEATURE_CODE,
+];
+#[cfg(all(feature = "fair-block-ordering", not(feature = "high-availability")))]
 pub const PROTOCOL_FEATURE_CODES: &[ProtocolFeatureCode] =
     &[FAIR_BLOCK_ORDERING_PROTOCOL_FEATURE_CODE];
-#[cfg(not(feature = "fair-block-ordering"))]
+#[cfg(all(not(feature = "fair-block-ordering"), feature = "high-availability"))]
+pub const PROTOCOL_FEATURE_CODES: &[ProtocolFeatureCode] =
+    &[HIGH_AVAILABILITY_PROTOCOL_FEATURE_CODE];
+#[cfg(all(
+    not(feature = "fair-block-ordering"),
+    not(feature = "high-availability")
+))]
 pub const PROTOCOL_FEATURE_CODES: &[ProtocolFeatureCode] = &[];
 
 pub fn protocol_hash_algorithm() -> &'static str {
@@ -464,16 +487,51 @@ mod tests {
     #[test]
     #[cfg(feature = "fair-block-ordering")]
     fn protocol_hash_algorithm_reports_fair_ordering_profile() {
+        #[cfg(all(feature = "insecure-fast-hash", feature = "high-availability"))]
+        assert_eq!(
+            protocol_hash_algorithm(),
+            "xxh3-128x2+fair-block-ordering+high-availability"
+        );
+        #[cfg(all(not(feature = "insecure-fast-hash"), feature = "high-availability"))]
+        assert_eq!(
+            protocol_hash_algorithm(),
+            "sha256+fair-block-ordering+high-availability"
+        );
         #[cfg(feature = "insecure-fast-hash")]
+        #[cfg(not(feature = "high-availability"))]
         assert_eq!(protocol_hash_algorithm(), "xxh3-128x2+fair-block-ordering");
 
         #[cfg(not(feature = "insecure-fast-hash"))]
+        #[cfg(not(feature = "high-availability"))]
         assert_eq!(protocol_hash_algorithm(), "sha256+fair-block-ordering");
 
+        #[cfg(feature = "high-availability")]
+        assert_eq!(
+            PROTOCOL_FEATURE_CODES,
+            &[
+                FAIR_BLOCK_ORDERING_PROTOCOL_FEATURE_CODE,
+                HIGH_AVAILABILITY_PROTOCOL_FEATURE_CODE
+            ]
+        );
+        #[cfg(not(feature = "high-availability"))]
         assert_eq!(
             PROTOCOL_FEATURE_CODES,
             &[FAIR_BLOCK_ORDERING_PROTOCOL_FEATURE_CODE]
         );
+        #[cfg(feature = "high-availability")]
+        assert_eq!(
+            protocol_feature_code_bytes(),
+            vec![
+                PROTOCOL_FEATURE_CODE_VERSION,
+                0x00,
+                0x02,
+                0x00,
+                0x01,
+                0x00,
+                0x02
+            ]
+        );
+        #[cfg(not(feature = "high-availability"))]
         assert_eq!(
             protocol_feature_code_bytes(),
             vec![PROTOCOL_FEATURE_CODE_VERSION, 0x00, 0x01, 0x00, 0x01]
@@ -504,6 +562,10 @@ mod tests {
         assert_eq!(
             protocol_feature_registry_entry(FAIR_BLOCK_ORDERING_PROTOCOL_FEATURE_CODE.id),
             Some(&FAIR_BLOCK_ORDERING_PROTOCOL_FEATURE)
+        );
+        assert_eq!(
+            protocol_feature_registry_entry(HIGH_AVAILABILITY_PROTOCOL_FEATURE_CODE.id),
+            Some(&HIGH_AVAILABILITY_PROTOCOL_FEATURE)
         );
         assert!(validate_protocol_feature_registry().is_ok());
         assert!(validate_protocol_feature_codes(PROTOCOL_FEATURE_CODES).is_ok());

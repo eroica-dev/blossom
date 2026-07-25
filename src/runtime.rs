@@ -7,11 +7,13 @@ use std::sync::{Arc, RwLock};
 use borsh::{BorshDeserialize, BorshSerialize};
 use indextreemap::IndexTreeMap;
 use serde::{Deserialize, Serialize};
+use tokio::sync::watch;
 
 use crate::address_book::{AddressBook, Service, ServiceKind};
 use crate::admission::{NodeAdmission, ReconnectVote};
 use crate::algorithm::{
-    byzantine_fault_bound, select_prefill_recipients, select_quorums, supermajority_count,
+    ConsensusParameters, QuorumSize, byzantine_fault_bound, select_prefill_recipients_with_size,
+    select_quorums_with_size, supermajority_count,
 };
 #[cfg(feature = "availability-gossip")]
 use crate::availability::{
@@ -43,7 +45,7 @@ use crate::node::NodeIdentity;
 use crate::nonce::Nonce;
 use crate::overlay::{
     BroadcastReport, FanOutStrategy, add_self_consensus_service, broadcast_wire_request,
-    select_fanout_targets,
+    select_fanout_targets_with_size,
 };
 use crate::round_skip::{
     DataDisseminationManifest, FutureRoundAssistDecision, FutureRoundAssistInput,
@@ -66,6 +68,7 @@ pub struct RuntimeConfig {
     pub epochchain: Option<EpochChain>,
     pub address_book: AddressBook,
     pub block_cap: usize,
+    pub quorum_size: QuorumSize,
     pub trust_mode: TrustMode,
     pub mode: RuntimeMode,
     pub consensus_node_removal_policy: ConsensusNodeRemovalPolicy,
@@ -83,6 +86,7 @@ impl RuntimeConfig {
             epochchain: None,
             address_book: AddressBook::new(),
             block_cap: 100,
+            quorum_size: QuorumSize::DEFAULT,
             trust_mode: TrustMode::Verified,
             mode: RuntimeMode::Consensus,
             consensus_node_removal_policy: ConsensusNodeRemovalPolicy::disabled(),
@@ -105,7 +109,23 @@ impl RuntimeConfig {
     }
 
     pub fn from_snapshot(snapshot: RuntimeSnapshotV1, self_node: NodeIdentity) -> Result<Self> {
+        Self::from_snapshot_with_quorum_override(snapshot, self_node, None)
+    }
+
+    pub fn from_snapshot_with_quorum_override(
+        snapshot: RuntimeSnapshotV1,
+        self_node: NodeIdentity,
+        configured_quorum_size: Option<QuorumSize>,
+    ) -> Result<Self> {
         snapshot.validate_for_node(&self_node)?;
+        if let Some(configured) = configured_quorum_size
+            && configured != snapshot.consensus_parameters.quorum_size
+        {
+            return Err(BlossomError::ConsensusParametersMismatch {
+                configured: configured.get(),
+                committed: snapshot.consensus_parameters.quorum_size.get(),
+            });
+        }
         let genesis = snapshot
             .epochchain
             .epochchain
@@ -119,6 +139,7 @@ impl RuntimeConfig {
             epochchain: Some(snapshot.epochchain),
             address_book: AddressBook::from_services(snapshot.address_book),
             block_cap: snapshot.block_cap,
+            quorum_size: snapshot.consensus_parameters.quorum_size,
             trust_mode: snapshot.trust_mode,
             mode: snapshot.mode,
             consensus_node_removal_policy: snapshot.consensus_node_removal_policy,
@@ -137,6 +158,11 @@ impl RuntimeConfig {
         self.block_store_path = Some(path.into());
         self
     }
+
+    pub fn with_quorum_size(mut self, quorum_size: QuorumSize) -> Self {
+        self.quorum_size = quorum_size;
+        self
+    }
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
@@ -149,11 +175,16 @@ pub enum RuntimeMode {
 pub enum TrustMode {
     Verified,
     Trusted,
+    HighAvailability,
 }
 
 impl TrustMode {
     pub fn is_trusted(self) -> bool {
         self == Self::Trusted
+    }
+
+    pub fn is_high_availability(self) -> bool {
+        self == Self::HighAvailability
     }
 }
 
@@ -175,11 +206,13 @@ struct RuntimeInner {
     trust_mode: TrustMode,
     mode: RuntimeMode,
     block_cap: usize,
+    consensus_parameters: ConsensusParameters,
     consensus_node_removal_policy: ConsensusNodeRemovalPolicy,
     snapshot_path: Option<PathBuf>,
     durable_block_store: Option<DurableBlockStore>,
     telemetry: TelemetryHandle,
     next_telemetry_span_id: AtomicU64,
+    epoch_commit_tx: watch::Sender<Nonce>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -199,6 +232,8 @@ pub struct RuntimeSnapshotV1 {
     pub epochchain: EpochChain,
     pub address_book: Vec<Service>,
     pub block_cap: usize,
+    #[serde(default)]
+    pub consensus_parameters: ConsensusParameters,
     pub trust_mode: TrustMode,
     pub mode: RuntimeMode,
     pub consensus_node_removal_policy: ConsensusNodeRemovalPolicy,
@@ -262,11 +297,20 @@ impl RuntimeSnapshotV1 {
         if self.epochchain.epochchain.is_empty() {
             return Err(BlossomError::EmptyEpochChain);
         }
+        self.consensus_parameters.validate()?;
         for (index, epoch) in self.epochchain.epochchain.iter().enumerate() {
             if epoch.body.group_id != self.group_id {
                 return Err(BlossomError::WireProtocol(
                     "snapshot epoch group id mismatch".to_string(),
                 ));
+            }
+            let epoch_parameters = epoch.body.effective_consensus_parameters();
+            epoch_parameters.validate()?;
+            if epoch_parameters != self.consensus_parameters {
+                return Err(BlossomError::ConsensusParametersMismatch {
+                    configured: self.consensus_parameters.quorum_size.get(),
+                    committed: epoch_parameters.quorum_size.get(),
+                });
             }
             let expected_hash = HashType::hash(&epoch.body.to_bytes());
             if epoch.hash != expected_hash {
@@ -284,6 +328,15 @@ impl RuntimeSnapshotV1 {
                 if epoch.body.nonce != previous.body.nonce.new_next() {
                     return Err(BlossomError::InvalidEpochNonce);
                 }
+                if let Some(previous_nonce) = epoch.body.previous_nonce
+                    && previous_nonce != previous.body.nonce
+                {
+                    return Err(BlossomError::InvalidEpochNonce);
+                }
+            } else if epoch.body.previous_nonce.is_some() {
+                return Err(BlossomError::WireProtocol(
+                    "genesis epoch must not claim a previous nonce".to_string(),
+                ));
             }
         }
         let latest = self
@@ -340,7 +393,35 @@ pub struct NodeStatus {
     pub last_epoch_nonce: Nonce,
     pub next_nonce: Nonce,
     pub pending_blocks: usize,
+    pub configured_quorum_size: usize,
+    pub effective_quorum_size: usize,
+    pub consensus_parameters_hash: HashType,
     pub services: Vec<Service>,
+}
+
+/// Read-only diagnostic snapshot of one node's current consensus round.
+///
+/// This deliberately exposes counts and hashes, not mutable protocol state. It
+/// is primarily used by deterministic simulations and benchmark fault traces.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConsensusRoundStatus {
+    pub target: EpochTarget,
+    pub round: u8,
+    pub expected_quorum_members: usize,
+    pub dispatch_status: Option<bool>,
+    pub received_dispatches: usize,
+    pub pending_dispatches: usize,
+    pub verified_blocks: usize,
+    pub verification_senders: usize,
+    pub verification_counts: BTreeMap<HashType, u8>,
+    pub verification_consensus_hash: Option<HashType>,
+    pub proposal_senders: usize,
+    pub proposal_counts: BTreeMap<HashType, u32>,
+    pub proposal_consensus: Option<bool>,
+    pub pending_proposals: usize,
+    pub pending_commits: usize,
+    pub commit_senders: usize,
+    pub commit_true_senders: usize,
 }
 
 #[derive(Serialize, Deserialize, BorshSerialize, BorshDeserialize, Debug, Clone, PartialEq, Eq)]
@@ -442,17 +523,46 @@ pub struct ObservedEncounterRecord {
 }
 
 impl NodeRuntime {
-    pub fn new(mut config: RuntimeConfig) -> Self {
+    pub fn new(config: RuntimeConfig) -> Self {
+        Self::try_new(config).expect("invalid Blossom runtime configuration")
+    }
+
+    pub fn trust_mode(&self) -> TrustMode {
+        self.inner.trust_mode
+    }
+
+    pub fn try_new(mut config: RuntimeConfig) -> Result<Self> {
+        if config.trust_mode.is_high_availability() {
+            return Err(BlossomError::InvalidConfiguration(
+                "high-availability mode uses HighAvailabilityRuntime, not NodeRuntime".to_string(),
+            ));
+        }
         let signer = config.self_node.signer().ok();
         let requested_group_id = config.group_id;
+        let configured_parameters = ConsensusParameters::new(config.quorum_size);
+        configured_parameters.validate()?;
         let genesis = config.genesis.take().unwrap_or_else(|| {
-            genesis_epoch_for_group(config.group_id, [config.self_node.clone()])
+            genesis_epoch_for_group_with_parameters(
+                config.group_id,
+                [config.self_node.clone()],
+                configured_parameters,
+            )
         });
-        assert!(
-            requested_group_id == ConsensusGroupId::root()
-                || requested_group_id == genesis.body.group_id,
-            "runtime config group id does not match genesis group id"
-        );
+        if requested_group_id != ConsensusGroupId::root()
+            && requested_group_id != genesis.body.group_id
+        {
+            return Err(BlossomError::InvalidConfiguration(
+                "runtime config group id does not match genesis group id".to_string(),
+            ));
+        }
+        let committed_parameters = genesis.body.effective_consensus_parameters();
+        committed_parameters.validate()?;
+        if configured_parameters != committed_parameters {
+            return Err(BlossomError::ConsensusParametersMismatch {
+                configured: configured_parameters.quorum_size.get(),
+                committed: committed_parameters.quorum_size.get(),
+            });
+        }
         let group_id = genesis.body.group_id;
         add_self_consensus_service(&mut config.address_book, &config.self_node);
         let mut state = LocalState::new_with_consensus_node_removal_policy(
@@ -461,15 +571,30 @@ impl NodeRuntime {
             config.consensus_node_removal_policy,
         );
         if let Some(epochchain) = config.epochchain.take() {
+            for epoch in &epochchain.epochchain {
+                let epoch_parameters = epoch.body.effective_consensus_parameters();
+                if epoch_parameters != committed_parameters {
+                    return Err(BlossomError::ConsensusParametersMismatch {
+                        configured: committed_parameters.quorum_size.get(),
+                        committed: epoch_parameters.quorum_size.get(),
+                    });
+                }
+            }
             state.epochchain = epochchain;
         }
         let durable_block_store = config
             .block_store_path
             .map(DurableBlockStore::open)
-            .transpose()
-            .expect("runtime block store path is not writable");
+            .transpose()?;
+        let committed_nonce = state
+            .epochchain
+            .epochchain
+            .last()
+            .map(|epoch| epoch.body.nonce)
+            .unwrap_or_default();
+        let (epoch_commit_tx, _) = watch::channel(committed_nonce);
 
-        Self {
+        Ok(Self {
             inner: Arc::new(RuntimeInner {
                 group_id,
                 state: RwLock::new(state),
@@ -483,13 +608,15 @@ impl NodeRuntime {
                 trust_mode: config.trust_mode,
                 mode: config.mode,
                 block_cap: config.block_cap,
+                consensus_parameters: committed_parameters,
                 consensus_node_removal_policy: config.consensus_node_removal_policy,
                 snapshot_path: config.snapshot_path,
                 durable_block_store,
                 telemetry: config.telemetry,
                 next_telemetry_span_id: AtomicU64::new(1),
+                epoch_commit_tx,
             }),
-        }
+        })
     }
 
     pub fn self_node(&self) -> NodeIdentity {
@@ -509,6 +636,67 @@ impl NodeRuntime {
         self.inner.group_id
     }
 
+    pub fn consensus_parameters(&self) -> ConsensusParameters {
+        self.inner.consensus_parameters
+    }
+
+    /// Subscribes to durable local epoch-chain advancement.
+    pub fn subscribe_epoch_commits(&self) -> watch::Receiver<Nonce> {
+        self.inner.epoch_commit_tx.subscribe()
+    }
+
+    /// Waits for one epoch to appear in this node's committed chain.
+    pub async fn wait_for_committed_epoch(
+        &self,
+        nonce: Nonce,
+        timeout: std::time::Duration,
+    ) -> Result<Epoch> {
+        if timeout.is_zero() {
+            return Err(BlossomError::InvalidConfiguration(
+                "epoch commit wait timeout must be non-zero".to_string(),
+            ));
+        }
+        let mut commits = self.subscribe_epoch_commits();
+        let wait = async {
+            loop {
+                if let Some(epoch) = self
+                    .epochchain()
+                    .epochchain
+                    .into_iter()
+                    .find(|epoch| epoch.body.nonce == nonce)
+                {
+                    return Ok(epoch);
+                }
+                commits.changed().await.map_err(|_| {
+                    BlossomError::ExternalService(
+                        "local epoch commit notification channel closed".to_string(),
+                    )
+                })?;
+            }
+        };
+        tokio::time::timeout(timeout, wait).await.map_err(|_| {
+            BlossomError::ExternalService(format!(
+                "timed out waiting for local epoch {nonce} commit"
+            ))
+        })?
+    }
+
+    fn publish_epoch_commit(&self) -> Result<()> {
+        let nonce = self
+            .inner
+            .state
+            .read()
+            .expect("state lock poisoned")
+            .epochchain
+            .epochchain
+            .last()
+            .ok_or(BlossomError::EmptyEpochChain)?
+            .body
+            .nonce;
+        self.inner.epoch_commit_tx.send_replace(nonce);
+        Ok(())
+    }
+
     pub fn emit_telemetry_event(
         &self,
         stage: impl Into<String>,
@@ -523,6 +711,7 @@ impl NodeRuntime {
             Some(target) => telemetry.with_target(target.last_epoch, target.nonce),
             None => telemetry,
         };
+        telemetry = self.with_quorum_telemetry(telemetry);
         self.inner.telemetry.record(telemetry);
     }
 
@@ -551,7 +740,61 @@ impl NodeRuntime {
             last_epoch_nonce: epoch.body.nonce,
             next_nonce: epoch.body.nonce.new_next(),
             pending_blocks,
+            configured_quorum_size: self.inner.consensus_parameters.quorum_size.get(),
+            effective_quorum_size: self
+                .inner
+                .consensus_parameters
+                .quorum_size
+                .effective(epoch.body.verifiers.len()),
+            consensus_parameters_hash: self.inner.consensus_parameters.hash(),
             services,
+        })
+    }
+
+    pub fn consensus_round_status(&self, round: u8) -> Result<ConsensusRoundStatus> {
+        self.ensure_consensus_mode("inspect consensus round")?;
+        let target = self.next_epoch_target()?;
+        let state = self.inner.state.read().expect("state lock poisoned");
+        let quorum = state.get_quorum(&target.last_epoch, target.nonce, round);
+        Ok(match quorum {
+            Some(quorum) => ConsensusRoundStatus {
+                target,
+                round,
+                expected_quorum_members: quorum.msg_matrix.quorum_nodes.len(),
+                dispatch_status: quorum.dispatch_status,
+                received_dispatches: quorum.received_dispatches.len(),
+                pending_dispatches: quorum.pending_dispatches.len(),
+                verified_blocks: quorum.verified_blocks.len(),
+                verification_senders: quorum.verifications.verifications.len(),
+                verification_counts: quorum.verifications.count.clone(),
+                verification_consensus_hash: quorum.verifications.consensus_hash(),
+                proposal_senders: quorum.proposals.proposals.len(),
+                proposal_counts: quorum.proposals.count.clone(),
+                proposal_consensus: quorum.proposals.consensus(),
+                pending_proposals: quorum.pending_proposals.len(),
+                pending_commits: quorum.pending_commits.len(),
+                commit_senders: quorum.commit_senders.len(),
+                commit_true_senders: quorum.commit_true_senders.len(),
+            },
+            None => ConsensusRoundStatus {
+                target,
+                round,
+                expected_quorum_members: 0,
+                dispatch_status: None,
+                received_dispatches: 0,
+                pending_dispatches: 0,
+                verified_blocks: 0,
+                verification_senders: 0,
+                verification_counts: BTreeMap::new(),
+                verification_consensus_hash: None,
+                proposal_senders: 0,
+                proposal_counts: BTreeMap::new(),
+                proposal_consensus: None,
+                pending_proposals: 0,
+                pending_commits: 0,
+                commit_senders: 0,
+                commit_true_senders: 0,
+            },
         })
     }
 
@@ -600,6 +843,15 @@ impl NodeRuntime {
         let timed = client.timed_ping(service, ping).await?;
         if timed.pong.public_key != service.public_key {
             return Err(BlossomError::KeyMismatch);
+        }
+        if !timed
+            .pong
+            .consensus_parameters_compatible(self.inner.consensus_parameters)
+        {
+            return Err(BlossomError::ConsensusParametersMismatch {
+                configured: self.inner.consensus_parameters.quorum_size.get(),
+                committed: timed.pong.quorum_size,
+            });
         }
         self.observe_peer_latency(
             timed.pong.public_key,
@@ -692,6 +944,7 @@ impl NodeRuntime {
             epochchain: state.epochchain.clone(),
             address_book,
             block_cap: self.inner.block_cap,
+            consensus_parameters: self.inner.consensus_parameters,
             trust_mode: self.inner.trust_mode,
             mode: self.inner.mode,
             consensus_node_removal_policy: self.inner.consensus_node_removal_policy,
@@ -1056,7 +1309,10 @@ impl NodeRuntime {
         };
         let mut state = self.inner.state.write().expect("state lock poisoned");
         let quorum = state.get_mut_quorum(&target.last_epoch, target.nonce, round);
-        if quorum.proposal_sent || quorum.proposals.consensus() == Some(true) {
+        if quorum.proposal_sent
+            || quorum.proposals.consensus() == Some(true)
+            || quorum.verifications.consensus_is_still_possible()
+        {
             return Ok(None);
         }
         quorum.proposal_sent = true;
@@ -1072,6 +1328,7 @@ impl NodeRuntime {
             epochchain: remote_chain.clone(),
             address_book: self.address_book(),
             block_cap: self.inner.block_cap,
+            consensus_parameters: self.inner.consensus_parameters,
             trust_mode: self.inner.trust_mode,
             mode: self.inner.mode,
             consensus_node_removal_policy: self.inner.consensus_node_removal_policy,
@@ -1097,6 +1354,7 @@ impl NodeRuntime {
         state.epochchain = remote_chain;
         drop(state);
         self.persist_snapshot()?;
+        self.publish_epoch_commit()?;
         Ok(true)
     }
 
@@ -1864,7 +2122,12 @@ impl NodeRuntime {
             .address_book
             .read()
             .expect("address book lock poisoned");
-        select_fanout_targets(&self_node, &address_book, strategy)
+        select_fanout_targets_with_size(
+            &self_node,
+            &address_book,
+            strategy,
+            self.inner.consensus_parameters.quorum_size,
+        )
     }
 
     pub fn round_consensus_services(&self, round: u8) -> Result<Vec<Service>> {
@@ -1901,11 +2164,12 @@ impl NodeRuntime {
             .epochchain
             .last()
             .ok_or(BlossomError::EmptyEpochChain)?;
-        let recipients = select_prefill_recipients(
+        let recipients = select_prefill_recipients_with_size(
             epoch.body.verifiers.keys().copied(),
             &self_node.public_key(),
             target.last_epoch,
             self_node.shuffle,
+            epoch.body.effective_consensus_parameters().quorum_size,
         );
         drop(state);
 
@@ -1942,13 +2206,23 @@ impl NodeRuntime {
             .epochchain
             .last()
             .ok_or(BlossomError::EmptyEpochChain)?;
-        Ok(select_quorums(
+        Ok(select_quorums_with_size(
             epoch.body.verifiers.keys().copied(),
             &self_node.public_key(),
             target.last_epoch,
             self_node.shuffle,
+            epoch.body.effective_consensus_parameters().quorum_size,
         )
         .len())
+    }
+
+    pub fn current_consensus_round(&self) -> Result<u8> {
+        self.ensure_consensus_mode("read current consensus round")?;
+        let target = self.next_epoch_target()?;
+        let mut state = self.inner.state.write().expect("state lock poisoned");
+        Ok(state
+            .get_mut_consensus(&target.last_epoch, target.nonce)
+            .round)
     }
 
     pub fn has_local_prefill_dispatch(&self) -> Result<bool> {
@@ -1981,10 +2255,6 @@ impl NodeRuntime {
         {
             let mut state = self.inner.state.write().expect("state lock poisoned");
             state.record_prefill_dispatch(&dispatch)?;
-            let consensus = state.get_mut_consensus(&plan.target.last_epoch, plan.target.nonce);
-            if consensus.peers.len() > 1 && consensus.round == 0 {
-                consensus.round = 1;
-            }
         }
         let broadcast = broadcast_wire_request(
             WireRequest::PrefillDispatch(dispatch.clone()),
@@ -2013,6 +2283,71 @@ impl NodeRuntime {
         let target = self.next_epoch_target()?;
         let mut state = self.inner.state.write().expect("state lock poisoned");
         Ok(state.seed_prefill_dispatches_into_quorum(&target.last_epoch, target.nonce, round))
+    }
+
+    /// Advances a prefill-enabled epoch to round one only after every routed
+    /// prefill sender expected by this node has delivered its block set.
+    ///
+    /// Without this barrier a node can dispatch an incomplete aggregate into
+    /// the final topology round, allowing different quorums to certify
+    /// different epoch contents.
+    pub fn try_activate_prefill_round(&self) -> Result<bool> {
+        self.ensure_consensus_mode("activate prefill round")?;
+        if self.quorum_round_count()? <= 1 {
+            return Ok(true);
+        }
+
+        let self_node = self.self_node();
+        let target = self.next_epoch_target()?;
+        let (verifiers, recorded_senders) = {
+            let state = self.inner.state.read().expect("state lock poisoned");
+            let epoch = state
+                .epochchain
+                .epochchain
+                .last()
+                .ok_or(BlossomError::EmptyEpochChain)?;
+            let recorded = state
+                .prefill_dispatches(&target.last_epoch, target.nonce)
+                .map(|records| records.keys().copied().collect::<BTreeSet<_>>())
+                .unwrap_or_default();
+            (
+                epoch.body.verifiers.values().cloned().collect::<Vec<_>>(),
+                recorded,
+            )
+        };
+        let quorum_size = self.inner.consensus_parameters.quorum_size;
+        let all_keys = verifiers
+            .iter()
+            .map(NodeIdentity::public_key)
+            .collect::<Vec<_>>();
+        let expected_senders = verifiers
+            .iter()
+            .filter_map(|sender| {
+                let sender_key = sender.public_key();
+                if sender_key == self_node.public_key() {
+                    return Some(sender_key);
+                }
+                select_prefill_recipients_with_size(
+                    all_keys.iter().copied(),
+                    &sender_key,
+                    target.last_epoch,
+                    sender.shuffle,
+                    quorum_size,
+                )
+                .contains(&self_node.public_key())
+                .then_some(sender_key)
+            })
+            .collect::<BTreeSet<_>>();
+        if !expected_senders.is_subset(&recorded_senders) {
+            return Ok(false);
+        }
+
+        let mut state = self.inner.state.write().expect("state lock poisoned");
+        let consensus = state.get_mut_consensus(&target.last_epoch, target.nonce);
+        if consensus.peers.len() > 1 && consensus.round == 0 {
+            consensus.round = 1;
+        }
+        Ok(true)
     }
 
     pub fn try_produce_dispatch(&self, round: u8) -> Result<Option<Dispatch>> {
@@ -2082,6 +2417,56 @@ impl NodeRuntime {
         Ok(Some(message))
     }
 
+    /// Completes one trusted dissemination round after the local node has sent
+    /// its unsigned receipt for the complete BTree-ordered block set.
+    ///
+    /// Trusted mode does not collect proposal or commit votes. Every node
+    /// advances independently once it has received the complete expected
+    /// dispatch set and sent its own matching receipt. A missing member
+    /// therefore stops liveness until membership/failure handling resolves it.
+    pub fn complete_trusted_verification(
+        &self,
+        round: u8,
+        expected_blocks_hash: HashType,
+    ) -> Result<bool> {
+        self.ensure_consensus_mode("complete trusted verification")?;
+        if !self.inner.trust_mode.is_trusted() {
+            return Err(BlossomError::InvalidConfiguration(
+                "trusted verification completion requires trusted mode".to_string(),
+            ));
+        }
+        let target = self.next_epoch_target()?;
+        let self_key = self.self_node().public_key();
+        let (advanced, chain_extended) = {
+            let mut state = self.inner.state.write().expect("state lock poisoned");
+            let quorum = state.get_mut_quorum(&target.last_epoch, target.nonce, round);
+            let local_receipt_matches = quorum
+                .verifications
+                .verifications
+                .get(&self_key)
+                .is_some_and(|receipt| receipt.body.blocks_hash == expected_blocks_hash);
+            if !quorum.has_complete_dispatch_set()
+                || !quorum.verification_sent
+                || !local_receipt_matches
+                || quorum.verified_blocks_hash() != expected_blocks_hash
+            {
+                return Err(BlossomError::WireProtocol(
+                    "trusted node cannot advance before receiving every expected block and sending its matching receipt"
+                        .to_string(),
+                ));
+            }
+            let before = state.epochchain.epochchain.len();
+            let advanced = state.advance_epoch(&target.last_epoch, target.nonce, round, true);
+            let chain_extended = state.epochchain.epochchain.len() > before;
+            (advanced, chain_extended)
+        };
+        if chain_extended {
+            self.persist_snapshot()?;
+            self.publish_epoch_commit()?;
+        }
+        Ok(advanced)
+    }
+
     pub fn try_produce_proposal(&self, round: u8) -> Result<Option<Proposal>> {
         self.ensure_consensus_mode("produce proposal")?;
         let target = self.next_epoch_target()?;
@@ -2090,6 +2475,7 @@ impl NodeRuntime {
             let mut state = self.inner.state.write().expect("state lock poisoned");
             state.seed_prefill_dispatches_into_quorum(&target.last_epoch, target.nonce, round);
             let quorum = state.get_mut_quorum(&target.last_epoch, target.nonce, round);
+            activate_pending_proposals(quorum);
             if quorum.proposal_sent {
                 return Ok(None);
             }
@@ -2205,6 +2591,7 @@ impl NodeRuntime {
         }
         if chain_extended {
             self.persist_snapshot()?;
+            self.publish_epoch_commit()?;
         }
         Ok(Some(message))
     }
@@ -2718,11 +3105,10 @@ impl NodeRuntime {
             self.persist_blocks_if_configured(decoded_message.body.blocks.values())?;
             let mut state = self.inner.state.write().expect("state lock poisoned");
             let sender = message.header.sender;
-            let quorum = state.get_mut_quorum(
-                &message.header.last_epoch,
-                message.header.nonce,
-                message.header.round,
-            );
+            let last_epoch = message.header.last_epoch;
+            let nonce = message.header.nonce;
+            let round = message.header.round;
+            let quorum = state.get_mut_quorum(&last_epoch, nonce, round);
             if quorum.received_dispatches.contains(&sender) {
                 return Err(BlossomError::WireProtocol(format!(
                     "duplicate dispatch from {sender}"
@@ -2969,11 +3355,10 @@ impl NodeRuntime {
             if message.header.verify_header(&mut state) == Some(false) {
                 return Err(BlossomError::UnknownSender);
             }
-            let quorum = state.get_mut_quorum(
-                &message.header.last_epoch,
-                message.header.nonce,
-                message.header.round,
-            );
+            let last_epoch = message.header.last_epoch;
+            let nonce = message.header.nonce;
+            let round = message.header.round;
+            let quorum = state.get_mut_quorum(&last_epoch, nonce, round);
             if quorum.verified_blocks_hash() != message.body.blocks_hash {
                 return Err(BlossomError::WireProtocol(
                     "reconcile commit references a block set that is not locally verified"
@@ -3007,6 +3392,7 @@ impl NodeRuntime {
         };
         if chain_extended {
             self.persist_snapshot()?;
+            self.publish_epoch_commit()?;
         }
         Ok(MessageReceipt::accepted("reconcile_commit"))
     }
@@ -3045,45 +3431,76 @@ impl NodeRuntime {
     fn receive_verification(&self, message: Verification) -> Result<MessageReceipt> {
         self.verify_message_signature(&message.header, MSGKey::Verification, &message.body)?;
         message.body.validate()?;
-        let mut state = self.inner.state.write().expect("state lock poisoned");
-        if message.header.verify_header(&mut state) == Some(false) {
-            return Err(BlossomError::UnknownSender);
-        }
-        state.seed_prefill_dispatches_into_quorum(
-            &message.header.last_epoch,
-            message.header.nonce,
-            message.header.round,
-        );
-        let quorum = state.get_mut_quorum(
-            &message.header.last_epoch,
-            message.header.nonce,
-            message.header.round,
-        );
-        if message.body.blocks != quorum.verified_blocks()
-            || message.body.blocks_hash != quorum.verified_blocks_hash()
+        let mut chain_extended = false;
         {
-            return Err(BlossomError::WireProtocol(
-                "verification references block set that has not been locally verified".to_string(),
-            ));
+            let mut state = self.inner.state.write().expect("state lock poisoned");
+            if message.header.verify_header(&mut state) == Some(false) {
+                return Err(BlossomError::UnknownSender);
+            }
+            let last_epoch = message.header.last_epoch;
+            let nonce = message.header.nonce;
+            let round = message.header.round;
+            state.seed_prefill_dispatches_into_quorum(&last_epoch, nonce, round);
+            let quorum = state.get_mut_quorum(&last_epoch, nonce, round);
+            if message.body.blocks != quorum.verified_blocks()
+                || message.body.blocks_hash != quorum.verified_blocks_hash()
+            {
+                return Err(BlossomError::WireProtocol(
+                    "verification references block set that has not been locally verified"
+                        .to_string(),
+                ));
+            }
+            quorum.verifications.record(message);
+            if !self.inner.trust_mode.is_trusted() {
+                activate_pending_proposals(quorum);
+                activate_pending_true_commits(quorum);
+                if quorum.commit_sent {
+                    let before = state.epochchain.epochchain.len();
+                    state.advance_epoch(&last_epoch, nonce, round, true);
+                    chain_extended = state.epochchain.epochchain.len() > before;
+                }
+            }
         }
-        quorum.verifications.record(message);
+        if chain_extended {
+            self.persist_snapshot()?;
+            self.publish_epoch_commit()?;
+        }
         Ok(MessageReceipt::accepted("verification"))
     }
 
     fn receive_proposal(&self, message: Proposal) -> Result<MessageReceipt> {
         self.verify_message_signature(&message.header, MSGKey::Proposal, &message.body)?;
         message.body.validate()?;
-        let mut state = self.inner.state.write().expect("state lock poisoned");
-        if message.header.verify_header(&mut state) == Some(false) {
-            return Err(BlossomError::UnknownSender);
+        let mut chain_extended = false;
+        {
+            let mut state = self.inner.state.write().expect("state lock poisoned");
+            if message.header.verify_header(&mut state) == Some(false) {
+                return Err(BlossomError::UnknownSender);
+            }
+            let last_epoch = message.header.last_epoch;
+            let nonce = message.header.nonce;
+            let round = message.header.round;
+            let quorum = state.get_mut_quorum(&last_epoch, nonce, round);
+            self.verify_proposal_evidence(&message.header, &message.body, quorum)?;
+            if message.body.consensus && !proposal_matches_verified_blocks(&message, quorum) {
+                quorum
+                    .pending_proposals
+                    .insert(message.header.sender, message);
+                return Ok(MessageReceipt::accepted("proposal_pending"));
+            }
+            quorum.pending_proposals.remove(&message.header.sender);
+            quorum.proposals.record(message);
+            activate_pending_true_commits(quorum);
+            if quorum.commit_sent {
+                let before = state.epochchain.epochchain.len();
+                state.advance_epoch(&last_epoch, nonce, round, true);
+                chain_extended = state.epochchain.epochchain.len() > before;
+            }
         }
-        let quorum = state.get_mut_quorum(
-            &message.header.last_epoch,
-            message.header.nonce,
-            message.header.round,
-        );
-        self.verify_proposal_proof(&message.header, &message.body, quorum)?;
-        quorum.proposals.record(message);
+        if chain_extended {
+            self.persist_snapshot()?;
+            self.publish_epoch_commit()?;
+        }
         Ok(MessageReceipt::accepted("proposal"))
     }
 
@@ -3095,38 +3512,26 @@ impl NodeRuntime {
             if message.header.verify_header(&mut state) == Some(false) {
                 return Err(BlossomError::UnknownSender);
             }
-            let quorum = state.get_mut_quorum(
-                &message.header.last_epoch,
-                message.header.nonce,
-                message.header.round,
-            );
+            let last_epoch = message.header.last_epoch;
+            let nonce = message.header.nonce;
+            let round = message.header.round;
+            let quorum = state.get_mut_quorum(&last_epoch, nonce, round);
             if message.body.consensus && quorum.proposals.consensus() != Some(true) {
-                return Err(BlossomError::WireProtocol(
-                    "true commit requires a local proposal supermajority".to_string(),
-                ));
+                quorum
+                    .pending_commits
+                    .insert(message.header.sender, message);
+                return Ok(MessageReceipt::accepted("commit_pending"));
             }
-            let sender = message.header.sender;
-            quorum.commit_senders.insert(sender);
-            if message.body.consensus {
-                quorum.commit_true_senders.insert(sender);
-            } else {
-                quorum.commit_true_senders.remove(&sender);
-            }
-            quorum.commit_sent =
-                quorum.commit_true_senders.len() >= quorum.proposals.supermajority as usize;
+            record_commit_vote(quorum, message);
             if quorum.commit_sent {
                 let before = state.epochchain.epochchain.len();
-                state.advance_epoch(
-                    &message.header.last_epoch,
-                    message.header.nonce,
-                    message.header.round,
-                    true,
-                );
+                state.advance_epoch(&last_epoch, nonce, round, true);
                 chain_extended = state.epochchain.epochchain.len() > before;
             }
         }
         if chain_extended {
             self.persist_snapshot()?;
+            self.publish_epoch_commit()?;
         }
         Ok(MessageReceipt::accepted("commit"))
     }
@@ -3157,6 +3562,7 @@ impl NodeRuntime {
             .with_node(self.self_node().public_key())
             .with_group_id(self.inner.group_id);
         event = apply_telemetry_meta(event, &meta);
+        event = self.with_quorum_telemetry(event);
         self.inner.telemetry.record(event);
         RuntimeTelemetrySpan { span_id, meta }
     }
@@ -3167,10 +3573,41 @@ impl NodeRuntime {
             .with_group_id(self.inner.group_id)
             .with_outcome(if result.is_ok() { "ok" } else { "error" });
         event = apply_telemetry_meta(event, &span.meta);
+        event = self.with_quorum_telemetry(event);
         if let Err(err) = result {
             event = event.with_error(err.to_string());
         }
         self.inner.telemetry.record(event);
+    }
+
+    fn with_quorum_telemetry(&self, event: TelemetryEvent) -> TelemetryEvent {
+        let validator_count = self
+            .inner
+            .state
+            .read()
+            .expect("state lock poisoned")
+            .epochchain
+            .epochchain
+            .last()
+            .map(|epoch| epoch.body.verifiers.len())
+            .unwrap_or_default();
+        event
+            .with_field(
+                "configured_quorum_size",
+                self.inner.consensus_parameters.quorum_size.to_string(),
+            )
+            .with_field(
+                "effective_quorum_size",
+                self.inner
+                    .consensus_parameters
+                    .quorum_size
+                    .effective(validator_count)
+                    .to_string(),
+            )
+            .with_field(
+                "consensus_parameters_hash",
+                self.inner.consensus_parameters.hash().to_string(),
+            )
     }
 
     fn target_telemetry_meta(
@@ -3252,11 +3689,12 @@ impl NodeRuntime {
         let Some(sender_identity) = epoch.body.verifiers.get(sender) else {
             return Ok(false);
         };
-        let recipients = select_prefill_recipients(
+        let recipients = select_prefill_recipients_with_size(
             epoch.body.verifiers.keys().copied(),
             sender,
             target.last_epoch,
             sender_identity.shuffle,
+            epoch.body.effective_consensus_parameters().quorum_size,
         );
         Ok(recipients.contains(&self_key))
     }
@@ -3359,6 +3797,7 @@ impl NodeRuntime {
         body: &ProposalBody,
         quorum: &TempQuorum,
     ) -> Result<()> {
+        self.verify_proposal_evidence(header, body, quorum)?;
         if !body.consensus {
             return Ok(());
         }
@@ -3377,6 +3816,33 @@ impl NodeRuntime {
         {
             return Err(BlossomError::WireProtocol(
                 "proposal references block set that has not been locally verified".to_string(),
+            ));
+        }
+
+        Ok(())
+    }
+
+    fn verify_proposal_evidence(
+        &self,
+        header: &Header,
+        body: &ProposalBody,
+        quorum: &TempQuorum,
+    ) -> Result<()> {
+        if !body.consensus {
+            return Ok(());
+        }
+
+        let approved_blocks = body.approved_blocks.as_ref().ok_or_else(|| {
+            BlossomError::WireProtocol(
+                "consensus proposal must include approved blocks".to_string(),
+            )
+        })?;
+        let approved_hash = body.approved_hash.ok_or_else(|| {
+            BlossomError::WireProtocol("consensus proposal must include approved hash".to_string())
+        })?;
+        if approved_blocks.hash() != approved_hash {
+            return Err(BlossomError::WireProtocol(
+                "consensus proposal approved-block hash mismatch".to_string(),
             ));
         }
 
@@ -3852,6 +4318,49 @@ fn record_verified_dispatch_blocks(quorum: &mut TempQuorum, blocks: BTreeMap<Has
     quorum.verified_blocks_hash = Some(quorum.verified_blocks_hash());
 }
 
+fn record_commit_vote(quorum: &mut TempQuorum, message: Commit) {
+    let sender = message.header.sender;
+    quorum.pending_commits.remove(&sender);
+    quorum.commit_senders.insert(sender);
+    if message.body.consensus {
+        quorum.commit_true_senders.insert(sender);
+    } else {
+        quorum.commit_true_senders.remove(&sender);
+    }
+    quorum.commit_sent =
+        quorum.commit_true_senders.len() >= quorum.proposals.supermajority as usize;
+}
+
+fn proposal_matches_verified_blocks(message: &Proposal, quorum: &TempQuorum) -> bool {
+    message.body.approved_blocks.as_ref() == Some(&quorum.verified_blocks())
+        && message.body.approved_hash == quorum.verified_blocks_hash
+}
+
+fn activate_pending_proposals(quorum: &mut TempQuorum) {
+    let matching_senders = quorum
+        .pending_proposals
+        .iter()
+        .filter_map(|(sender, proposal)| {
+            proposal_matches_verified_blocks(proposal, quorum).then_some(*sender)
+        })
+        .collect::<Vec<_>>();
+    for sender in matching_senders {
+        if let Some(proposal) = quorum.pending_proposals.remove(&sender) {
+            quorum.proposals.record(proposal);
+        }
+    }
+}
+
+fn activate_pending_true_commits(quorum: &mut TempQuorum) {
+    if quorum.proposals.consensus() != Some(true) {
+        return;
+    }
+    let pending = std::mem::take(&mut quorum.pending_commits);
+    for message in pending.into_values() {
+        record_commit_vote(quorum, message);
+    }
+}
+
 impl MessageReceipt {
     fn accepted(kind: impl Into<String>) -> Self {
         Self {
@@ -3862,12 +4371,24 @@ impl MessageReceipt {
 }
 
 pub fn genesis_epoch(nodes: impl IntoIterator<Item = NodeIdentity>) -> Epoch {
-    genesis_epoch_for_group(ConsensusGroupId::root(), nodes)
+    genesis_epoch_for_group_with_parameters(
+        ConsensusGroupId::root(),
+        nodes,
+        ConsensusParameters::default(),
+    )
 }
 
 pub fn genesis_epoch_for_group(
     group_id: ConsensusGroupId,
     nodes: impl IntoIterator<Item = NodeIdentity>,
+) -> Epoch {
+    genesis_epoch_for_group_with_parameters(group_id, nodes, ConsensusParameters::default())
+}
+
+pub fn genesis_epoch_for_group_with_parameters(
+    group_id: ConsensusGroupId,
+    nodes: impl IntoIterator<Item = NodeIdentity>,
+    consensus_parameters: ConsensusParameters,
 ) -> Epoch {
     let mut verifiers = IndexTreeMap::new();
     for node in nodes {
@@ -3879,6 +4400,7 @@ pub fn genesis_epoch_for_group(
             group_id,
             verifiers,
             nonce: Nonce::new(0),
+            consensus_parameters: Some(consensus_parameters),
             ..Default::default()
         },
         ..Default::default()
@@ -4035,6 +4557,106 @@ mod tests {
     }
 
     #[test]
+    fn general_runtime_rejects_the_isolated_high_availability_mode() {
+        let node = NodeIdentity::generate("tcp", "127.0.0.1", 8082);
+        let mut config = RuntimeConfig::new(node);
+        config.trust_mode = TrustMode::HighAvailability;
+        assert!(matches!(
+            NodeRuntime::try_new(config),
+            Err(BlossomError::InvalidConfiguration(message))
+                if message.contains("HighAvailabilityRuntime")
+        ));
+    }
+
+    #[test]
+    fn runtime_uses_committed_configurable_quorum_size() {
+        let keypair = Keypair::generate();
+        let node = NodeIdentity::new(
+            keypair.public,
+            Some(keypair.secret),
+            "tcp",
+            "127.0.0.1",
+            8082,
+            false,
+        );
+        let quorum_size = QuorumSize::new(9).unwrap();
+        let runtime =
+            NodeRuntime::try_new(RuntimeConfig::new(node).with_quorum_size(quorum_size)).unwrap();
+        let status = runtime.status().unwrap();
+
+        assert_eq!(status.configured_quorum_size, 9);
+        assert_eq!(status.effective_quorum_size, 1);
+        assert_eq!(
+            status.consensus_parameters_hash,
+            ConsensusParameters::new(quorum_size).hash()
+        );
+        assert_eq!(
+            runtime
+                .epochchain()
+                .epochchain
+                .first()
+                .unwrap()
+                .body
+                .effective_consensus_parameters()
+                .quorum_size,
+            quorum_size
+        );
+    }
+
+    #[test]
+    fn restored_runtime_rejects_local_quorum_override_mismatch() {
+        let (runtime, keypair) = runtime();
+        let snapshot = runtime.snapshot().unwrap();
+        let restored_node = NodeIdentity::new(
+            keypair.public,
+            Some(keypair.secret),
+            "tcp",
+            "127.0.0.1",
+            8080,
+            false,
+        );
+
+        assert_eq!(
+            RuntimeConfig::from_snapshot_with_quorum_override(
+                snapshot,
+                restored_node,
+                Some(QuorumSize::new(9).unwrap()),
+            )
+            .unwrap_err(),
+            BlossomError::ConsensusParametersMismatch {
+                configured: 9,
+                committed: 6,
+            }
+        );
+    }
+
+    #[test]
+    fn legacy_snapshot_decodes_as_six_and_rewrites_explicit_parameters() {
+        let (runtime, _) = runtime();
+        let mut snapshot = runtime.snapshot().unwrap();
+        for epoch in &mut snapshot.epochchain.epochchain {
+            epoch.body.consensus_parameters = None;
+            epoch.set_hash();
+        }
+        let mut json = serde_json::to_value(snapshot).unwrap();
+        json.as_object_mut().unwrap().remove("consensus_parameters");
+        let decoded: RuntimeSnapshotV1 = serde_json::from_value(json).unwrap();
+
+        assert_eq!(decoded.consensus_parameters, ConsensusParameters::default());
+        assert_eq!(
+            decoded.epochchain.epochchain[0].body.consensus_parameters,
+            None
+        );
+        decoded.validate().unwrap();
+
+        let rewritten = serde_json::to_value(decoded).unwrap();
+        assert_eq!(
+            rewritten["consensus_parameters"]["quorum_size"],
+            serde_json::json!(6)
+        );
+    }
+
+    #[test]
     fn catch_up_from_epoch_started_accepts_extending_chain_and_rejects_corruption() {
         let (leader, keypairs, target) = runtime_with_peers();
         let nodes = keypairs
@@ -4111,6 +4733,16 @@ mod tests {
         let mut corrupt = leader.epochchain();
         corrupt.epochchain.last_mut().unwrap().hash = HashType([3; 32]);
         assert!(follower.catch_up_from_epoch_started(corrupt).is_err());
+
+        let mut corrupt_nonce_link = leader.epochchain();
+        let latest = corrupt_nonce_link.epochchain.last_mut().unwrap();
+        latest.body.previous_nonce = Some(Nonce::new(99));
+        latest.set_hash();
+        assert!(
+            follower
+                .catch_up_from_epoch_started(corrupt_nonce_link)
+                .is_err()
+        );
     }
 
     #[test]
@@ -5893,6 +6525,86 @@ mod tests {
     }
 
     #[test]
+    fn receive_proposal_buffers_valid_proof_until_blocks_are_locally_verified() {
+        let (runtime, keypairs, target) = runtime_with_peers();
+        let round = 0;
+        let round_peers = {
+            let mut state = runtime.inner.state.write().expect("state lock poisoned");
+            state
+                .get_mut_consensus(&target.last_epoch, target.nonce)
+                .peers(round)
+        };
+        let block_signer = keypairs
+            .iter()
+            .find(|keypair| keypair.public == round_peers[0])
+            .unwrap();
+        let block = signed_block_for_target(block_signer, &target, b"proposal-arrives-early");
+        let mut dispatched_blocks = BTreeMap::new();
+        dispatched_blocks.insert(block.hash, block);
+        let dispatch = signed_dispatch_for_blocks(block_signer, &target, dispatched_blocks);
+        let approved_blocks = dispatch
+            .body
+            .blocks
+            .keys()
+            .map(|hash| (*hash, ()))
+            .collect::<BTreeMap<_, _>>();
+        let proof = verification_proof_for(
+            &keypairs,
+            &target,
+            round,
+            &approved_blocks,
+            &round_peers[..4],
+        );
+        let body = consensus_proposal_body(&approved_blocks, Some(proof));
+        let proposal = Proposal {
+            header: signed_test_header_for_round(
+                block_signer,
+                &target,
+                round,
+                MSGKey::Proposal,
+                &body,
+            ),
+            body,
+        };
+
+        let receipt = runtime.receive_message(Msg::Proposal(proposal)).unwrap();
+        assert_eq!(receipt.kind, "proposal_pending");
+        {
+            let state = runtime.inner.state.read().expect("state lock poisoned");
+            let quorum = state
+                .get_quorum(&target.last_epoch, target.nonce, round)
+                .unwrap();
+            assert_eq!(quorum.pending_proposals.len(), 1);
+            assert!(quorum.proposals.proposals.is_empty());
+        }
+
+        runtime.receive_message(Msg::Dispatch(dispatch)).unwrap();
+        let verification_body = VerificationBody {
+            blocks_hash: approved_blocks.hash(),
+            blocks: approved_blocks,
+        };
+        runtime
+            .receive_message(Msg::Verification(Verification {
+                header: signed_test_header_for_round(
+                    block_signer,
+                    &target,
+                    round,
+                    MSGKey::Verification,
+                    &verification_body,
+                ),
+                body: verification_body,
+            }))
+            .unwrap();
+
+        let state = runtime.inner.state.read().expect("state lock poisoned");
+        let quorum = state
+            .get_quorum(&target.last_epoch, target.nonce, round)
+            .unwrap();
+        assert!(quorum.pending_proposals.is_empty());
+        assert_eq!(quorum.proposals.proposals.len(), 1);
+    }
+
+    #[test]
     fn receive_commit_requires_distinct_true_supermajority() {
         let (runtime, keypairs, target) = runtime_with_peers();
         receive_proposal_supermajority(&runtime, &keypairs, &target, b"commit-threshold-proposals");
@@ -6031,7 +6743,7 @@ mod tests {
     }
 
     #[test]
-    fn receive_commit_rejects_true_without_local_proposal_supermajority() {
+    fn receive_commit_buffers_true_vote_until_local_proposal_supermajority() {
         let (runtime, keypairs, target) = runtime_with_peers();
         let signer = round_signer(&runtime, &keypairs, &target, 0);
         let body = CommitBody {
@@ -6043,19 +6755,28 @@ mod tests {
             body,
         };
 
-        assert!(matches!(
-            runtime.receive_message(Msg::Commit(commit)),
-            Err(BlossomError::WireProtocol(message))
-                if message.contains("proposal supermajority")
-        ));
+        let receipt = runtime.receive_message(Msg::Commit(commit)).unwrap();
+        assert_eq!(receipt.kind, "commit_pending");
 
+        {
+            let state = runtime.inner.state.read().expect("state lock poisoned");
+            let quorum = state
+                .get_quorum(&target.last_epoch, target.nonce, 0)
+                .expect("header validation should initialize quorum state");
+            assert_eq!(quorum.pending_commits.len(), 1);
+            assert!(quorum.commit_senders.is_empty());
+            assert!(quorum.commit_true_senders.is_empty());
+            assert!(!quorum.commit_sent);
+        }
+
+        receive_proposal_supermajority(&runtime, &keypairs, &target, b"buffered-commit-proposals");
         let state = runtime.inner.state.read().expect("state lock poisoned");
         let quorum = state
             .get_quorum(&target.last_epoch, target.nonce, 0)
-            .expect("header validation should initialize quorum state");
-        assert!(quorum.commit_senders.is_empty());
-        assert!(quorum.commit_true_senders.is_empty());
-        assert!(!quorum.commit_sent);
+            .expect("proposal processing should retain quorum state");
+        assert!(quorum.pending_commits.is_empty());
+        assert_eq!(quorum.commit_senders.len(), 1);
+        assert_eq!(quorum.commit_true_senders.len(), 1);
     }
 
     #[test]
@@ -6222,6 +6943,85 @@ mod tests {
             state.epochchain.epochchain.last().unwrap().body.nonce,
             target.nonce
         );
+    }
+
+    #[test]
+    fn trusted_complete_block_set_advances_after_local_receipt_without_votes() {
+        let (runtime, keypairs, target) = runtime_with_peers_mode(TrustMode::Trusted);
+        let local_block =
+            signed_block_for_target(&keypairs[0], &target, b"trusted-stage-driver-local");
+        runtime.submit_block(local_block).unwrap();
+        let local_dispatch = runtime
+            .try_produce_dispatch(0)
+            .unwrap()
+            .expect("queued local block should produce a trusted dispatch");
+        let round_peers = {
+            let mut state = runtime.inner.state.write().expect("state lock poisoned");
+            state
+                .get_mut_consensus(&target.last_epoch, target.nonce)
+                .peers(0)
+        };
+        let mut expected_blocks = local_dispatch.body.blocks.clone();
+
+        for (index, peer) in round_peers.iter().enumerate() {
+            let signer = keypairs
+                .iter()
+                .find(|keypair| keypair.public == *peer)
+                .unwrap();
+            let block = signed_block_for_target(
+                signer,
+                &target,
+                format!("trusted-stage-driver-peer-{index}"),
+            );
+            let mut blocks = BTreeMap::new();
+            blocks.insert(block.hash, block);
+            let dispatch = signed_dispatch_for_blocks(signer, &target, blocks);
+            expected_blocks.extend(dispatch.body.blocks.clone());
+            runtime.receive_message(Msg::Dispatch(dispatch)).unwrap();
+        }
+
+        assert_eq!(runtime.status().unwrap().last_epoch_nonce, Nonce::new(0));
+        assert!(
+            runtime
+                .complete_trusted_verification(0, expected_blocks.hash())
+                .is_err(),
+            "trusted node must send its receipt before advancing"
+        );
+
+        let receipt = runtime
+            .try_produce_verification(0)
+            .unwrap()
+            .expect("complete trusted dispatch set should produce one receipt");
+        assert_eq!(receipt.header.signature, Signature::default());
+        assert_eq!(receipt.body.blocks_hash, expected_blocks.hash());
+        assert_eq!(
+            receipt.body.blocks,
+            expected_blocks
+                .keys()
+                .map(|hash| (*hash, ()))
+                .collect::<BTreeMap<_, _>>()
+        );
+
+        assert!(
+            runtime
+                .complete_trusted_verification(0, receipt.body.blocks_hash)
+                .unwrap()
+        );
+
+        let state = runtime.inner.state.read().expect("state lock poisoned");
+        assert_eq!(state.epochchain.epochchain.len(), 2);
+        let latest = state.epochchain.epochchain.last().unwrap();
+        assert_eq!(latest.body.previous_nonce, Some(Nonce::new(0)));
+        assert_eq!(latest.body.nonce, target.nonce);
+        assert_eq!(
+            latest.body.blocks.keys().copied().collect::<Vec<_>>(),
+            expected_blocks.keys().copied().collect::<Vec<_>>()
+        );
+        let old_quorum = state
+            .get_quorum(&target.last_epoch, target.nonce, 0)
+            .expect("trusted round remains available for diagnostics");
+        assert!(old_quorum.proposals.proposals.is_empty());
+        assert!(old_quorum.commit_senders.is_empty());
     }
 
     #[test]

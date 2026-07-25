@@ -445,9 +445,12 @@ async fn autonomous_tcp_driver_finalizes_36_node_v2_two_round_epoch() {
         36,
         ConsensusDriverConfig {
             interval: std::time::Duration::from_millis(50),
+            event_driven: false,
             max_round: 1,
             drive_prefill: true,
             drive_dispatch: true,
+            require_local_pending_block: false,
+            continue_after_error: false,
         },
     )
     .await
@@ -479,6 +482,51 @@ async fn autonomous_tcp_driver_finalizes_36_node_v2_two_round_epoch() {
         .await
         .unwrap();
     assert_eq!(block_count, 36);
+}
+
+#[tokio::test]
+async fn autonomous_tcp_driver_finalizes_24_node_non_power_topology_epoch() {
+    let cluster = SimulatedCluster::spawn_autonomous_with_config(
+        24,
+        ConsensusDriverConfig {
+            interval: std::time::Duration::from_millis(20),
+            event_driven: false,
+            max_round: 1,
+            drive_prefill: false,
+            drive_dispatch: true,
+            require_local_pending_block: false,
+            continue_after_error: false,
+        },
+    )
+    .await
+    .unwrap();
+    let first_target = cluster.next_target(0).await.unwrap();
+
+    for index in 0..cluster.len() {
+        let block = cluster
+            .signed_block_for(
+                index,
+                index,
+                [Transaction::new(format!("non-power-topology-{index}"))],
+            )
+            .await
+            .unwrap();
+        match cluster
+            .request(index, WireRequest::SubmitBlock(block))
+            .await
+            .unwrap()
+        {
+            WireResponse::BlockAccepted(accepted) => {
+                assert_eq!(accepted.nonce, first_target.nonce);
+            }
+            response => panic!("expected block accepted, got {}", response.kind()),
+        }
+    }
+
+    let (_final_hash, block_count) = wait_for_same_finalized_epoch(&cluster, first_target.nonce, 8)
+        .await
+        .unwrap();
+    assert_eq!(block_count, 24);
 }
 
 #[tokio::test]

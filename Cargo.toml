@@ -14,7 +14,7 @@ availability-gossip = ["filtered-transactions"]
 external-transaction-hashes = []
 fair-block-ordering = []
 filtered-transactions = []
-high-availability = ["dep:hmac", "dep:redb"]
+high-availability = ["dep:hmac"]
 insecure-fast-hash = ["dep:xxhash-rust"]
 propagation-adaptive = [
     "propagation-push",
@@ -40,7 +40,7 @@ indextreemap = "0.2.0"
 itoa = "1.0.15"
 log = "0.4.28"
 rand_core = { version = "0.6.4", features = ["getrandom"] }
-redb = { version = "=4.1.0", optional = true }
+redb = "=4.1.0"
 rs_merkle = "1.5.0"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.145"

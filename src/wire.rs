@@ -28,6 +28,8 @@ use crate::encounter::{
 use crate::error::{BlossomError, Result};
 use crate::group::ConsensusGroupId;
 use crate::hash::{DoHash, HashType, ProtocolHasher};
+#[cfg(feature = "high-availability")]
+use crate::high_availability::{HaMessage, HaNodeStatus, HaWireReceipt};
 use crate::messages::{MSGKey, Msg};
 use crate::nonce::Nonce;
 use crate::runtime::{AcceptedBlock, EpochTarget, MessageReceipt, NodeStatus};
@@ -101,6 +103,10 @@ pub enum WireRequest {
     },
     PrefillDispatch(Dispatch),
     Message(Msg),
+    #[cfg(feature = "high-availability")]
+    HighAvailability(HaMessage),
+    #[cfg(feature = "high-availability")]
+    HighAvailabilityStatus,
     SendNonce(Nonce),
     BlockNonce(Nonce),
     GetBlock(Nonce),
@@ -131,6 +137,10 @@ pub enum WireResponse {
     BlockAccepted(AcceptedBlock),
     Dispatch(Dispatch),
     MessageReceipt(MessageReceipt),
+    #[cfg(feature = "high-availability")]
+    HighAvailabilityReceipt(HaWireReceipt),
+    #[cfg(feature = "high-availability")]
+    HighAvailabilityStatus(HaNodeStatus),
     EchoReDispatch(Option<EchoReDispatch>),
     Block(Block),
     BlocksByHash(BTreeMap<HashType, Block>),
@@ -196,6 +206,10 @@ impl WireResponse {
             Self::BlockAccepted(_) => "block_accepted",
             Self::Dispatch(_) => "dispatch",
             Self::MessageReceipt(_) => "message_receipt",
+            #[cfg(feature = "high-availability")]
+            Self::HighAvailabilityReceipt(_) => "high_availability_receipt",
+            #[cfg(feature = "high-availability")]
+            Self::HighAvailabilityStatus(_) => "high_availability_status",
             Self::EchoReDispatch(_) => "echo_redispatch",
             Self::Block(_) => "block",
             Self::BlocksByHash(_) => "blocks_by_hash",
@@ -253,6 +267,8 @@ pub struct NodePong {
     pub group_id: ConsensusGroupId,
     pub public_key: crate::crypto::PubKey,
     pub protocol_hash_algorithm: String,
+    pub consensus_parameters_hash: HashType,
+    pub quorum_size: usize,
     pub nonce: u64,
     pub payload: Vec<u8>,
 }
@@ -264,10 +280,28 @@ impl NodePong {
         nonce: u64,
         payload: impl Into<Vec<u8>>,
     ) -> Self {
+        Self::new_with_consensus_parameters(
+            group_id,
+            public_key,
+            crate::algorithm::ConsensusParameters::default(),
+            nonce,
+            payload,
+        )
+    }
+
+    pub fn new_with_consensus_parameters(
+        group_id: ConsensusGroupId,
+        public_key: crate::crypto::PubKey,
+        consensus_parameters: crate::algorithm::ConsensusParameters,
+        nonce: u64,
+        payload: impl Into<Vec<u8>>,
+    ) -> Self {
         Self {
             group_id,
             public_key,
             protocol_hash_algorithm: crate::hash::protocol_hash_algorithm().to_string(),
+            consensus_parameters_hash: consensus_parameters.hash(),
+            quorum_size: consensus_parameters.quorum_size.get(),
             nonce,
             payload: payload.into(),
         }
@@ -275,6 +309,14 @@ impl NodePong {
 
     pub fn protocol_hash_compatible(&self) -> bool {
         crate::hash::protocol_hash_algorithm_is_compatible(&self.protocol_hash_algorithm)
+    }
+
+    pub fn consensus_parameters_compatible(
+        &self,
+        expected: crate::algorithm::ConsensusParameters,
+    ) -> bool {
+        self.quorum_size == expected.quorum_size.get()
+            && self.consensus_parameters_hash == expected.hash()
     }
 }
 
@@ -519,7 +561,6 @@ where
     borsh::from_slice(bytes.as_ref()).map_err(|err| BlossomError::WireProtocol(err.to_string()))
 }
 
-#[cfg(feature = "high-availability")]
 pub async fn read_frame_optional<T, R>(reader: &mut R) -> Result<Option<T>>
 where
     T: BorshDeserialize,

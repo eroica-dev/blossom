@@ -10,8 +10,8 @@ use blossom::wire::FRAME_PREFIX_BYTES;
 use blossom::{
     Block, BlockHandle, BlockIndex, BlossomBody, Commit, CommitBody, DoHash, EchoResponse,
     EchoResponseBody, HashType, Header, Keypair, MSGKey, Msg, Nonce, Proposal, ProposalBody,
-    PubKey, SecretSigner, Signature, SignatureTree, Transaction, Verification, VerificationBody,
-    WireRequest, encoded_len, framed_len, supermajority_order_statistic,
+    PubKey, QuorumSize, SecretSigner, Signature, SignatureTree, Transaction, Verification,
+    VerificationBody, WireRequest, encoded_len, framed_len, supermajority_order_statistic,
 };
 
 type MainResult<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
@@ -82,9 +82,7 @@ struct LatencyProfile {
 
 impl LatencyProfile {
     fn from_args(args: &Args) -> MainResult<Self> {
-        if args.quorum_size < 2 {
-            return Err("quorum size must be at least 2".into());
-        }
+        QuorumSize::new(args.quorum_size)?;
         if args.latency_min_ms > args.latency_max_ms {
             return Err("latency-min-ms must be <= latency-max-ms".into());
         }
