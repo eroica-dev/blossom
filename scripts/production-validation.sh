@@ -48,6 +48,8 @@ run reconnect-and-byzantine-sim cargo run -p blossom-sim --bin blossom-sim-epoch
   --byzantine-reconnect-sybil-ppm 250 \
   --seed 4242
 
+run high-availability-production-gate "$ROOT/scripts/ha-production-validation.sh"
+
 run latency-100ms-sim cargo run -p blossom-sim --bin blossom-sim-epoch-chaos --release -- \
   --nodes 36 \
   --epochs 64 \

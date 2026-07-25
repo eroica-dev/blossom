@@ -1,0 +1,46 @@
+name: HA Merge Gate
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+concurrency:
+  group: ha-merge-gate-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  release-and-ha-production:
+    name: Release and HA production gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust 1.90
+        uses: dtolnay/rust-toolchain@1.90.0
+        with:
+          components: clippy,rustfmt
+
+      - name: Cache Cargo build outputs
+        uses: Swatinem/rust-cache@v2
+
+      - name: Run mandatory release and HA validation
+        run: ./scripts/release-gate.sh
+
+      - name: Publish validation logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ha-merge-gate-${{ github.run_id }}
+          path: |
+            target/release-gate
+            target/ha-production-validation
+          if-no-files-found: error
+          retention-days: 30
