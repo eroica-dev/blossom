@@ -1,0 +1,62 @@
+{
+  "version": 1,
+  "consensus_parameters_hash": "a60b34e983f052575daa2d698582ccf5369a8de8ead217617e0716c4e81df902",
+  "configured_quorum_size": 6,
+  "effective_quorum_size": 6,
+  "validator_count": 36,
+  "committee_layout": {
+    "members": [
+      {
+        "node": "0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c",
+        "site": "site-0"
+      },
+      {
+        "node": "0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f",
+        "site": "site-0"
+      },
+      {
+        "node": "1111111111111111111111111111111111111111111111111111111111111111",
+        "site": "site-2"
+      },
+      {
+        "node": "1616161616161616161616161616161616161616161616161616161616161616",
+        "site": "site-1"
+      },
+      {
+        "node": "1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a",
+        "site": "site-2"
+      },
+      {
+        "node": "1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f",
+        "site": "site-1"
+      }
+    ],
+    "members_by_site": {
+      "site-0": [
+        "0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c",
+        "0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f"
+      ],
+      "site-1": [
+        "1616161616161616161616161616161616161616161616161616161616161616",
+        "1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f"
+      ],
+      "site-2": [
+        "1111111111111111111111111111111111111111111111111111111111111111",
+        "1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a"
+      ]
+    }
+  },
+  "local_finality_threshold": 4,
+  "global_finality_threshold": 24,
+  "local_minimum_intersection": 2,
+  "global_minimum_intersection": 12,
+  "validator_byzantine_fault_bound": 11,
+  "holder_fault_bound": 0,
+  "max_validator_liveness_omissions": 12,
+  "site_loss_tolerance": true,
+  "liveness_stop_conditions": [
+    "fewer than 24 validators can participate",
+    "fewer than 4 selected committee members can participate",
+    "a finalized reference at the stable-prefix head is unavailable"
+  ]
+}

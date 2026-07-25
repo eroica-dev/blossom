@@ -65,6 +65,7 @@ harness = false
 members = [
     ".",
     "crates/blossom-observer",
+    "crates/blossom-bench-harness",
     "crates/blossom-propagation",
     "crates/blossom-sim",
     "crates/deterministic-test-env",

@@ -1,0 +1,15 @@
+[package]
+name = "blossom-bench-harness"
+version = "2.0.0-pre-release"
+edition = "2024"
+publish = false
+
+[dependencies]
+blossom = { path = "../..", features = ["high-availability"] }
+borsh = { version = "1.5.7", features = ["derive"] }
+clap = { version = "4.5", features = ["derive", "env"] }
+openraft = { version = "=0.9.24", features = ["serde", "storage-v2"] }
+redb = "=4.1.0"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.145"
+tokio = { version = "1.48", features = ["macros", "net", "rt-multi-thread", "sync", "time"] }

@@ -4,6 +4,12 @@ Performance benchmarks for Blossom protocol primitives and simulated node
 behavior. These are developer-facing benchmarks, separate from the correctness
 test suite.
 
+The current trusted active-active critical path and its prioritized
+1,000-plus-node optimization checklist are documented in
+[`TRUSTED_PATH_OPTIMIZATION.md`](TRUSTED_PATH_OPTIMIZATION.md). Smoke benchmark
+rows include non-overlapping per-stage timings under
+`rows[].blossom.trusted_path`.
+
 ## Modes
 
 | Mode | Driver | Question |
@@ -20,6 +26,79 @@ test suite.
 | `profile-matrix` | Hermetic simulator with node profiling | Which nodes saturate CPU, queue work, or show high handler cost under replayable network and hardware conditions? |
 | `sim-container` | VM-like container runner for `blossom-sim` | Can we run simulations in a contained process/network boundary with only results mounted out? |
 | `epoch-depth` | In-memory protocol simulation | How do paper-aligned quorum rounds behave across consecutive epochs? |
+| `active-active-matrix` | Safety manifest generator plus shared Blossom/OpenRaft harness | Which q=3k and 3/5/7-voter rows are safety-equivalent, and which are footprint-only scaling rows? |
+| `ha-head-to-head` | Fixed-slot HA and OpenRaft protocol-core harness | How do leaderless active-active Blossom HA and leader-based active-passive Raft compare at 2–7 physical nodes? |
+
+## Small-cluster HA versus OpenRaft
+
+Run every supported two-through-seven-node footprint:
+
+```bash
+ITERATIONS=3 PAYLOAD_BYTES=256 \
+  ./benchmarks/scripts/run-ha-head-to-head.sh
+```
+
+Set `WAIT_FOR_SEAL=1` to include Blossom's six-successor sealed visibility
+latency. The harness uses all Blossom members as parallel writers. Raft uses
+two voters at a two-node footprint, then 3/5/7 voters with learners filling
+even footprints. Results are protocol-core diagnostics and remain explicitly
+non-publishable until the full methodology gates are run.
+
+## Active-active Blossom versus OpenRaft
+
+Generate the accepted topology matrices and one safety manifest per row:
+
+```bash
+BLOSSOM_QUORUM_SIZE=6 cargo run -p blossom-bench-harness \
+  --bin blossom-benchmark-matrix -- \
+  --output benchmarks/manifests/active_active
+```
+
+Run the configurable-quorum properties, active-active Hegel suite, OpenRaft
+storage/recovery harness, manifest generator, and available formal tools as one
+gate:
+
+```bash
+BLOSSOM_QUORUM_SIZE=6 ./benchmarks/scripts/run-active-active-gates.sh
+```
+
+Exercise both implementations through `Applied` over the equal-fault rows:
+
+```bash
+ITERATIONS=3 MODE=equal-fault \
+  ./benchmarks/scripts/run-active-active-smoke-matrix.sh
+```
+
+Use `MODE=equal-footprint BLOSSOM_QUORUM_SIZE=6` for the 6–72-machine topology
+matrix. Smoke artifacts are always marked `publishable: false`: the command is
+an executable integration and result-equivalence check, not a substitute for
+the full repetition, steady-state, fault, or confidence-interval gates. It
+uses native TCP for Blossom and OpenRaft's in-process network, while giving
+both protocols immediate-durability redb storage; those transport timings are
+therefore diagnostic and are not a scored comparison.
+
+The shared harness pins OpenRaft 0.9.24, redb 4.1.0, and Hegel 0.28.2. It
+uses the same command/result model for Blossom and OpenRaft, records milestone
+events separately, checks conflicting histories independently for
+linearizability, and implements hierarchical bootstrap resampling over runs
+and one-second blocks.
+
+`benchmarks/manifests/active_active/matrix.json` is configuration evidence, not
+a performance result. A performance row is publishable only after twelve paired
+AB/BA repetitions, five minutes of steady state, at least 100,000 `Applied`
+samples, and all safety, history, durability, replay, and recovery gates pass.
+Validate a completed result bundle with:
+
+```bash
+cargo run -p blossom-bench-harness --bin blossom-benchmark-gate -- \
+  --artifact path/to/performance-artifact.json
+```
+
+The gate also requires non-empty raw milestone events, histories, environment
+and configuration snapshots, safety manifests, fault traces, dependency
+versions, and a summary report. Durable OpenRaft profiles use redb immediate
+durability for votes, logs, state-machine application, and snapshots; the
+kill/restart path reconstructs a new OpenRaft node from that persisted state.
 
 ## Commands
 
@@ -199,7 +278,7 @@ EPOCH_DEPTH=3 NODES=36 TXS_PER_NODE=1000 TX_BYTES=32 \
 ```
 
 Run the 100-epoch latency/quorum matrix. By default this tests quorum sizes
-`3`, `4`, `5`, and `6` with `q*q` nodes, trusted and trustless paths, and both
+`3`, `6`, `9`, and `12` with `q*q` nodes, trusted and trustless paths, and both
 fixed/even and deterministic random pairwise latency:
 
 ```bash
