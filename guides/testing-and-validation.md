@@ -32,8 +32,8 @@ Byzantine reconnect simulation, 100 ms latency simulation, and proof validation
 workloads.
 
 The focused HA gate also includes 1,001+ epoch durability tests, authenticated
-subprocess kill/restart, ENOSPC and fsync atomicity, Hegel properties, OpenRaft
-restart controls, and deterministic 2–7 node fault campaigns:
+subprocess kill/restart, ENOSPC and fsync atomicity, Hegel properties, and
+deterministic 2–7 node fault campaigns:
 
 ```sh
 scripts/ha-production-validation.sh

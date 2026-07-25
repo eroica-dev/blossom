@@ -15,8 +15,6 @@ Whitepaper: [Blossom Consensus Protocol v2](Blossom-Consensus-Protocol-v2-Whitep
   finality.
 - TCP node surface, service clients, local block intake, and restart/catch-up
   primitives.
-- Durable active-active admission, availability certification, global ordering,
-  read barriers, and direct ordered-application APIs.
 - v2 prefill dispatch, recovery, reconciliation, fair block ordering, and
   trusted/trustless execution paths.
 - Deterministic simulation, fault injection, profiling, and telemetry observer
@@ -33,7 +31,6 @@ semantics.
 - [Feature Flags](guides/feature-flags.md)
 - [Operations](guides/operations.md)
 - [Testing And Validation](guides/testing-and-validation.md)
-- [Direct Active-Active Integration](guides/active-active-integration.md)
 - [Small-Cluster High Availability](guides/high-availability.md)
 
 ## Workspace
@@ -41,7 +38,6 @@ semantics.
 | Crate | Purpose |
 | --- | --- |
 | `blossom` | Protocol core, runtime, TCP node, wire protocol, blocks, membership, telemetry events, and benchmarks. |
-| `blossom-bench-harness` | Safety-gated Blossom/OpenRaft topology, correctness, fault, and statistical benchmark controls. |
 | `blossom-propagation` | Feature-gated push, inventory, and adaptive propagation policy primitives. |
 | `blossom-sim` | Deterministic Blossom simulation environment for epochs, faults, churn, reconnects, and profiling. |
 | `blossom-observer` | Telemetry collector and analyzer for multi-node stage/span health. |

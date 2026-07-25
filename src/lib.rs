@@ -28,6 +28,8 @@ pub mod error;
 pub mod group;
 pub mod harness;
 pub mod hash;
+#[cfg(feature = "high-availability")]
+pub mod high_availability;
 pub mod latency_topology;
 pub mod local_block;
 pub mod membership;
@@ -104,6 +106,8 @@ pub use hash::{
     protocol_hash_algorithm_is_compatible, validate_protocol_feature_codes,
     validate_protocol_feature_registry,
 };
+#[cfg(feature = "high-availability")]
+pub use high_availability::*;
 pub use indextreemap::{IndexTreeMap, SharedIndexTreeMap};
 pub use latency_topology::{
     ClosestPeer, LatencyEstimate, LatencyEstimateMethod, LatencyRelationship, LatencyTopology,

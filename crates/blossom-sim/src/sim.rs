@@ -416,7 +416,6 @@ fn to_blossom_error(err: SimEnvError) -> BlossomError {
 }
 
 fn request_kind(request: &WireRequest) -> &'static str {
-    #[allow(unreachable_patterns)]
     match request {
         WireRequest::Health => "health",
         WireRequest::Ping(_) => "ping",
@@ -442,19 +441,11 @@ fn request_kind(request: &WireRequest) -> &'static str {
         WireRequest::Dispatch { .. } => "dispatch",
         WireRequest::PrefillDispatch(_) => "prefill_dispatch",
         WireRequest::Message(_) => "message",
-        #[cfg(feature = "high-availability")]
-        WireRequest::HighAvailability(_) => "high_availability",
-        #[cfg(feature = "high-availability")]
-        WireRequest::HighAvailabilityStatus => "high_availability_status",
         WireRequest::SendNonce(_) => "send_nonce",
         WireRequest::BlockNonce(_) => "block_nonce",
         WireRequest::GetBlock(_) => "get_block",
         WireRequest::GetBlocksByHash { .. } => "get_blocks_by_hash",
         WireRequest::SendBlock(_) => "send_block",
-        // Cargo feature unification may enable a Blossom wire variant through
-        // another workspace crate without enabling the forwarding feature on
-        // blossom-sim itself.
-        _ => "feature_gated",
     }
 }
 

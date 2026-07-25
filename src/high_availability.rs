@@ -23,7 +23,6 @@ use sha2::Sha256;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Mutex;
 
-use crate::active_active::{CommandIdentity, Watermark};
 use crate::address_book::Service;
 use crate::block::Block;
 use crate::crypto::PubKey;
@@ -32,7 +31,7 @@ use crate::group::ConsensusGroupId;
 use crate::hash::{HashType, ProtocolHasher};
 use crate::node::NodeIdentity;
 use crate::nonce::Nonce;
-use crate::wire::{WireRequest, WireResponse, read_frame, read_frame_optional, write_frame};
+use crate::wire::{read_frame, read_frame_optional, write_frame};
 
 const HA_RUNTIME_STATE_TABLE: TableDefinition<u8, &[u8]> =
     TableDefinition::new("ha_runtime_state_v1");
@@ -68,6 +67,77 @@ pub const HIGH_AVAILABILITY_PARAMETERS_VERSION: u16 = 1;
 pub const HIGH_AVAILABILITY_RECOVERY_SNAPSHOT_VERSION: u16 = 1;
 
 type HaHmacSha256 = Hmac<Sha256>;
+
+#[derive(
+    Serialize,
+    Deserialize,
+    BorshSerialize,
+    BorshDeserialize,
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+)]
+pub struct ClientId(pub [u8; 16]);
+
+#[derive(
+    Serialize,
+    Deserialize,
+    BorshSerialize,
+    BorshDeserialize,
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+)]
+pub struct ClientEpoch(pub u64);
+
+#[derive(
+    Serialize,
+    Deserialize,
+    BorshSerialize,
+    BorshDeserialize,
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+)]
+pub struct CommandIdentity {
+    pub client_id: ClientId,
+    pub client_epoch: ClientEpoch,
+    pub sequence: u64,
+}
+
+#[derive(
+    Serialize,
+    Deserialize,
+    BorshSerialize,
+    BorshDeserialize,
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    Default,
+)]
+pub struct Watermark {
+    pub position: u64,
+}
 
 /// Shared secret used to authenticate and integrity-protect the isolated HA
 /// transport profile.
@@ -161,11 +231,41 @@ struct HaTransportSessionSeed {
     server_nonce: [u8; HA_TRANSPORT_KEY_BYTES],
 }
 
+/// Request envelope for the isolated HA transport.
+///
+/// This deliberately does not reuse [`crate::wire::WireRequest`], so enabling
+/// HA cannot change the discriminants or compatibility profile of Blossom's
+/// existing verified and trusted wire protocol.
+#[derive(BorshSerialize, BorshDeserialize, Debug, Clone)]
+pub enum HaWireRequest {
+    Message(HaMessage),
+    Status,
+    Health,
+}
+
+/// Response envelope for the isolated HA transport.
+#[derive(BorshSerialize, BorshDeserialize, Debug, Clone)]
+pub enum HaWireResponse {
+    Receipt(HaWireReceipt),
+    Status(HaNodeStatus),
+    Error(String),
+}
+
+impl HaWireResponse {
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::Receipt(_) => "high_availability_receipt",
+            Self::Status(_) => "high_availability_status",
+            Self::Error(_) => "error",
+        }
+    }
+}
+
 #[derive(BorshSerialize, BorshDeserialize, Debug, Clone)]
 struct HaAuthenticatedRequestBody {
     session_id: [u8; HA_TRANSPORT_KEY_BYTES],
     sequence: u64,
-    request: WireRequest,
+    request: HaWireRequest,
 }
 
 #[derive(BorshSerialize, BorshDeserialize, Debug, Clone)]
@@ -178,7 +278,7 @@ struct HaAuthenticatedRequest {
 struct HaAuthenticatedResponseBody {
     session_id: [u8; HA_TRANSPORT_KEY_BYTES],
     sequence: u64,
-    response: WireResponse,
+    response: HaWireResponse,
 }
 
 #[derive(BorshSerialize, BorshDeserialize, Debug, Clone)]
@@ -2686,7 +2786,7 @@ impl HaAuthenticatedConnection {
         })
     }
 
-    async fn request(&mut self, request: &WireRequest) -> Result<WireResponse> {
+    async fn request(&mut self, request: &HaWireRequest) -> Result<HaWireResponse> {
         let sequence = self.next_sequence;
         let body = HaAuthenticatedRequestBody {
             session_id: self.session_id,
@@ -2739,7 +2839,11 @@ impl HighAvailabilityTcpClient {
         }
     }
 
-    pub async fn request(&self, service: &Service, request: &WireRequest) -> Result<WireResponse> {
+    pub async fn request(
+        &self,
+        service: &Service,
+        request: &HaWireRequest,
+    ) -> Result<HaWireResponse> {
         let key = format!("{}#{}", service.socket_addr(), service.public_key);
         let connection = self.connection(&key, service).await?;
         let response = {
@@ -2762,12 +2866,9 @@ impl HighAvailabilityTcpClient {
     }
 
     pub async fn status(&self, service: &Service) -> Result<HaNodeStatus> {
-        match self
-            .request(service, &WireRequest::HighAvailabilityStatus)
-            .await?
-        {
-            WireResponse::HighAvailabilityStatus(status) => Ok(status),
-            WireResponse::Error(message) => Err(BlossomError::ExternalService(message)),
+        match self.request(service, &HaWireRequest::Status).await? {
+            HaWireResponse::Status(status) => Ok(status),
+            HaWireResponse::Error(message) => Err(BlossomError::ExternalService(message)),
             response => Err(BlossomError::WireProtocol(format!(
                 "expected HA status, got {}",
                 response.kind()
@@ -2781,11 +2882,11 @@ impl HighAvailabilityTcpClient {
         message: HaMessage,
     ) -> Result<HaWireReceipt> {
         match self
-            .request(service, &WireRequest::HighAvailability(message))
+            .request(service, &HaWireRequest::Message(message))
             .await?
         {
-            WireResponse::HighAvailabilityReceipt(receipt) => Ok(receipt),
-            WireResponse::Error(message) => Err(BlossomError::ExternalService(message)),
+            HaWireResponse::Receipt(receipt) => Ok(receipt),
+            HaWireResponse::Error(message) => Err(BlossomError::ExternalService(message)),
             response => Err(BlossomError::WireProtocol(format!(
                 "expected HA receipt, got {}",
                 response.kind()
@@ -2950,7 +3051,7 @@ impl HighAvailabilityTcpNode {
             let response = self
                 .handle_authenticated_request(challenge.body.hello.client, request.body.request)
                 .await
-                .unwrap_or_else(|error| WireResponse::Error(error.to_string()));
+                .unwrap_or_else(|error| HaWireResponse::Error(error.to_string()));
             let response_body = HaAuthenticatedResponseBody {
                 session_id,
                 sequence: expected_sequence,
@@ -2971,10 +3072,10 @@ impl HighAvailabilityTcpNode {
     async fn handle_authenticated_request(
         &self,
         authenticated_peer: PubKey,
-        request: WireRequest,
-    ) -> Result<WireResponse> {
+        request: HaWireRequest,
+    ) -> Result<HaWireResponse> {
         match request {
-            WireRequest::HighAvailability(message) => {
+            HaWireRequest::Message(message) => {
                 let mut runtime = self.runtime.lock().await;
                 let claimed_peer = ha_message_sender(&message, runtime.members())?;
                 if claimed_peer != authenticated_peer {
@@ -2984,13 +3085,13 @@ impl HighAvailabilityTcpNode {
                 }
                 let event = runtime.receive_message(message)?;
                 let nonce = runtime.head().nonce;
-                Ok(WireResponse::HighAvailabilityReceipt(
-                    HaWireReceipt::from_event(&event, nonce),
-                ))
+                Ok(HaWireResponse::Receipt(HaWireReceipt::from_event(
+                    &event, nonce,
+                )))
             }
-            WireRequest::HighAvailabilityStatus => Ok(WireResponse::HighAvailabilityStatus(
-                self.runtime.lock().await.status()?,
-            )),
+            HaWireRequest::Status => {
+                Ok(HaWireResponse::Status(self.runtime.lock().await.status()?))
+            }
             _ => Err(BlossomError::WireProtocol(
                 "HA service accepts only high-availability messages and status requests"
                     .to_string(),
@@ -4184,7 +4285,6 @@ impl HighAvailabilityRuntime {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::active_active::{ClientEpoch, ClientId};
     use crate::address_book::ServiceKind;
     use crate::block::Transaction;
     use redb::StorageBackend;
@@ -5140,10 +5240,12 @@ mod tests {
         let task = tokio::spawn(server.serve(listener));
         let service = Service::new(ServiceKind::Consensus, server_key, "tcp", "127.0.0.1", port);
 
-        let raw_client = crate::service_client::TcpServiceClient::new();
+        let mut raw_stream = TcpStream::connect(service.socket_addr()).await.unwrap();
+        write_frame(&mut raw_stream, &HaWireRequest::Status)
+            .await
+            .unwrap();
         assert!(
-            raw_client
-                .request(&service, &WireRequest::HighAvailabilityStatus)
+            read_frame::<HaWireResponse, _>(&mut raw_stream)
                 .await
                 .is_err()
         );
@@ -5211,7 +5313,7 @@ mod tests {
         let body = HaAuthenticatedRequestBody {
             session_id: connection.session_id,
             sequence: 1,
-            request: WireRequest::HighAvailabilityStatus,
+            request: HaWireRequest::Status,
         };
         let request = HaAuthenticatedRequest {
             mac: ha_transport_mac(&connection.session_key, HA_TRANSPORT_REQUEST_DOMAIN, &body)
@@ -5263,7 +5365,7 @@ mod tests {
         let authenticated_body = HaAuthenticatedRequestBody {
             session_id: connection.session_id,
             sequence: 1,
-            request: WireRequest::HighAvailabilityStatus,
+            request: HaWireRequest::Status,
         };
         let mut request = HaAuthenticatedRequest {
             mac: ha_transport_mac(
@@ -5274,7 +5376,7 @@ mod tests {
             .unwrap(),
             body: authenticated_body,
         };
-        request.body.request = WireRequest::Health;
+        request.body.request = HaWireRequest::Health;
 
         write_frame(&mut connection.stream, &request).await.unwrap();
         assert!(

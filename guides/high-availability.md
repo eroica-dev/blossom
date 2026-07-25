@@ -3,7 +3,7 @@
 The `high-availability` feature is Blossom's trusted active-active protocol for
 two through seven fixed node identities. Every active member may write in every
 epoch. OpenRaft remains the benchmarked leader-based active-passive option and
-is not a Blossom core dependency.
+is kept outside Blossom core.
 
 Enable the API directly from an application such as `shard-kv` or
 `shard-stream`:
@@ -225,8 +225,6 @@ The gate includes:
 - the formal strict-majority checks for every supported size;
 - a 1,001-epoch immediate-durability soak with repeated reopen and snapshot
   recovery;
-- a 1,001-write durable OpenRaft adapter soak with repeated leader and follower
-  restarts, snapshots, linearizable reads, and replica catch-up;
 - three deterministic 1,200-epoch campaigns for every cluster size from two
   through seven;
 - transient asymmetric loss, duplicate and reordered delivery, all tolerated

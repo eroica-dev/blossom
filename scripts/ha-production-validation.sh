@@ -5,7 +5,6 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 OUT_DIR="${HA_VALIDATION_OUT_DIR:-$ROOT/target/ha-production-validation}"
 EPOCHS="${HA_FAULT_EPOCHS:-1200}"
 SOAK_EPOCHS="${BLOSSOM_HA_SOAK_EPOCHS:-1001}"
-RAFT_SOAK_COMMANDS="${BLOSSOM_RAFT_SOAK_COMMANDS:-1001}"
 mkdir -p "$OUT_DIR"
 
 run() {
@@ -21,9 +20,6 @@ run ha-clippy \
 
 run ha-simulator-clippy \
   cargo clippy -p blossom-sim --all-targets --features high-availability -- -D warnings
-
-run openraft-adapter-clippy \
-  cargo clippy -p blossom-bench-harness --all-targets -- -D warnings
 
 run ha-unit-and-integration \
   cargo test -p blossom --features high-availability high_availability
@@ -50,12 +46,6 @@ run ha-durable-soak \
   env BLOSSOM_HA_SOAK_EPOCHS="$SOAK_EPOCHS" \
   cargo test --release -p blossom --features high-availability \
   high_availability::tests::durable_runtime_survives_thousand_epoch_restart_and_recovery_soak \
-  -- --ignored --nocapture
-
-run openraft-durable-soak \
-  env BLOSSOM_RAFT_SOAK_COMMANDS="$RAFT_SOAK_COMMANDS" \
-  cargo test --release -p blossom-bench-harness \
-  raft_adapter::tests::durable_openraft_survives_thousand_write_leader_and_follower_restart_soak \
   -- --ignored --nocapture
 
 run ha-chaos-seed-primary \

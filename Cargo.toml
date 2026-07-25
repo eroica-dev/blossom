@@ -14,7 +14,7 @@ availability-gossip = ["filtered-transactions"]
 external-transaction-hashes = []
 fair-block-ordering = []
 filtered-transactions = []
-high-availability = []
+high-availability = ["dep:hmac", "dep:redb"]
 insecure-fast-hash = ["dep:xxhash-rust"]
 propagation-adaptive = [
     "propagation-push",
@@ -35,11 +35,12 @@ clap = { version = "4.5", features = ["derive", "env"] }
 ed25519-dalek = { version = "2.2.0", features = ["batch", "hazmat", "rand_core"] }
 fast-telemetry = { version = "0.5.1", default-features = false }
 hex = { version = "0.4.3", features = ["serde"] }
-hmac = "=0.12.1"
+hmac = { version = "=0.12.1", optional = true }
 indextreemap = "0.2.0"
 itoa = "1.0.15"
 log = "0.4.28"
 rand_core = { version = "0.6.4", features = ["getrandom"] }
+redb = { version = "=4.1.0", optional = true }
 rs_merkle = "1.5.0"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.145"
@@ -51,6 +52,7 @@ xxhash-rust = { version = "0.8.15", features = ["xxh3"], optional = true }
 [dev-dependencies]
 criterion = "0.7.0"
 env_logger = "0.11.8"
+hegeltest = "=0.28.2"
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ["cfg(kani)"] }

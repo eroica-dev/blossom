@@ -519,6 +519,20 @@ where
     borsh::from_slice(bytes.as_ref()).map_err(|err| BlossomError::WireProtocol(err.to_string()))
 }
 
+#[cfg(feature = "high-availability")]
+pub async fn read_frame_optional<T, R>(reader: &mut R) -> Result<Option<T>>
+where
+    T: BorshDeserialize,
+    R: AsyncRead + Unpin,
+{
+    let Some(bytes) = read_payload_optional(reader).await? else {
+        return Ok(None);
+    };
+    borsh::from_slice(bytes.as_ref())
+        .map(Some)
+        .map_err(|err| BlossomError::WireProtocol(err.to_string()))
+}
+
 pub async fn read_wire_request<R>(reader: &mut R) -> Result<WireRequest>
 where
     R: AsyncRead + Unpin,

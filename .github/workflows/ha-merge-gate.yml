@@ -22,6 +22,8 @@ jobs:
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Install Rust 1.90
         uses: dtolnay/rust-toolchain@1.90.0
@@ -30,6 +32,9 @@ jobs:
 
       - name: Cache Cargo build outputs
         uses: Swatinem/rust-cache@v2
+
+      - name: Verify HA-only source isolation
+        run: ./scripts/check-ha-isolation.sh "origin/${GITHUB_BASE_REF:-main}"
 
       - name: Run mandatory release and HA validation
         run: ./scripts/release-gate.sh
