@@ -14,6 +14,7 @@ availability-gossip = ["filtered-transactions"]
 external-transaction-hashes = []
 fair-block-ordering = []
 filtered-transactions = []
+high-availability = []
 insecure-fast-hash = ["dep:xxhash-rust"]
 propagation-adaptive = [
     "propagation-push",
@@ -34,6 +35,7 @@ clap = { version = "4.5", features = ["derive", "env"] }
 ed25519-dalek = { version = "2.2.0", features = ["batch", "hazmat", "rand_core"] }
 fast-telemetry = { version = "0.5.1", default-features = false }
 hex = { version = "0.4.3", features = ["serde"] }
+hmac = "=0.12.1"
 indextreemap = "0.2.0"
 itoa = "1.0.15"
 log = "0.4.28"

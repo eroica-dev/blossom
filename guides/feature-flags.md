@@ -9,7 +9,12 @@
 | `propagation-push` | no | Enable latency-first full-block push planning. |
 | `propagation-inventory` | no | Enable inventory-then-missing planning for bandwidth-sensitive propagation. |
 | `propagation-adaptive` | no | Enable adaptive propagation policy selection. |
+| `high-availability` | no | Enable trusted, fixed-slot, leaderless active-active replication for 2–7 fixed node identities. |
 | `insecure-fast-hash` | no | Replace SHA-256 protocol commitments with XXH3 for trusted/performance experiments only. |
 
 Trustless deployments should keep `fair-block-ordering` enabled and should not
 use `insecure-fast-hash`.
+
+`high-availability` is a separate trusted wire and state profile. It does not
+consult `BLOSSOM_QUORUM_SIZE`, and it does not provide Byzantine or Sybil
+protection.

@@ -14,6 +14,7 @@ availability-gossip = ["blossom/availability-gossip"]
 external-transaction-hashes = ["blossom/external-transaction-hashes"]
 fair-block-ordering = ["blossom/fair-block-ordering"]
 filtered-transactions = ["blossom/filtered-transactions"]
+high-availability = ["blossom/high-availability"]
 insecure-fast-hash = ["blossom/insecure-fast-hash"]
 propagation-adaptive = ["blossom/propagation-adaptive"]
 propagation-inventory = ["blossom/propagation-inventory"]
@@ -23,4 +24,11 @@ propagation-push = ["blossom/propagation-push"]
 blossom = { version = "2.0.0-pre-release", path = "../..", default-features = false }
 deterministic-test-env = { version = "2.0.0-pre-release", path = "../deterministic-test-env" }
 clap = { version = "4.5", features = ["derive", "env"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 tokio = { version = "1.48", features = ["macros", "net", "rt-multi-thread", "time"] }
+
+[[bin]]
+name = "blossom-sim-ha-chaos"
+path = "src/bin/blossom-sim-ha-chaos.rs"
+required-features = ["high-availability"]
