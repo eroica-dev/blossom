@@ -10,6 +10,8 @@
 | `propagation-inventory` | no | Enable inventory-then-missing planning for bandwidth-sensitive propagation. |
 | `propagation-adaptive` | no | Enable adaptive propagation policy selection. |
 | `high-availability` | no | Enable trusted, fixed-slot, leaderless active-active replication for 2–7 fixed node identities. |
+| `trusted-checkpoint-dag` | no | Experiment with append-only DAG dissemination under Global Blossom's sequential quorum ordering. Global Blossom requires at least six logical members. |
+| `parallel-networks` | no | Enable application-level coordination records between independent HA and Global Blossom networks. Enables `high-availability` and `trusted-checkpoint-dag`. |
 | `insecure-fast-hash` | no | Replace SHA-256 protocol commitments with XXH3 for trusted/performance experiments only. |
 
 Trustless deployments should keep `fair-block-ordering` enabled and should not
@@ -17,4 +19,10 @@ use `insecure-fast-hash`.
 
 `high-availability` is a separate trusted wire and state profile. It does not
 consult `BLOSSOM_QUORUM_SIZE`, and it does not provide Byzantine or Sybil
-protection.
+protection. Its service API also exposes the independent
+`MajorityLeaderActivePassive` integration contract for external Raft drivers;
+this does not add a Raft implementation or dependency to Blossom core.
+
+`parallel-networks` does not merge either protocol's membership or quorum. It
+only allows sealed HA state references to be ordered as application records by
+an independent Global Blossom network.

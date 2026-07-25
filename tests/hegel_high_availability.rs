@@ -2,7 +2,8 @@
 
 use blossom::{
     ConsensusGroupId, DEFAULT_MUTABLE_EPOCH_DEPTH, DEFAULT_UNRESPONSIVE_EPOCH_DEPTH,
-    EpochLifecycle, HaCandidate, HaMemberSlots, HaServiceDirective, HaServiceHealth, HashType,
+    EpochLifecycle, HaCandidate, HaLeadershipStatus, HaMemberSlots, HaReplicationMode,
+    HaServiceDirective, HaServiceHealth, HaServiceTopology, HaWriteRoute, HashType,
     HighAvailabilityParameters, HighAvailabilityRuntime, MAX_HA_NODES, NodeAvailabilityStatus,
     NodeIdentity, PubKey, epoch_lifecycle, high_availability_fault_tolerance,
     high_availability_majority,
@@ -202,4 +203,99 @@ fn operational_health_matches_every_supported_quorum_boundary(tc: TestCase) {
                 .contains(&HaServiceDirective::DrainWrites)
         );
     }
+}
+
+#[hegel::test(test_cases = 400)]
+fn both_ha_modes_obey_the_same_voter_majority_boundary(tc: TestCase) {
+    let physical_nodes = tc.draw(gs::integers::<u8>().min_value(2).max_value(7));
+    let active_passive = tc.draw(gs::booleans());
+    let voting_nodes = if active_passive {
+        tc.draw(gs::integers::<u8>().min_value(2).max_value(physical_nodes))
+    } else {
+        physical_nodes
+    };
+    let responsive = tc.draw(gs::integers::<u8>().min_value(0).max_value(voting_nodes));
+    let topology = if active_passive {
+        HaServiceTopology::active_passive(usize::from(physical_nodes), usize::from(voting_nodes))
+            .unwrap()
+    } else {
+        HaServiceTopology::active_active(usize::from(physical_nodes)).unwrap()
+    };
+    let leadership = if active_passive {
+        if tc.draw(gs::booleans()) {
+            HaLeadershipStatus::Elected
+        } else {
+            HaLeadershipStatus::Unavailable
+        }
+    } else {
+        HaLeadershipStatus::NotApplicable
+    };
+    let status = topology
+        .assess(usize::from(responsive), leadership)
+        .unwrap();
+    let required = high_availability_majority(usize::from(voting_nodes)) as u8;
+    let expected_writable =
+        responsive >= required && (!active_passive || leadership == HaLeadershipStatus::Elected);
+
+    assert_eq!(status.required_voters, required);
+    assert_eq!(
+        status.tolerated_voter_failures,
+        voting_nodes.saturating_sub(required)
+    );
+    assert_eq!(status.accepts_writes, expected_writable);
+    assert!(status.serves_local_reads);
+    assert_eq!(
+        status.write_route,
+        if active_passive {
+            HaWriteRoute::CurrentLeader
+        } else {
+            HaWriteRoute::AnyActiveMember
+        }
+    );
+    assert_eq!(
+        status.topology.mode,
+        if active_passive {
+            HaReplicationMode::MajorityLeaderActivePassive
+        } else {
+            HaReplicationMode::LeaderlessActiveActive
+        }
+    );
+    if responsive < required {
+        assert!(
+            status
+                .directives
+                .contains(&HaServiceDirective::AwaitQuorum {
+                    required,
+                    responsive,
+                })
+        );
+    } else if active_passive && leadership == HaLeadershipStatus::Unavailable {
+        assert!(status.directives.contains(&HaServiceDirective::AwaitLeader));
+    }
+}
+
+#[hegel::test(test_cases = 200)]
+fn two_voter_ha_never_writes_after_one_voter_is_lost(tc: TestCase) {
+    let active_passive = tc.draw(gs::booleans());
+    let (topology, leadership) = if active_passive {
+        (
+            HaServiceTopology::active_passive(2, 2).unwrap(),
+            if tc.draw(gs::booleans()) {
+                HaLeadershipStatus::Elected
+            } else {
+                HaLeadershipStatus::Unavailable
+            },
+        )
+    } else {
+        (
+            HaServiceTopology::active_active(2).unwrap(),
+            HaLeadershipStatus::NotApplicable,
+        )
+    };
+    let status = topology.assess(1, leadership).unwrap();
+    assert_eq!(status.required_voters, 2);
+    assert_eq!(status.health, HaServiceHealth::Unavailable);
+    assert!(!status.accepts_writes);
+    assert!(status.serves_local_reads);
+    assert!(status.directives.contains(&HaServiceDirective::DrainWrites));
 }

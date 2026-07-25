@@ -38,6 +38,8 @@ pub mod messages;
 pub mod node;
 pub mod nonce;
 pub mod overlay;
+#[cfg(feature = "parallel-networks")]
+pub mod parallel_networks;
 pub mod register;
 pub mod round_skip;
 pub mod runtime;
@@ -48,6 +50,9 @@ pub mod state;
 pub mod subset_gossip;
 pub mod tcp;
 pub mod telemetry;
+#[cfg(feature = "trusted-checkpoint-dag")]
+pub mod trusted_dag;
+pub mod trusted_log;
 pub mod wire;
 
 #[cfg(any(
@@ -144,6 +149,12 @@ pub use messages::{MSGKey, Msg};
 pub use node::{NodeIdentity, NodeType};
 pub use nonce::Nonce;
 pub use overlay::{BroadcastReceipt, BroadcastReport, FanOutStrategy, OverlayRuntime};
+#[cfg(feature = "parallel-networks")]
+pub use parallel_networks::{
+    HA_GROUP_STATE_REFERENCE_VERSION, HaGroupRegistration, HaGroupStateReference,
+    HaGroupStateReferenceBody, PARALLEL_NETWORK_SNAPSHOT_VERSION, ParallelNetworkCoordinator,
+    ParallelNetworkEvent, ParallelNetworkSnapshot, ParallelNetworkStatus,
+};
 pub use register::{MessageMatrix, QuorumQueue, Status};
 pub use round_skip::{
     DataDisseminationManifest, DataDisseminationManifestValidation, FutureRoundAssistDecision,
@@ -156,7 +167,8 @@ pub use runtime::{
     NodeRuntime, NodeStatus, ObservedEncounterRecord, PeerApplicationState,
     PrefillDispatchBroadcastReport, PrefillDispatchPlan, ReconnectAdmissionDecision,
     ReconnectAdmissionEvidence, RuntimeConfig, RuntimeMode, RuntimeSnapshotV1, TrustMode,
-    genesis_epoch, genesis_epoch_for_group, genesis_epoch_for_group_with_parameters,
+    TrustedOperationalStatus, TrustedServiceHealth, genesis_epoch, genesis_epoch_for_group,
+    genesis_epoch_for_group_with_parameters,
 };
 pub use safety::{
     CommitteeLayout, CommitteeParticipant, SafetyManifest, SiteId, generate_safety_manifest,
@@ -185,6 +197,18 @@ pub use tcp::{
 pub use telemetry::{
     InMemoryTelemetrySink, JsonlTcpTelemetrySink, JsonlTcpTelemetrySinkConfig, NoopTelemetrySink,
     TELEMETRY_SCHEMA_VERSION, TelemetryEvent, TelemetryEventKind, TelemetryHandle, TelemetrySink,
+};
+#[cfg(feature = "trusted-checkpoint-dag")]
+pub use trusted_dag::{
+    MIN_GLOBAL_BLOSSOM_PARTICIPANTS, SequentialQuorumDagReport, TrustedCheckpointDag,
+    TrustedDagCandidate, TrustedDagCandidateBody, TrustedDagCheckpoint, TrustedDagCheckpointBody,
+    TrustedDagFrontierEntry, TrustedDagIngestOutcome, TrustedDagRoundCompletion,
+    TrustedDagRoundLock, TrustedDagVertex, TrustedDagVertexBody,
+    run_sequential_quorum_dag_experiment,
+};
+pub use trusted_log::{
+    TrustedFailureAssessment, TrustedFailureClass, TrustedLogHead, TrustedRoundId,
+    TrustedServiceDirective, assess_trusted_durability_failure,
 };
 pub use wire::{
     AddressBookUpdate, ApplicationRequest, ApplicationResponse, EncodedFrame, FRAME_PREFIX_BYTES,

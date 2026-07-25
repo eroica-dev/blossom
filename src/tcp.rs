@@ -81,6 +81,7 @@ impl Default for ConsensusDriverConfig {
 pub struct ConsensusDriverTick {
     pub prefill_broadcasts: usize,
     pub dispatch_broadcasts: usize,
+    pub trusted_acknowledgement_broadcasts: usize,
     pub verification_broadcasts: usize,
     pub proposal_broadcasts: usize,
     pub commit_broadcasts: usize,
@@ -94,6 +95,7 @@ impl ConsensusDriverTick {
     pub fn broadcasts(&self) -> usize {
         self.prefill_broadcasts
             + self.dispatch_broadcasts
+            + self.trusted_acknowledgement_broadcasts
             + self.verification_broadcasts
             + self.proposal_broadcasts
             + self.commit_broadcasts
@@ -255,14 +257,39 @@ impl TcpNode {
         if config.drive_dispatch
             && let Some(dispatch) = self.runtime.try_produce_dispatch(round)?
         {
-            self.broadcast_round_message(round, Msg::Dispatch(dispatch))
+            let blocks_hash = dispatch.body.blocks_hash;
+            let report = self
+                .broadcast_round_message(round, Msg::Dispatch(dispatch))
                 .await?;
+            if self.runtime.trust_mode().is_trusted() && report.failed() != 0 {
+                self.runtime
+                    .schedule_trusted_dispatch_retry(round, blocks_hash)?;
+            }
             tick.dispatch_broadcasts += 1;
+        }
+        if self.runtime.trust_mode().is_trusted()
+            && let Some(acknowledgement) =
+                self.runtime.try_produce_trusted_acknowledgement(round)?
+        {
+            let blocks_hash = acknowledgement.body.blocks_hash;
+            let report = self
+                .broadcast_round_message(round, Msg::TrustedAcknowledgement(acknowledgement))
+                .await?;
+            if report.failed() != 0 {
+                self.runtime
+                    .schedule_trusted_acknowledgement_retry(round, blocks_hash)?;
+            }
+            tick.trusted_acknowledgement_broadcasts += 1;
         }
         if let Some(verification) = self.runtime.try_produce_verification(round)? {
             let blocks_hash = verification.body.blocks_hash;
-            self.broadcast_round_message(round, Msg::Verification(verification))
+            let report = self
+                .broadcast_round_message(round, Msg::Verification(verification))
                 .await?;
+            if self.runtime.trust_mode().is_trusted() && report.failed() != 0 {
+                self.runtime
+                    .schedule_trusted_confirmation_retry(round, blocks_hash)?;
+            }
             tick.verification_broadcasts += 1;
             if self.runtime.trust_mode().is_trusted() {
                 self.runtime
@@ -270,6 +297,7 @@ impl TcpNode {
             }
         }
         if self.runtime.trust_mode().is_trusted() {
+            self.runtime.try_complete_trusted_verification(round)?;
             if let Some(epoch_started) = self.runtime.try_produce_epoch_started()? {
                 self.broadcast_round_message(0, Msg::EpochStarted(epoch_started))
                     .await?;
@@ -296,6 +324,37 @@ impl TcpNode {
             self.broadcast_round_message(0, Msg::EpochStarted(epoch_started))
                 .await?;
             tick.epoch_started_broadcasts += 1;
+        }
+        Ok(tick)
+    }
+
+    /// Drives only the Dispatch stage for the current round.
+    ///
+    /// Deterministic protocol harnesses use this to establish an all-writer
+    /// admission barrier before allowing acknowledgement or confirmation
+    /// production. Normal autonomous operation continues to use
+    /// [`Self::drive_consensus_once`].
+    pub async fn drive_dispatch_stage_once(&self, max_round: u8) -> Result<ConsensusDriverTick> {
+        let round = self.runtime.current_consensus_round()?;
+        if round > max_round {
+            return Err(crate::BlossomError::WireProtocol(format!(
+                "consensus advanced to round {round}, beyond configured maximum {max_round}"
+            )));
+        }
+        for message in self.runtime.drain_buffered_current_round_messages()? {
+            self.runtime.receive_message(message)?;
+        }
+        let mut tick = ConsensusDriverTick::default();
+        if let Some(dispatch) = self.runtime.try_produce_dispatch(round)? {
+            let blocks_hash = dispatch.body.blocks_hash;
+            let report = self
+                .broadcast_round_message(round, Msg::Dispatch(dispatch))
+                .await?;
+            if self.runtime.trust_mode().is_trusted() && report.failed() != 0 {
+                self.runtime
+                    .schedule_trusted_dispatch_retry(round, blocks_hash)?;
+            }
+            tick.dispatch_broadcasts = 1;
         }
         Ok(tick)
     }

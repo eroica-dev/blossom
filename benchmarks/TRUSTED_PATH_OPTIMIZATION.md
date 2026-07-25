@@ -2,10 +2,12 @@
 
 Trusted Blossom has two deliberately separate benchmark profiles:
 
-- `trusted-direct`: every epoch member sends one unsigned block, receives the
-  complete expected block set, emits one unsigned receipt, orders the blocks by
-  their BTree hash keys, and advances locally. There is no proposal, commit
-  vote, signature, `OrderStatement`, or `OrderCertificate`.
+- `trusted-direct`: every epoch member may send one unsigned block. A node
+  broadcasts a mutable acknowledgement after receiving a two-thirds dispatch
+  quorum. Once two thirds acknowledge the same block set, it durably locks and
+  broadcasts one immutable confirmation, then advances after two thirds
+  confirm that candidate. There is no leader, proposal, signed vote,
+  `OrderStatement`, or portable `OrderCertificate`.
 - `trusted-durable-references`: the stronger asynchronous active-active profile
   with site-local admission, two-site payload custody, compact references, and
   durable visibility milestones.
@@ -26,6 +28,13 @@ The target for 1,000-plus validators is:
 - one amortized durable commit per epoch at each applying replica;
 - `Applied` independent of all-node convergence.
 
+The feature-gated `trusted-checkpoint-dag` experiment evaluates immutable
+per-writer origin chains and compact frontier digests beneath this same
+sequential quorum ordering. It does not add an alternative finality path:
+every frontier must still pass through each selected hierarchical
+acknowledgement/confirmation round before a linear checkpoint advances. See
+[`TRUSTED_CHECKPOINT_DAG_EXPERIMENT.md`](TRUSTED_CHECKPOINT_DAG_EXPERIMENT.md).
+
 The universal-writer diagnostic is
 `blossom-universal-writer-smoke`. It sends independent clients to OpenRaft
 concurrently and validates exact non-conflicting final state after both
@@ -39,19 +48,33 @@ For one fixed membership epoch:
    permitted for idle members.
 2. Members propagate blocks over the configured overlay. Blocks are sealed
    with their writer identity but carry no signature.
-3. A node waits until it possesses exactly one valid block from every expected
-   member.
-4. It sends one unsigned receipt for the complete BTree block-hash set/root.
-5. It commits the epoch locally. The epoch hash binds the block set, previous
-   epoch hash, and previous epoch nonce.
-6. Applications consume `Epoch::trusted_ordered_transactions()`, which returns
+3. A node waits until it possesses exactly one valid block from at least
+   `N - floor(N / 3)` expected members.
+4. It broadcasts its unsigned acknowledgement of the received block set to
+   every round peer. This acknowledgement may only grow as delayed blocks
+   arrive.
+5. After `N - floor(N / 3)` current acknowledgements name the same set, it
+   durably locks and broadcasts one immutable confirmation for that candidate.
+   It cannot confirm a second candidate for the same round, including after
+   restart.
+   Failed trusted fanouts are retried with the exact cached dispatch or locked
+   confirmation; acknowledgements retry their latest monotonic block mask.
+6. It commits the epoch only after the same threshold confirms that candidate.
+   Hierarchical topologies carry the confirmed set into the next round; the
+   final round atomically commits the epoch and append-only log head before the
+   new head is exposed. The epoch hash binds the block set, previous epoch
+   hash, and previous epoch nonce.
+7. Applications consume `Epoch::trusted_ordered_transactions()`, which returns
    opaque payloads in BTree block-hash order, and atomically advance their local
    watermark.
 
-The receipt is synchronization/observability, not a vote. A node does not wait
-for a quorum of receipts and there is no proposal or commit phase. Missing
-members stop liveness for that membership epoch; changing that denominator
-requires an explicit membership transition.
+The acknowledgement is mutable availability evidence. The confirmation is an
+authenticated trusted-network crash-fault decision, not a Byzantine signature
+or portable proof. Two finalized candidates cannot conflict because two
+two-thirds confirmation quorums intersect and each trusted member durably
+locks only one candidate. Up to `floor(N / 3)` inactive members can be omitted
+from an epoch; losing more than that stops liveness until recovery or an
+explicit membership transition.
 
 This design distributes ingress and CPU across writers, but it does not make
 replicating `N` distinct blocks to all `N` nodes sub-quadratic in aggregate
@@ -64,22 +87,25 @@ network bytes, maximum per-node load, and leader load—not only latency.
 
 1. Every eligible node is a writer; no leader, proposer, sequencer, or
    leader-forwarding hop assigns its position.
-2. Every member sends one block per epoch, and real writer blocks are not
-   replaced by one reference plus `N-1` synthetic benchmark blocks.
-3. Ordering is the BTree order of block hashes from the complete expected set.
+2. Every member remains eligible to send one block per epoch, and real writer
+   blocks are not replaced by one reference plus synthetic benchmark blocks.
+3. Ordering is the BTree order of block hashes from the finalized dispatch
+   quorum.
 4. The epoch commits its previous epoch nonce and hash, extending one immutable
    local stable prefix.
 5. Trusted mode carries no signatures or portable certificate. Verified mode
    remains a separate protocol and result label.
 6. `Applied` and all-node convergence are distinct observations.
 7. Non-conflicting workloads require exact final-state equality with Raft.
-8. A missing member is a visible head-of-line liveness fault until membership
-   changes; the implementation never silently shrinks the expected set.
+8. Up to the committed crash-fault bound may be absent without silently
+   changing membership. More than one-third missing members is a visible
+   head-of-line liveness fault until recovery or membership change.
 
 `N` below is the validator population, `H_s` is the holder population in one
 site, `q` is the configured Blossom branching factor, and `B` is commands per
-ordered batch. In trusted mode, "approval" means an unsigned receipt that the
-expected block set was received; it is not a consensus vote.
+ordered batch. In trusted mode, "approval" means an unsigned,
+transport-authenticated confirmation for one durably locked block set; it is
+not a Byzantine consensus vote.
 
 | # | Current operation | Synchronous boundary | Current work | Optimization |
 |---:|---|---|---|---|
@@ -96,7 +122,7 @@ expected block set was received; it is not a consensus vote.
 | 10 | Persist the whole ordered-engine state for `Available` | Serialization + durable I/O | Grows with retained history | Store a delta keyed by reference hash; do not rewrite the state machine or every map. |
 | 11 | Resolve the next epoch target | Local state | Constant after removing an `O(N)` serial agreement scan | Use the locally committed previous epoch nonce/hash; remote validators reject stale targets. |
 | 12 | Submit one unsigned block per member; active writers carry real references | Network | `O(N)` blocks; every origin submits only its own block | Drive activation and completion from runtime events, retain bounded overlay fanout, and benchmark direct payload blocks separately from durable references. |
-| 13 | Receive the complete expected block set, send one unsigned BTree-set receipt, and advance locally | Network + CPU | One trusted receipt phase per overlay level; no proposal or commit vote | Replace timer polling with event-driven completion, pre-encode immutable messages, and pipeline windows. |
+| 13 | Receive a two-thirds dispatch quorum, exchange monotonic block-set acknowledgements, durably lock one confirmation, then advance after a matching confirmation quorum | Network + durable I/O + CPU | One acknowledgement and one confirmation wave per overlay level; no proposal or signed commit vote | Keep control messages compact, event-driven completion, pre-encoded immutable confirmations, and pipelined windows. |
 | 14 | Poll validator chains for benchmark observation | Network + decoding | Trusted `Finalized` is the origin node's local commit; convergence is measured separately | Subscribe to the local epoch-commit event and keep all-node observation off the critical path. |
 | 15 | Derive an `OrderStatement` from the finalized epoch | CPU | Constant plus repeated hashing | Put position, reference hash, previous order-certificate hash, and generation in the Blossom-finalized statement. |
 | 16 | Trusted order-vote wave | None | Removed: trusted mode finalizes directly from its locally committed epoch | Keep signed anti-equivocation votes only in verified mode. |
@@ -147,8 +173,9 @@ epoch API, then coalesce or bypass the optional durable-reference transactions.
    `Epoch::trusted_ordered_transactions()` with one atomic epoch commit,
    bypassing local-admission, two-site-availability, and order-certificate
    storage.
-3. Retain exactly one block from every expected member. Optimize empty-block
-   encoding and activation; never omit a member silently.
+3. Retain at most one block per expected member and require the committed
+   two-thirds threshold. Durably carry a local writer block forward when a
+   competing quorum omits it; never discard accepted local work silently.
 4. Replace benchmark chain polling with a local epoch-commit notification.
 5. Keep convergence and repair asynchronous after `Applied`.
 

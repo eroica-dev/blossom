@@ -17,18 +17,28 @@ without the durable-reference engine:
 1. Build one `Block` per member and place the application's opaque
    `Transaction` payloads in it.
 2. Call `Block::seal_unsigned(writer_public_key)`.
-3. Submit it to `NodeRuntime`/`TcpNode`. Blossom propagates the blocks, sends
-   one unsigned complete-set receipt, and locally commits the BTree block-hash
-   order after all expected member blocks arrive.
-4. Read the committed `Epoch` from the runtime and call
+3. Submit it to `NodeRuntime`/`TcpNode`. In production, configure
+   `RuntimeConfig::with_trusted_epoch_log_path` so acceptance, confirmation locks,
+   and epochs use immediate-durability redb transactions.
+4. Blossom propagates blocks and broadcasts a monotonic acknowledgement after
+   `N - floor(N / 3)` dispatches. A matching acknowledgement quorum permits
+   one durable confirmation; a matching confirmation quorum advances the
+   hierarchy or commits the BTree block-hash order at its final round. The
+   durable log advances before the in-memory head or commit notification. A
+   locally accepted writer block omitted by another valid quorum is atomically
+   retargeted to the next epoch.
+5. Read the committed `Epoch` from the runtime and call
    `Epoch::trusted_ordered_transactions()`.
-5. Apply those payloads in the returned order and atomically persist the
+6. Apply those payloads in the returned order and atomically persist the
    application's epoch/watermark.
 
-There is no leader, proposer, signature, proposal vote, commit vote,
-`OrderStatement`, or `OrderCertificate` on this path. The epoch already binds
-the previous epoch hash and nonce. A missing expected member stops the current
-epoch until an explicit membership transition handles it.
+There is no leader, proposer, signature, signed proposal/commit phase,
+`OrderStatement`, or portable `OrderCertificate` on this path. Unsigned
+acknowledgements and confirmations are authenticated by the trusted transport.
+Confirmations act as crash-fault decisions. The epoch already binds the
+previous epoch hash and nonce. Up to
+`floor(N / 3)` members may be inactive; losing more stops progress until
+recovery or an explicit membership transition.
 
 ## Durable-reference flow
 
@@ -106,3 +116,19 @@ Resolve `--quorum-size`, then `BLOSSOM_QUORUM_SIZE`, then the default of six
 with `QuorumSize::resolve_startup`. Only values `q >= 3` divisible by three are
 accepted. Once a cluster has committed `ConsensusParameters`, joining and
 restored nodes must use those committed parameters.
+
+Trusted production nodes must also configure a node-local epoch log:
+
+```sh
+BLOSSOM_TRUSTED=true
+BLOSSOM_TRUSTED_EPOCH_LOG=/var/lib/my-service/blossom-trusted.redb
+```
+
+The equivalent CLI option is `--trusted-epoch-log`. A trusted runtime without
+this option remains available for protocol-core simulation and compatibility,
+but `trusted_operational_status()` reports it unavailable for production
+writes. Supplying the option in verified mode is rejected, so verified startup
+and persistence behavior remain unchanged.
+
+See [Trusted Network Durability and Recovery](trusted-network-durability.md)
+for the crash contract and service operations API.

@@ -5,8 +5,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use blossom::{
     ActiveActiveCommand, ClientEpoch, ClientId, CommandIdentity, CommandOperation, CommandResult,
-    HashType, HighAvailabilityParameters, high_availability_fault_tolerance,
-    high_availability_majority,
+    HaReplicationMode, HaServiceTopology, HashType, HighAvailabilityParameters,
+    high_availability_fault_tolerance, high_availability_majority,
 };
 use blossom_bench_harness::{
     FixedSlotHaCluster, HaAppliedSample, InProcessRaftCluster, OPENRAFT_VERSION, PairedRunOrder,
@@ -45,6 +45,8 @@ struct HaHeadToHeadArtifact {
     build_profile: &'static str,
     blossom_profile: &'static str,
     raft_profile: &'static str,
+    blossom_replication_mode: HaReplicationMode,
+    raft_replication_mode: HaReplicationMode,
     openraft_version: &'static str,
     redb_version: &'static str,
     ha_parameters: HighAvailabilityParameters,
@@ -57,6 +59,8 @@ struct HaHeadToHeadArtifact {
 #[derive(Serialize)]
 struct FootprintRow {
     physical_nodes: usize,
+    blossom_topology: HaServiceTopology,
+    raft_topology: HaServiceTopology,
     blossom_fixed_membership_hash: HashType,
     blossom_active_writers: usize,
     blossom_required: usize,
@@ -116,6 +120,8 @@ async fn main() -> Result<(), BoxError> {
     let mut rows = Vec::with_capacity(6);
     for physical_nodes in 2..=7 {
         let (raft_voters, raft_learners) = raft_layout(physical_nodes);
+        let blossom_topology = HaServiceTopology::active_active(physical_nodes)?;
+        let raft_topology = HaServiceTopology::active_passive(physical_nodes, raft_voters)?;
         let mut blossom = match &storage_root {
             Some(root) => FixedSlotHaCluster::with_durable_storage(
                 physical_nodes,
@@ -181,6 +187,8 @@ async fn main() -> Result<(), BoxError> {
         raft.shutdown().await;
         rows.push(FootprintRow {
             physical_nodes,
+            blossom_topology,
+            raft_topology,
             blossom_fixed_membership_hash: blossom.fixed_membership_hash(),
             blossom_active_writers: physical_nodes,
             blossom_required: high_availability_majority(physical_nodes),
@@ -203,7 +211,7 @@ async fn main() -> Result<(), BoxError> {
         not_publishable_reasons.push("does not satisfy twelve paired repetitions");
     }
     let artifact = HaHeadToHeadArtifact {
-        schema_version: 2,
+        schema_version: 3,
         publishable: false,
         not_publishable_reasons,
         build_profile: if cfg!(debug_assertions) {
@@ -221,6 +229,8 @@ async fn main() -> Result<(), BoxError> {
         } else {
             "leader-based-active-passive-in-process-in-memory"
         },
+        blossom_replication_mode: HaReplicationMode::LeaderlessActiveActive,
+        raft_replication_mode: HaReplicationMode::MajorityLeaderActivePassive,
         openraft_version: OPENRAFT_VERSION,
         redb_version: REDB_VERSION,
         ha_parameters: parameters,

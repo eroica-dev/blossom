@@ -14,6 +14,7 @@ The release gate runs:
 - `cargo test -p blossom --no-default-features`
 - `cargo test -p blossom --features insecure-fast-hash`
 - `cargo clippy --workspace --all-features --all-targets -- -D warnings`
+- `scripts/trusted-production-validation.sh`
 - `scripts/ha-production-validation.sh`
 - `verification/run-formal.sh`
 
@@ -30,6 +31,16 @@ scripts/production-validation.sh
 This runs the broader protocol validation matrix, including TCP finality,
 Byzantine reconnect simulation, 100 ms latency simulation, and proof validation
 workloads.
+
+The trusted-network gate includes immediate-durability ENOSPC/fsync fault
+injection, crash/restart recovery, quorum-intersection and dispatch-mask
+properties, atomic multi-reference finalization, and a 1,001-epoch trusted
+delay/drop/partition/reconciliation campaign. It also verifies that parallel
+HA/Global Blossom coordination never merges memberships or quorum votes:
+
+```sh
+scripts/trusted-production-validation.sh
+```
 
 The focused HA gate also includes 1,001+ epoch durability tests, authenticated
 subprocess kill/restart, ENOSPC and fsync atomicity, Hegel properties, and

@@ -536,6 +536,18 @@ pub struct Verification {
     pub body: VerificationBody,
 }
 
+/// A mutable, monotonic trusted-network acknowledgement of locally available
+/// blocks.
+///
+/// This is deliberately separate from [`Verification`]. Trusted nodes may
+/// expand their acknowledgement as delayed blocks arrive, but durably emit at
+/// most one immutable verification/confirmation for a round.
+#[derive(Serialize, Deserialize, BorshSerialize, BorshDeserialize, Debug, Clone)]
+pub struct TrustedAcknowledgement {
+    pub header: Header,
+    pub body: VerificationBody,
+}
+
 #[derive(Serialize, Deserialize, BorshSerialize, BorshDeserialize, Debug, Clone)]
 pub struct VerificationBody {
     pub blocks_hash: HashType,
@@ -589,6 +601,24 @@ impl BlossomMessage for Verification {
 
     fn msg(&self) -> Msg {
         Msg::Verification(self.clone())
+    }
+}
+
+impl BlossomMessage for TrustedAcknowledgement {
+    fn kind(&self) -> MSGKey {
+        MSGKey::TrustedAcknowledgement
+    }
+
+    fn header(&self) -> &Header {
+        &self.header
+    }
+
+    fn body_hash(&self) -> HashType {
+        self.body.blocks_hash
+    }
+
+    fn msg(&self) -> Msg {
+        Msg::TrustedAcknowledgement(self.clone())
     }
 }
 

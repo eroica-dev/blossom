@@ -15,6 +15,9 @@ blossom = { version = "2", features = ["high-availability"] }
 
 HA uses fixed member slots sorted by public key, `u8` masks, and fixed arrays.
 It does not use hierarchical quorum selection or `BLOSSOM_QUORUM_SIZE`.
+An application may also publish sealed HA state references through an
+independent Global Blossom network; this does not add HA replicas to Blossom's
+membership. See [Parallel HA and Global Blossom Networks](parallel-ha-global-blossom.md).
 
 ## Guarantees
 
@@ -41,6 +44,37 @@ partitions; it does not protect against malicious trusted members, Sybil
 identities, or Byzantine equivocation. Because all members share the transport
 key, key distribution and coordinated rotation belong to the deployment
 control plane.
+
+## Service replication modes
+
+Node count is a supported topology boundary, not an automatic protocol
+selector. Applications explicitly choose:
+
+```rust
+enum HaReplicationMode {
+    LeaderlessActiveActive,
+    MajorityLeaderActivePassive,
+}
+```
+
+`LeaderlessActiveActive` is implemented by Blossom HA and routes writes to any
+active member. `MajorityLeaderActivePassive` routes writes to the current
+leader and is implemented by an external Raft driver. Blossom core contains no
+OpenRaft dependency.
+
+Use `HaServiceTopology::active_active(member_count)` or
+`HaServiceTopology::active_passive(physical_nodes, voting_nodes)` to validate a
+2–7 node deployment and expose its write route, majority, and tolerated voter
+failures. `HaServiceTopology::assess` combines responsive-voter count with the
+external leadership observation into machine-readable readiness and service
+directives.
+
+A two-voter topology requires both voters in either mode. If one is lost, the
+survivor remains locally readable but rejects new consensus writes and emits
+`NotifyOperators`, `NotifyUsers`, `DrainWrites`, and `AwaitQuorum`. Leadership
+does not let one of two voters safely distinguish a crashed peer from a
+partition. Continuous write availability after one failure therefore requires
+at least three voting durability domains.
 
 Each round is:
 
@@ -258,6 +292,13 @@ seven:
 
 ```bash
 ./benchmarks/scripts/run-ha-head-to-head.sh
+```
+
+Run all supported footprints with twelve paired AB/BA repetitions in both the
+in-memory and immediate-durability profiles:
+
+```bash
+./benchmarks/scripts/run-ha-head-to-head-full.sh
 ```
 
 Blossom runs one writer per node. Raft uses 2, 3, 5, or 7 voters and learners

@@ -5,7 +5,7 @@ use std::fmt;
 use crate::blossom::{
     BlossomMessage, Commit, Dispatch, EchoReDispatch, EchoRequest, EchoResponse, EpochStarted,
     Proposal, ReconcileAppraisal, ReconcileCommit, ReconcileRequest, ReconcileResponse,
-    RoundSkipCertificateMessage, RoundSkipVoteMessage, Verification,
+    RoundSkipCertificateMessage, RoundSkipVoteMessage, TrustedAcknowledgement, Verification,
 };
 
 #[derive(Serialize, Deserialize, BorshSerialize, BorshDeserialize, Debug, Clone)]
@@ -26,6 +26,8 @@ pub enum Msg {
     ReconcileCommit(ReconcileCommit),
     Ok,
     Fail,
+    /// Appended to preserve all existing Borsh enum discriminants.
+    TrustedAcknowledgement(TrustedAcknowledgement),
 }
 
 impl Msg {
@@ -101,6 +103,11 @@ impl Msg {
                 .downcast_ref::<ReconcileCommit>()
                 .map(|msg| Msg::ReconcileCommit(msg.clone()))
                 .unwrap(),
+            MSGKey::TrustedAcknowledgement => message
+                .as_any()
+                .downcast_ref::<TrustedAcknowledgement>()
+                .map(|msg| Msg::TrustedAcknowledgement(msg.clone()))
+                .unwrap(),
         }
     }
 }
@@ -121,6 +128,7 @@ pub enum MSGKey {
     ReconcileRequest,
     ReconcileResponse,
     ReconcileCommit,
+    TrustedAcknowledgement,
 }
 
 impl fmt::Display for MSGKey {
@@ -140,6 +148,7 @@ impl fmt::Display for MSGKey {
             Self::ReconcileRequest => write!(f, "RECONCILEREQUEST"),
             Self::ReconcileResponse => write!(f, "RECONCILERESPONSE"),
             Self::ReconcileCommit => write!(f, "RECONCILECOMMIT"),
+            Self::TrustedAcknowledgement => write!(f, "TRUSTEDACKNOWLEDGEMENT"),
         }
     }
 }
@@ -161,6 +170,7 @@ impl MSGKey {
             Self::ReconcileRequest => 11,
             Self::ReconcileResponse => 12,
             Self::ReconcileCommit => 13,
+            Self::TrustedAcknowledgement => 14,
         }
     }
 }
@@ -174,7 +184,7 @@ mod tests {
         ReconcileAppraisal, ReconcileAppraisalBody, ReconcileCommit, ReconcileCommitBody,
         ReconcileRequest, ReconcileRequestBody, ReconcileResponse, ReconcileResponseBody,
         RoundSkipCertificateBody, RoundSkipCertificateMessage, RoundSkipVoteBody,
-        RoundSkipVoteMessage, Verification, VerificationBody,
+        RoundSkipVoteMessage, TrustedAcknowledgement, Verification, VerificationBody,
     };
 
     #[test]
@@ -279,6 +289,13 @@ mod tests {
             }),
             Msg::ReconcileCommit(_)
         ));
+        assert!(matches!(
+            Msg::from_message(&TrustedAcknowledgement {
+                header: Header::default(),
+                body: VerificationBody::default()
+            }),
+            Msg::TrustedAcknowledgement(_)
+        ));
     }
 
     #[test]
@@ -300,5 +317,22 @@ mod tests {
         assert_eq!(MSGKey::ReconcileRequest.to_string(), "RECONCILEREQUEST");
         assert_eq!(MSGKey::ReconcileResponse.to_string(), "RECONCILERESPONSE");
         assert_eq!(MSGKey::ReconcileCommit.to_string(), "RECONCILECOMMIT");
+        assert_eq!(
+            MSGKey::TrustedAcknowledgement.to_string(),
+            "TRUSTEDACKNOWLEDGEMENT"
+        );
+    }
+
+    #[test]
+    fn trusted_message_extension_preserves_existing_borsh_discriminants() {
+        assert_eq!(borsh::to_vec(&Msg::Ok).unwrap(), vec![14]);
+        assert_eq!(borsh::to_vec(&Msg::Fail).unwrap(), vec![15]);
+
+        let encoded = borsh::to_vec(&Msg::TrustedAcknowledgement(TrustedAcknowledgement {
+            header: Header::default(),
+            body: VerificationBody::default(),
+        }))
+        .unwrap();
+        assert_eq!(encoded.first(), Some(&16));
     }
 }

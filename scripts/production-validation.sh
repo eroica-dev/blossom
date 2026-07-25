@@ -19,6 +19,8 @@ run protocol-hardening-runtime cargo test -p blossom --lib runtime::tests
 
 run protocol-hardening-tcp cargo test -p blossom --lib tcp::tests
 
+run trusted-network-production-gate "$ROOT/scripts/trusted-production-validation.sh"
+
 run tcp-finality-6-node cargo test --test e2e_tcp autonomous_tcp_driver_advances_all_nodes_through_epoch
 
 run tcp-finality-36-node-v2 cargo test --test e2e_tcp autonomous_tcp_driver_finalizes_36_node_v2_two_round_epoch

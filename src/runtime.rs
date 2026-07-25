@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 
 use borsh::{BorshDeserialize, BorshSerialize};
 use indextreemap::IndexTreeMap;
@@ -28,7 +28,8 @@ use crate::blossom::{
     BlossomBody, BlossomMessage, Commit, CommitBody, Dispatch, DispatchBody, EchoReDispatch,
     EchoRequest, EchoResponse, EpochStarted, Header, Proposal, ProposalBody, ReconcileAppraisal,
     ReconcileCommit, ReconcileRequest, ReconcileResponse, RoundSkipCertificateMessage,
-    RoundSkipVoteBody, RoundSkipVoteMessage, SignatureTree, Verification, VerificationBody,
+    RoundSkipVoteBody, RoundSkipVoteMessage, SignatureTree, TrustedAcknowledgement, Verification,
+    VerificationBody,
 };
 use crate::crypto::{PubKey, SecretSigner, Signature};
 use crate::encounter::{EncounterOutcome, EncounterPhase, EncounterRecord, EncounterRecordBody};
@@ -58,6 +59,10 @@ use crate::state::{
     configured_max_pending_raw_dispatch_bytes_per_sender,
 };
 use crate::telemetry::{TelemetryEvent, TelemetryHandle};
+use crate::trusted_log::{
+    TrustedEpochLog, TrustedFailureAssessment, TrustedLogHead, TrustedRoundId, TrustedRoundLock,
+    TrustedServiceDirective, assess_trusted_durability_failure, validate_trusted_extension,
+};
 use crate::wire::{HotDispatch, NodePing, NodePong, WireRequest};
 
 #[derive(Debug, Clone)]
@@ -75,6 +80,10 @@ pub struct RuntimeConfig {
     pub telemetry: TelemetryHandle,
     pub snapshot_path: Option<PathBuf>,
     pub block_store_path: Option<PathBuf>,
+    /// Append-only trusted confirmation/epoch log. This is intentionally separate
+    /// from verified snapshots so enabling trusted durability cannot alter the
+    /// trustless protocol.
+    pub trusted_epoch_log_path: Option<PathBuf>,
 }
 
 impl RuntimeConfig {
@@ -93,6 +102,7 @@ impl RuntimeConfig {
             telemetry: TelemetryHandle::default(),
             snapshot_path: None,
             block_store_path: None,
+            trusted_epoch_log_path: None,
         }
     }
 
@@ -146,6 +156,7 @@ impl RuntimeConfig {
             telemetry: TelemetryHandle::default(),
             snapshot_path: None,
             block_store_path: None,
+            trusted_epoch_log_path: None,
         })
     }
 
@@ -156,6 +167,11 @@ impl RuntimeConfig {
 
     pub fn with_block_store_path(mut self, path: impl Into<PathBuf>) -> Self {
         self.block_store_path = Some(path.into());
+        self
+    }
+
+    pub fn with_trusted_epoch_log_path(mut self, path: impl Into<PathBuf>) -> Self {
+        self.trusted_epoch_log_path = Some(path.into());
         self
     }
 
@@ -210,6 +226,8 @@ struct RuntimeInner {
     consensus_node_removal_policy: ConsensusNodeRemovalPolicy,
     snapshot_path: Option<PathBuf>,
     durable_block_store: Option<DurableBlockStore>,
+    trusted_epoch_log: Option<TrustedEpochLog>,
+    trusted_transition_lock: Mutex<()>,
     telemetry: TelemetryHandle,
     next_telemetry_span_id: AtomicU64,
     epoch_commit_tx: watch::Sender<Nonce>,
@@ -399,6 +417,33 @@ pub struct NodeStatus {
     pub services: Vec<Service>,
 }
 
+#[derive(
+    Serialize, Deserialize, BorshSerialize, BorshDeserialize, Debug, Clone, Copy, PartialEq, Eq,
+)]
+pub enum TrustedServiceHealth {
+    Ready,
+    Degraded,
+    Unavailable,
+}
+
+#[derive(Serialize, Deserialize, BorshSerialize, BorshDeserialize, Debug, Clone, PartialEq, Eq)]
+pub struct TrustedOperationalStatus {
+    pub health: TrustedServiceHealth,
+    pub durable: bool,
+    pub head_nonce: Nonce,
+    pub head_hash: HashType,
+    pub durable_epoch_count: u64,
+    pub pending_round_lock: bool,
+    pub expected_round_members: usize,
+    pub observed_dispatch_members: usize,
+    pub required_acknowledgements: usize,
+    pub observed_matching_acknowledgements: usize,
+    pub required_confirmations: usize,
+    pub observed_matching_confirmations: usize,
+    pub accepts_writes: bool,
+    pub directives: Vec<TrustedServiceDirective>,
+}
+
 /// Read-only diagnostic snapshot of one node's current consensus round.
 ///
 /// This deliberately exposes counts and hashes, not mutable protocol state. It
@@ -582,10 +627,100 @@ impl NodeRuntime {
             }
             state.epochchain = epochchain;
         }
+        if config.trusted_epoch_log_path.is_some() && !config.trust_mode.is_trusted() {
+            return Err(BlossomError::InvalidConfiguration(
+                "trusted epoch log is only applicable to TrustMode::Trusted".to_string(),
+            ));
+        }
+        let trusted_epoch_log = match config.trusted_epoch_log_path.as_ref() {
+            Some(path) => {
+                let (store, recovered) = TrustedEpochLog::open(
+                    path,
+                    state.self_node.public_key(),
+                    &state.epochchain,
+                    state.consensus_node_removal_policy,
+                )?;
+                state.epochchain = recovered;
+                let round_locks = store.round_locks()?;
+                for (expected_round, round_lock) in round_locks.iter().enumerate() {
+                    let head = state
+                        .epochchain
+                        .epochchain
+                        .last()
+                        .ok_or(BlossomError::EmptyEpochChain)?;
+                    let head_hash = head.hash;
+                    let head_nonce = head.body.nonce;
+                    let head_verifiers = head.body.verifiers.clone();
+                    if round_lock.round_id.group_id != group_id
+                        || round_lock.round_id.previous_epoch_hash != head_hash
+                        || round_lock.round_id.previous_epoch_nonce != head_nonce
+                        || round_lock.round_id.nonce != head_nonce.new_next()
+                        || usize::from(round_lock.round_id.round) != expected_round
+                    {
+                        return Err(BlossomError::InvalidConfiguration(
+                            "trusted epoch log contains non-contiguous locks outside the current epoch"
+                                .to_string(),
+                        ));
+                    }
+                    let available_rounds = state
+                        .get_mut_consensus(
+                            &round_lock.round_id.previous_epoch_hash,
+                            round_lock.round_id.nonce,
+                        )
+                        .peers
+                        .len();
+                    if expected_round >= available_rounds {
+                        return Err(BlossomError::InvalidConfiguration(
+                            "trusted epoch log contains a lock beyond the committed topology"
+                                .to_string(),
+                        ));
+                    }
+                    for block in round_lock.blocks.values() {
+                        if !head_verifiers.contains_key(&block.body.validator) {
+                            return Err(BlossomError::UnknownSender);
+                        }
+                    }
+                    let quorum = state.get_mut_quorum(
+                        &round_lock.round_id.previous_epoch_hash,
+                        round_lock.round_id.nonce,
+                        round_lock.round_id.round,
+                    );
+                    for (hash, block) in &round_lock.blocks {
+                        quorum.record_verified_block(*hash, block.clone());
+                    }
+                    quorum.verified_blocks_hash = Some(quorum.verified_blocks_hash());
+                    quorum
+                        .trusted_confirmations
+                        .record(round_lock.verification.clone())?;
+                    quorum.verification_sent = true;
+                }
+                if let Some(highest) = round_locks.last() {
+                    let consensus = state.get_mut_consensus(
+                        &highest.round_id.previous_epoch_hash,
+                        highest.round_id.nonce,
+                    );
+                    consensus.round = highest.round_id.round;
+                    if let Some(quorum) = consensus.quorum.get_mut(&highest.round_id.round) {
+                        quorum.verification_sent = false;
+                    }
+                }
+                Some(store)
+            }
+            None => None,
+        };
         let durable_block_store = config
             .block_store_path
             .map(DurableBlockStore::open)
             .transpose()?;
+        let mut local_blocks = LocalBlock::new(config.block_cap);
+        if let Some(block) = trusted_epoch_log
+            .as_ref()
+            .map(TrustedEpochLog::pending_local_block)
+            .transpose()?
+            .flatten()
+        {
+            local_blocks.enqueue_preverified_block(block)?;
+        }
         let committed_nonce = state
             .epochchain
             .epochchain
@@ -599,7 +734,7 @@ impl NodeRuntime {
                 group_id,
                 state: RwLock::new(state),
                 future_round_messages: RwLock::new(BTreeMap::new()),
-                local_blocks: RwLock::new(LocalBlock::new(config.block_cap)),
+                local_blocks: RwLock::new(local_blocks),
                 #[cfg(feature = "availability-gossip")]
                 availability: RwLock::new(AvailabilityStore::default()),
                 address_book: RwLock::new(config.address_book),
@@ -612,6 +747,8 @@ impl NodeRuntime {
                 consensus_node_removal_policy: config.consensus_node_removal_policy,
                 snapshot_path: config.snapshot_path,
                 durable_block_store,
+                trusted_epoch_log,
+                trusted_transition_lock: Mutex::new(()),
                 telemetry: config.telemetry,
                 next_telemetry_span_id: AtomicU64::new(1),
                 epoch_commit_tx,
@@ -751,6 +888,123 @@ impl NodeRuntime {
         })
     }
 
+    pub fn trusted_epoch_log_head(&self) -> Result<Option<TrustedLogHead>> {
+        if !self.inner.trust_mode.is_trusted() {
+            return Err(BlossomError::InvalidConfiguration(
+                "trusted epoch log status is only available in trusted mode".to_string(),
+            ));
+        }
+        self.inner
+            .trusted_epoch_log
+            .as_ref()
+            .map(TrustedEpochLog::head)
+            .transpose()
+    }
+
+    /// Returns service-facing durability and quorum state for trusted active-
+    /// active deployments.
+    pub fn trusted_operational_status(&self) -> Result<TrustedOperationalStatus> {
+        if !self.inner.trust_mode.is_trusted() {
+            return Err(BlossomError::InvalidConfiguration(
+                "trusted operational status is only available in trusted mode".to_string(),
+            ));
+        }
+        let state = self.inner.state.read().expect("state lock poisoned");
+        let head = state
+            .epochchain
+            .epochchain
+            .last()
+            .ok_or(BlossomError::EmptyEpochChain)?;
+        let target_nonce = head.body.nonce.new_next();
+        let consensus = state.get_consensus(&head.hash, target_nonce);
+        let quorum = consensus.and_then(|consensus| consensus.quorum.get(&consensus.round));
+        let expected_round_members = quorum
+            .map(|quorum| quorum.msg_matrix.quorum_nodes.len())
+            .unwrap_or_default();
+        let observed_dispatch_members = quorum.map_or(0, |quorum| {
+            quorum.received_dispatches.len() + usize::from(quorum.dispatch_status == Some(true))
+        });
+        let required_confirmations = if expected_round_members == 0 {
+            0
+        } else {
+            supermajority_count(expected_round_members)
+        };
+        let required_acknowledgements = required_confirmations;
+        let observed_matching_acknowledgements = quorum
+            .and_then(|quorum| {
+                quorum
+                    .trusted_acknowledgements
+                    .count
+                    .values()
+                    .max()
+                    .copied()
+            })
+            .and_then(|count| usize::try_from(count).ok())
+            .unwrap_or_default();
+        let observed_matching_confirmations = quorum
+            .and_then(|quorum| quorum.trusted_confirmations.count.values().max().copied())
+            .and_then(|count| usize::try_from(count).ok())
+            .unwrap_or_default();
+        let head_nonce = head.body.nonce;
+        let head_hash = head.hash;
+        drop(state);
+
+        let durable_head = self.trusted_epoch_log_head()?;
+        let durable = durable_head.is_some();
+        let durable_matches_memory = durable_head
+            .is_some_and(|durable| durable.nonce == head_nonce && durable.hash == head_hash);
+        let pending_round_lock = durable_head.is_some_and(|durable| durable.pending_round_lock);
+        let (health, directives) = if !durable || !durable_matches_memory {
+            (
+                TrustedServiceHealth::Unavailable,
+                vec![
+                    TrustedServiceDirective::NotifyOperators,
+                    TrustedServiceDirective::NotifyUsers,
+                    TrustedServiceDirective::DrainWrites,
+                    TrustedServiceDirective::RestartOrRedeploy,
+                ],
+            )
+        } else if pending_round_lock && observed_matching_confirmations < required_confirmations {
+            (
+                TrustedServiceHealth::Degraded,
+                vec![
+                    TrustedServiceDirective::NotifyOperators,
+                    TrustedServiceDirective::AwaitConfirmationQuorum,
+                ],
+            )
+        } else {
+            (
+                TrustedServiceHealth::Ready,
+                vec![TrustedServiceDirective::Continue],
+            )
+        };
+        Ok(TrustedOperationalStatus {
+            health,
+            durable,
+            head_nonce,
+            head_hash,
+            durable_epoch_count: durable_head.map_or(0, |durable| durable.epoch_count),
+            pending_round_lock,
+            expected_round_members,
+            observed_dispatch_members,
+            required_acknowledgements,
+            observed_matching_acknowledgements,
+            required_confirmations,
+            observed_matching_confirmations,
+            accepts_writes: durable_matches_memory && health != TrustedServiceHealth::Unavailable,
+            directives,
+        })
+    }
+
+    pub fn assess_trusted_failure(&self, error: &BlossomError) -> Result<TrustedFailureAssessment> {
+        if !self.inner.trust_mode.is_trusted() {
+            return Err(BlossomError::InvalidConfiguration(
+                "trusted failure assessment is only available in trusted mode".to_string(),
+            ));
+        }
+        Ok(assess_trusted_durability_failure(error))
+    }
+
     pub fn consensus_round_status(&self, round: u8) -> Result<ConsensusRoundStatus> {
         self.ensure_consensus_mode("inspect consensus round")?;
         let target = self.next_epoch_target()?;
@@ -765,9 +1019,26 @@ impl NodeRuntime {
                 received_dispatches: quorum.received_dispatches.len(),
                 pending_dispatches: quorum.pending_dispatches.len(),
                 verified_blocks: quorum.verified_blocks.len(),
-                verification_senders: quorum.verifications.verifications.len(),
-                verification_counts: quorum.verifications.count.clone(),
-                verification_consensus_hash: quorum.verifications.consensus_hash(),
+                verification_senders: if self.inner.trust_mode.is_trusted() {
+                    quorum.trusted_confirmations.confirmations.len()
+                } else {
+                    quorum.verifications.verifications.len()
+                },
+                verification_counts: if self.inner.trust_mode.is_trusted() {
+                    quorum
+                        .trusted_confirmations
+                        .count
+                        .iter()
+                        .map(|(hash, count)| (*hash, u8::try_from(*count).unwrap_or(u8::MAX)))
+                        .collect()
+                } else {
+                    quorum.verifications.count.clone()
+                },
+                verification_consensus_hash: if self.inner.trust_mode.is_trusted() {
+                    quorum.trusted_confirmations.consensus_hash()
+                } else {
+                    quorum.verifications.consensus_hash()
+                },
                 proposal_senders: quorum.proposals.proposals.len(),
                 proposal_counts: quorum.proposals.count.clone(),
                 proposal_consensus: quorum.proposals.consensus(),
@@ -1284,6 +1555,11 @@ impl NodeRuntime {
 
     pub fn try_produce_false_proposal(&self, round: u8) -> Result<Option<Proposal>> {
         self.ensure_consensus_mode("produce false proposal")?;
+        if self.inner.trust_mode.is_trusted() {
+            return Err(BlossomError::InvalidConfiguration(
+                "trusted mode uses confirmation quorum finality, not proposals".to_string(),
+            ));
+        }
         if self.recovery_wait_assessment(round)?.status != RecoveryEvidenceStatus::Unrecoverable {
             return Ok(None);
         }
@@ -1321,6 +1597,9 @@ impl NodeRuntime {
     }
 
     pub fn catch_up_from_epoch_started(&self, remote_chain: EpochChain) -> Result<bool> {
+        if self.inner.trust_mode.is_trusted() {
+            return self.catch_up_trusted_epoch_range(remote_chain);
+        }
         RuntimeSnapshotV1 {
             version: RuntimeSnapshotV1::VERSION,
             group_id: self.group_id(),
@@ -1354,6 +1633,87 @@ impl NodeRuntime {
         state.epochchain = remote_chain;
         drop(state);
         self.persist_snapshot()?;
+        self.publish_epoch_commit()?;
+        Ok(true)
+    }
+
+    fn catch_up_trusted_epoch_range(&self, remote_chain: EpochChain) -> Result<bool> {
+        let _trusted_transition = self.inner.trusted_epoch_log.as_ref().map(|_| {
+            self.inner
+                .trusted_transition_lock
+                .lock()
+                .expect("trusted transition lock poisoned")
+        });
+        if remote_chain.epochchain.is_empty() {
+            return Ok(false);
+        }
+        let local_tip = self
+            .inner
+            .state
+            .read()
+            .expect("state lock poisoned")
+            .epochchain
+            .epochchain
+            .last()
+            .cloned()
+            .ok_or(BlossomError::EmptyEpochChain)?;
+        let suffix = if let Some(local_tip_index) = remote_chain
+            .epochchain
+            .iter()
+            .position(|epoch| epoch.hash == local_tip.hash)
+        {
+            remote_chain.epochchain[local_tip_index + 1..].to_vec()
+        } else {
+            remote_chain.epochchain
+        };
+        if suffix.is_empty() {
+            return Ok(false);
+        }
+        let mut previous = &local_tip;
+        for epoch in &suffix {
+            validate_trusted_extension(previous, epoch, self.inner.consensus_node_removal_policy)?;
+            previous = epoch;
+        }
+
+        let durable_pending_block = if let Some(store) = self.inner.trusted_epoch_log.as_ref() {
+            store.append_suffix(&suffix)?;
+            store.pending_local_block()?
+        } else {
+            None
+        };
+        if self.inner.trusted_epoch_log.is_some() {
+            self.inner
+                .local_blocks
+                .write()
+                .expect("block lock poisoned")
+                .reconcile_durable_pending_block(durable_pending_block)?;
+        }
+        let original_chain = {
+            let mut state = self.inner.state.write().expect("state lock poisoned");
+            let current_tip = state
+                .epochchain
+                .epochchain
+                .last()
+                .ok_or(BlossomError::EmptyEpochChain)?;
+            if current_tip.hash != local_tip.hash {
+                return Err(BlossomError::InvalidConfiguration(
+                    "trusted catch-up raced with local epoch advancement".to_string(),
+                ));
+            }
+            let original = state.epochchain.clone();
+            state.epochchain.epochchain.extend(suffix);
+            original
+        };
+        if self.inner.trusted_epoch_log.is_none()
+            && let Err(error) = self.persist_snapshot()
+        {
+            self.inner
+                .state
+                .write()
+                .expect("state lock poisoned")
+                .epochchain = original_chain;
+            return Err(error);
+        }
         self.publish_epoch_commit()?;
         Ok(true)
     }
@@ -2357,35 +2717,236 @@ impl NodeRuntime {
             let mut state = self.inner.state.write().expect("state lock poisoned");
             let quorum = state.get_mut_quorum(&target.last_epoch, target.nonce, round);
             if quorum.dispatch_status == Some(true) {
+                if self.inner.trust_mode.is_trusted() && quorum.trusted_dispatch_retry {
+                    quorum.trusted_dispatch_retry = false;
+                    return quorum
+                        .trusted_local_dispatch
+                        .clone()
+                        .map(Some)
+                        .ok_or_else(|| {
+                            BlossomError::InvalidConfiguration(
+                                "trusted dispatch retry is missing its original message"
+                                    .to_string(),
+                            )
+                        });
+                }
                 return Ok(None);
             }
         }
         self.dispatch_local_block(round).map(Some)
     }
 
-    pub fn try_produce_verification(&self, round: u8) -> Result<Option<Verification>> {
-        self.ensure_consensus_mode("produce verification")?;
+    pub(crate) fn schedule_trusted_dispatch_retry(
+        &self,
+        round: u8,
+        blocks_hash: HashType,
+    ) -> Result<()> {
+        if !self.inner.trust_mode.is_trusted() {
+            return Ok(());
+        }
+        let target = self.next_epoch_target()?;
+        let mut state = self.inner.state.write().expect("state lock poisoned");
+        let quorum = state.get_mut_quorum(&target.last_epoch, target.nonce, round);
+        if quorum
+            .trusted_local_dispatch
+            .as_ref()
+            .is_some_and(|dispatch| dispatch.body.blocks_hash == blocks_hash)
+        {
+            quorum.trusted_dispatch_retry = true;
+        }
+        Ok(())
+    }
+
+    /// Broadcasts the local node's monotonic trusted availability view.
+    ///
+    /// Acknowledgements may grow as delayed blocks arrive. They are not
+    /// durable confirmation locks and are never produced in verified mode.
+    pub fn try_produce_trusted_acknowledgement(
+        &self,
+        round: u8,
+    ) -> Result<Option<TrustedAcknowledgement>> {
+        self.ensure_consensus_mode("produce trusted acknowledgement")?;
+        if !self.inner.trust_mode.is_trusted() {
+            return Err(BlossomError::InvalidConfiguration(
+                "trusted acknowledgements are unavailable in verified mode".to_string(),
+            ));
+        }
         let target = self.next_epoch_target()?;
         let self_node = self.self_node();
         let body = {
             let mut state = self.inner.state.write().expect("state lock poisoned");
             state.seed_prefill_dispatches_into_quorum(&target.last_epoch, target.nonce, round);
             let quorum = state.get_mut_quorum(&target.last_epoch, target.nonce, round);
+            if !quorum.has_trusted_dispatch_quorum() {
+                return Ok(None);
+            }
+            quorum.verify_trusted();
+            quorum.activate_pending_trusted_messages()?;
+            let blocks = quorum.verified_blocks();
+            let blocks_hash = blocks.hash();
+            if quorum.last_trusted_acknowledgement_hash == Some(blocks_hash)
+                && quorum.trusted_acknowledgement_retry != Some(blocks_hash)
+            {
+                return Ok(None);
+            }
+            VerificationBody {
+                blocks_hash,
+                blocks,
+            }
+        };
+        let acknowledgement = TrustedAcknowledgement {
+            header: self.signed_header_for_body(
+                &self_node,
+                &target,
+                round,
+                MSGKey::TrustedAcknowledgement,
+                &body,
+            )?,
+            body,
+        };
+        let mut state = self.inner.state.write().expect("state lock poisoned");
+        let quorum = state.get_mut_quorum(&target.last_epoch, target.nonce, round);
+        if quorum.last_trusted_acknowledgement_hash == Some(acknowledgement.body.blocks_hash) {
+            quorum.trusted_acknowledgement_retry = None;
+            return Ok(Some(acknowledgement));
+        }
+        quorum
+            .trusted_acknowledgements
+            .record(acknowledgement.clone())?;
+        quorum.last_trusted_acknowledgement_hash = Some(acknowledgement.body.blocks_hash);
+        quorum.trusted_acknowledgement_retry = None;
+        Ok(Some(acknowledgement))
+    }
+
+    pub(crate) fn schedule_trusted_acknowledgement_retry(
+        &self,
+        round: u8,
+        blocks_hash: HashType,
+    ) -> Result<()> {
+        if !self.inner.trust_mode.is_trusted() {
+            return Ok(());
+        }
+        let target = self.next_epoch_target()?;
+        let mut state = self.inner.state.write().expect("state lock poisoned");
+        let quorum = state.get_mut_quorum(&target.last_epoch, target.nonce, round);
+        if quorum.last_trusted_acknowledgement_hash == Some(blocks_hash) {
+            quorum.trusted_acknowledgement_retry = Some(blocks_hash);
+        }
+        Ok(())
+    }
+
+    pub fn try_produce_verification(&self, round: u8) -> Result<Option<Verification>> {
+        self.ensure_consensus_mode("produce verification")?;
+        let _trusted_transition = self.inner.trusted_epoch_log.as_ref().map(|_| {
+            self.inner
+                .trusted_transition_lock
+                .lock()
+                .expect("trusted transition lock poisoned")
+        });
+        let target = self.next_epoch_target()?;
+        let self_node = self.self_node();
+        if self.inner.trust_mode.is_trusted() {
+            let mut state = self.inner.state.write().expect("state lock poisoned");
+            let quorum = state.get_mut_quorum(&target.last_epoch, target.nonce, round);
+            if let Some(retry_hash) = quorum.trusted_confirmation_retry {
+                let confirmation = quorum
+                    .trusted_confirmations
+                    .confirmations
+                    .get(&self_node.public_key())
+                    .filter(|confirmation| confirmation.body.blocks_hash == retry_hash)
+                    .cloned()
+                    .ok_or_else(|| {
+                        BlossomError::InvalidConfiguration(
+                            "trusted confirmation retry is missing its immutable message"
+                                .to_string(),
+                        )
+                    })?;
+                quorum.trusted_confirmation_retry = None;
+                return Ok(Some(confirmation));
+            }
+        }
+        let trusted_round_id = if self.inner.trust_mode.is_trusted() {
+            let previous_epoch_nonce = self
+                .inner
+                .state
+                .read()
+                .expect("state lock poisoned")
+                .epochchain
+                .epochchain
+                .last()
+                .ok_or(BlossomError::EmptyEpochChain)?
+                .body
+                .nonce;
+            Some(TrustedRoundId {
+                group_id: target.group_id,
+                previous_epoch_hash: target.last_epoch,
+                previous_epoch_nonce,
+                nonce: target.nonce,
+                round,
+            })
+        } else {
+            None
+        };
+        let persisted_lock = match (
+            self.inner.trusted_epoch_log.as_ref(),
+            trusted_round_id.as_ref(),
+        ) {
+            (Some(store), Some(round_id)) => store.round_lock(round_id)?,
+            _ => None,
+        };
+        let (body, trusted_blocks, trusted_round_id) = {
+            let mut state = self.inner.state.write().expect("state lock poisoned");
+            state.seed_prefill_dispatches_into_quorum(&target.last_epoch, target.nonce, round);
+            let quorum = state.get_mut_quorum(&target.last_epoch, target.nonce, round);
             if quorum.verification_sent {
                 return Ok(None);
             }
-            if !quorum.has_complete_dispatch_set() {
-                return Ok(None);
-            }
             if self.inner.trust_mode.is_trusted() {
-                quorum.verify_trusted();
+                let round_id = trusted_round_id.expect("trusted round identity initialized above");
+                if let Some(round_lock) = persisted_lock.as_ref() {
+                    if round_lock.round_id != round_id {
+                        return Err(BlossomError::InvalidConfiguration(
+                            "durable trusted confirmation lock targets a different round"
+                                .to_string(),
+                        ));
+                    }
+                    for (hash, block) in &round_lock.blocks {
+                        quorum.record_verified_block(*hash, block.clone());
+                    }
+                    quorum.verified_blocks_hash = Some(quorum.verified_blocks_hash());
+                    (
+                        round_lock.verification.body.clone(),
+                        Some(round_lock.blocks.clone()),
+                        Some(round_id),
+                    )
+                } else {
+                    quorum.activate_pending_trusted_messages()?;
+                    let Some(body) = quorum.trusted_acknowledgements.consensus_body().cloned()
+                    else {
+                        return Ok(None);
+                    };
+                    let blocks = quorum.trusted_candidate_blocks(&body).ok_or_else(|| {
+                        BlossomError::InvalidConfiguration(
+                            "trusted acknowledgement quorum references unavailable blocks"
+                                .to_string(),
+                        )
+                    })?;
+                    (body, Some(blocks), Some(round_id))
+                }
             } else {
+                if !quorum.has_complete_dispatch_set() {
+                    return Ok(None);
+                }
                 quorum.verify();
-            }
-            let blocks = quorum.verified_blocks();
-            VerificationBody {
-                blocks_hash: blocks.hash(),
-                blocks,
+                let blocks = quorum.verified_blocks();
+                (
+                    VerificationBody {
+                        blocks_hash: blocks.hash(),
+                        blocks,
+                    },
+                    None,
+                    None,
+                )
             }
         };
         let message = Verification {
@@ -2399,31 +2960,70 @@ impl NodeRuntime {
             body,
         };
 
+        if let (Some(store), Some(blocks), Some(round_id)) = (
+            self.inner.trusted_epoch_log.as_ref(),
+            trusted_blocks.as_ref(),
+            trusted_round_id,
+        ) {
+            store.lock_round(&TrustedRoundLock {
+                round_id,
+                verification: message.clone(),
+                blocks: blocks.clone(),
+            })?;
+        }
+
         let mut state = self.inner.state.write().expect("state lock poisoned");
         let quorum = state.get_mut_quorum(&target.last_epoch, target.nonce, round);
         if quorum.verification_sent {
             return Ok(None);
         }
-        if message.body.blocks != quorum.verified_blocks()
-            || message.body.blocks_hash != quorum.verified_blocks_hash()
-        {
-            return Err(BlossomError::WireProtocol(
-                "local verified block set changed before verification could be recorded"
-                    .to_string(),
-            ));
+        if self.inner.trust_mode.is_trusted() {
+            if quorum.trusted_candidate_blocks(&message.body).is_none() {
+                return Err(BlossomError::WireProtocol(
+                    "trusted confirmation references unavailable local blocks".to_string(),
+                ));
+            }
+            quorum.trusted_confirmations.record(message.clone())?;
+        } else {
+            if message.body.blocks != quorum.verified_blocks()
+                || message.body.blocks_hash != quorum.verified_blocks_hash()
+            {
+                return Err(BlossomError::WireProtocol(
+                    "local verified block set changed before verification could be recorded"
+                        .to_string(),
+                ));
+            }
+            quorum.verifications.record(message.clone());
         }
         quorum.verification_sent = true;
-        quorum.verifications.record(message.clone());
         Ok(Some(message))
     }
 
-    /// Completes one trusted dissemination round after the local node has sent
-    /// its unsigned receipt for the complete BTree-ordered block set.
-    ///
-    /// Trusted mode does not collect proposal or commit votes. Every node
-    /// advances independently once it has received the complete expected
-    /// dispatch set and sent its own matching receipt. A missing member
-    /// therefore stops liveness until membership/failure handling resolves it.
+    pub(crate) fn schedule_trusted_confirmation_retry(
+        &self,
+        round: u8,
+        blocks_hash: HashType,
+    ) -> Result<()> {
+        if !self.inner.trust_mode.is_trusted() {
+            return Ok(());
+        }
+        let target = self.next_epoch_target()?;
+        let self_key = self.self_node().public_key();
+        let mut state = self.inner.state.write().expect("state lock poisoned");
+        let quorum = state.get_mut_quorum(&target.last_epoch, target.nonce, round);
+        if quorum
+            .trusted_confirmations
+            .confirmations
+            .get(&self_key)
+            .is_some_and(|confirmation| confirmation.body.blocks_hash == blocks_hash)
+        {
+            quorum.trusted_confirmation_retry = Some(blocks_hash);
+        }
+        Ok(())
+    }
+
+    /// Completes one trusted dissemination round after a supermajority has
+    /// confirmed the same immutable block set.
     pub fn complete_trusted_verification(
         &self,
         round: u8,
@@ -2435,40 +3035,132 @@ impl NodeRuntime {
                 "trusted verification completion requires trusted mode".to_string(),
             ));
         }
+        let _trusted_transition = self.inner.trusted_epoch_log.as_ref().map(|_| {
+            self.inner
+                .trusted_transition_lock
+                .lock()
+                .expect("trusted transition lock poisoned")
+        });
         let target = self.next_epoch_target()?;
         let self_key = self.self_node().public_key();
-        let (advanced, chain_extended) = {
-            let mut state = self.inner.state.write().expect("state lock poisoned");
-            let quorum = state.get_mut_quorum(&target.last_epoch, target.nonce, round);
-            let local_receipt_matches = quorum
-                .verifications
-                .verifications
+        let (confirmed_blocks, previous_epoch_nonce, final_round) = {
+            let state = self.inner.state.read().expect("state lock poisoned");
+            let consensus = state
+                .get_consensus(&target.last_epoch, target.nonce)
+                .ok_or(BlossomError::FailedConsensus)?;
+            let quorum = state
+                .get_quorum(&target.last_epoch, target.nonce, round)
+                .ok_or(BlossomError::FailedConsensus)?;
+            let local_confirmation_matches = quorum
+                .trusted_confirmations
+                .confirmations
                 .get(&self_key)
-                .is_some_and(|receipt| receipt.body.blocks_hash == expected_blocks_hash);
-            if !quorum.has_complete_dispatch_set()
-                || !quorum.verification_sent
-                || !local_receipt_matches
-                || quorum.verified_blocks_hash() != expected_blocks_hash
+                .is_some_and(|confirmation| confirmation.body.blocks_hash == expected_blocks_hash);
+            if !quorum.verification_sent
+                || !local_confirmation_matches
+                || quorum.trusted_confirmations.consensus_hash() != Some(expected_blocks_hash)
             {
-                return Err(BlossomError::WireProtocol(
-                    "trusted node cannot advance before receiving every expected block and sending its matching receipt"
-                        .to_string(),
-                ));
+                return Ok(false);
             }
-            let before = state.epochchain.epochchain.len();
-            let advanced = state.advance_epoch(&target.last_epoch, target.nonce, round, true);
-            let chain_extended = state.epochchain.epochchain.len() > before;
-            (advanced, chain_extended)
+            let confirmed_blocks = quorum
+                .trusted_confirmations
+                .confirmations
+                .get(&self_key)
+                .expect("matching local trusted confirmation checked above")
+                .body
+                .blocks
+                .clone();
+            let previous_epoch_nonce = state
+                .epochchain
+                .epochchain
+                .last()
+                .ok_or(BlossomError::EmptyEpochChain)?
+                .body
+                .nonce;
+            (
+                confirmed_blocks,
+                previous_epoch_nonce,
+                consensus.peers.len() <= usize::from(round) + 1,
+            )
         };
-        if chain_extended {
-            self.persist_snapshot()?;
-            self.publish_epoch_commit()?;
+        if !final_round {
+            return self
+                .inner
+                .state
+                .write()
+                .expect("state lock poisoned")
+                .advance_trusted_round(&target.last_epoch, target.nonce, round, &confirmed_blocks);
         }
-        Ok(advanced)
+        let epoch = self
+            .inner
+            .state
+            .read()
+            .expect("state lock poisoned")
+            .prepare_trusted_epoch(&target.last_epoch, target.nonce, round, &confirmed_blocks)?;
+        let round_id = TrustedRoundId {
+            group_id: target.group_id,
+            previous_epoch_hash: target.last_epoch,
+            previous_epoch_nonce,
+            nonce: target.nonce,
+            round,
+        };
+        if let Some(store) = self.inner.trusted_epoch_log.as_ref() {
+            store.append_epoch(&epoch, Some(round_id))?;
+            let pending = store.pending_local_block()?;
+            self.inner
+                .local_blocks
+                .write()
+                .expect("block lock poisoned")
+                .reconcile_durable_pending_block(pending)?;
+        }
+        {
+            let mut state = self.inner.state.write().expect("state lock poisoned");
+            let current = state
+                .epochchain
+                .epochchain
+                .last()
+                .ok_or(BlossomError::EmptyEpochChain)?;
+            if current.hash == epoch.hash {
+                return Ok(false);
+            }
+            state.install_trusted_epoch(epoch)?;
+        }
+        // Legacy snapshots remain an explicit compatibility artifact. A
+        // configured append-only trusted log is already durable and avoids an
+        // O(history) snapshot rewrite on the commit path.
+        if self.inner.trusted_epoch_log.is_none() {
+            self.persist_snapshot()?;
+        }
+        self.publish_epoch_commit()?;
+        Ok(true)
+    }
+
+    pub fn try_complete_trusted_verification(&self, round: u8) -> Result<bool> {
+        if !self.inner.trust_mode.is_trusted() {
+            return Ok(false);
+        }
+        let target = self.next_epoch_target()?;
+        let self_key = self.self_node().public_key();
+        let expected = {
+            let state = self.inner.state.read().expect("state lock poisoned");
+            let Some(quorum) = state.get_quorum(&target.last_epoch, target.nonce, round) else {
+                return Ok(false);
+            };
+            let Some(local) = quorum.trusted_confirmations.confirmations.get(&self_key) else {
+                return Ok(false);
+            };
+            local.body.blocks_hash
+        };
+        self.complete_trusted_verification(round, expected)
     }
 
     pub fn try_produce_proposal(&self, round: u8) -> Result<Option<Proposal>> {
         self.ensure_consensus_mode("produce proposal")?;
+        if self.inner.trust_mode.is_trusted() {
+            return Err(BlossomError::InvalidConfiguration(
+                "trusted mode uses confirmation quorum finality, not proposals".to_string(),
+            ));
+        }
         let target = self.next_epoch_target()?;
         let self_node = self.self_node();
         let body = {
@@ -2533,6 +3225,11 @@ impl NodeRuntime {
 
     pub fn try_produce_commit(&self, round: u8) -> Result<Option<Commit>> {
         self.ensure_consensus_mode("produce commit")?;
+        if self.inner.trust_mode.is_trusted() {
+            return Err(BlossomError::InvalidConfiguration(
+                "trusted mode uses confirmation quorum finality, not commit votes".to_string(),
+            ));
+        }
         let target = self.next_epoch_target()?;
         let self_node = self.self_node();
         let body = {
@@ -2674,6 +3371,12 @@ impl NodeRuntime {
     }
 
     pub fn submit_block(&self, block: Block) -> Result<AcceptedBlock> {
+        let _trusted_transition = self.inner.trusted_epoch_log.as_ref().map(|_| {
+            self.inner
+                .trusted_transition_lock
+                .lock()
+                .expect("trusted transition lock poisoned")
+        });
         let target = self.next_epoch_target()?;
         let span = self.start_telemetry_span(self.target_telemetry_meta(
             "block_formation",
@@ -2700,13 +3403,26 @@ impl NodeRuntime {
             self.store_filtered_payloads_from_block(&block)?;
 
             let application_state_bytes = block.application_state_len();
-            let hash = self
-                .inner
-                .local_blocks
-                .write()
-                .expect("block lock poisoned")
-                .enqueue_preverified_block(block.clone())?;
-            self.persist_block_if_configured(&block)?;
+            let hash = if let Some(store) = self.inner.trusted_epoch_log.as_ref() {
+                let mut local_blocks = self
+                    .inner
+                    .local_blocks
+                    .write()
+                    .expect("block lock poisoned");
+                local_blocks.can_enqueue_preverified_block(&block)?;
+                store.persist_local_block(&block)?;
+                self.persist_block_if_configured(&block)?;
+                local_blocks.enqueue_preverified_block(block.clone())?
+            } else {
+                let hash = self
+                    .inner
+                    .local_blocks
+                    .write()
+                    .expect("block lock poisoned")
+                    .enqueue_preverified_block(block.clone())?;
+                self.persist_block_if_configured(&block)?;
+                hash
+            };
             Ok(AcceptedBlock {
                 group_id: self.inner.group_id,
                 hash,
@@ -2818,7 +3534,12 @@ impl NodeRuntime {
             let quorum = state.get_mut_quorum(&target.last_epoch, target.nonce, round);
             quorum.dispatch_status = Some(true);
             record_verified_dispatch_blocks(quorum, body.blocks.clone());
-            Ok(Dispatch { header, body })
+            let dispatch = Dispatch { header, body };
+            if self.inner.trust_mode.is_trusted() {
+                quorum.trusted_local_dispatch = Some(dispatch.clone());
+                quorum.trusted_dispatch_retry = false;
+            }
+            Ok(dispatch)
         })();
         self.finish_telemetry_span(span, &result);
         result
@@ -2853,6 +3574,9 @@ impl NodeRuntime {
                     let quorum =
                         state.get_mut_quorum(&header.last_epoch, header.nonce, header.round);
                     record_verified_dispatch_blocks(quorum, verified_blocks);
+                    if self.inner.trust_mode.is_trusted() {
+                        quorum.activate_pending_trusted_messages()?;
+                    }
                     Ok(MessageReceipt::accepted("dispatch"))
                 }
                 Msg::EchoResponse(message) => self.receive_echo_response(message),
@@ -2870,6 +3594,9 @@ impl NodeRuntime {
                 Msg::ReconcileCommit(message) => self.receive_reconcile_commit(message),
                 Msg::Ok => Ok(MessageReceipt::accepted("ok")),
                 Msg::Fail => Ok(MessageReceipt::accepted("fail")),
+                Msg::TrustedAcknowledgement(message) => {
+                    self.receive_trusted_acknowledgement(message)
+                }
             }
         })();
         self.finish_telemetry_span(span, &result);
@@ -2897,6 +3624,11 @@ impl NodeRuntime {
             Msg::Verification(message) => {
                 self.verify_message_signature(&message.header, MSGKey::Verification, &message.body)
             }
+            Msg::TrustedAcknowledgement(message) => self.verify_message_signature(
+                &message.header,
+                MSGKey::TrustedAcknowledgement,
+                &message.body,
+            ),
             Msg::Proposal(message) => {
                 self.verify_message_signature(&message.header, MSGKey::Proposal, &message.body)
             }
@@ -3349,6 +4081,11 @@ impl NodeRuntime {
     }
 
     fn receive_reconcile_commit(&self, message: ReconcileCommit) -> Result<MessageReceipt> {
+        if self.inner.trust_mode.is_trusted() {
+            return Err(BlossomError::InvalidConfiguration(
+                "trusted mode does not accept verified reconcile commits".to_string(),
+            ));
+        }
         self.verify_message_signature(&message.header, MSGKey::ReconcileCommit, &message.body)?;
         let chain_extended = {
             let mut state = self.inner.state.write().expect("state lock poisoned");
@@ -3398,6 +4135,11 @@ impl NodeRuntime {
     }
 
     pub fn try_reconcile_commit(&self, message: ReconcileCommit) -> Result<MessageReceipt> {
+        if self.inner.trust_mode.is_trusted() {
+            return Err(BlossomError::InvalidConfiguration(
+                "trusted mode does not accept verified reconcile commits".to_string(),
+            ));
+        }
         self.receive_reconcile_commit(message)
     }
 
@@ -3431,6 +4173,7 @@ impl NodeRuntime {
     fn receive_verification(&self, message: Verification) -> Result<MessageReceipt> {
         self.verify_message_signature(&message.header, MSGKey::Verification, &message.body)?;
         message.body.validate()?;
+        let message_round = message.header.round;
         let mut chain_extended = false;
         {
             let mut state = self.inner.state.write().expect("state lock poisoned");
@@ -3442,15 +4185,43 @@ impl NodeRuntime {
             let round = message.header.round;
             state.seed_prefill_dispatches_into_quorum(&last_epoch, nonce, round);
             let quorum = state.get_mut_quorum(&last_epoch, nonce, round);
-            if message.body.blocks != quorum.verified_blocks()
-                || message.body.blocks_hash != quorum.verified_blocks_hash()
+            if self.inner.trust_mode.is_trusted()
+                && !quorum.verification_sent
+                && quorum.has_trusted_dispatch_quorum()
             {
-                return Err(BlossomError::WireProtocol(
-                    "verification references block set that has not been locally verified"
-                        .to_string(),
-                ));
+                quorum.verify_trusted();
+                quorum.activate_pending_trusted_messages()?;
             }
-            quorum.verifications.record(message);
+            if self.inner.trust_mode.is_trusted() {
+                quorum.trusted_confirmations.validate_update(&message)?;
+                if let Some(pending) = quorum
+                    .pending_trusted_confirmations
+                    .get(&message.header.sender)
+                    && (pending.body.blocks_hash != message.body.blocks_hash
+                        || pending.body.blocks != message.body.blocks)
+                {
+                    return Err(BlossomError::WireProtocol(
+                        "trusted member confirmed two candidates for one round".to_string(),
+                    ));
+                }
+                if quorum.trusted_candidate_blocks(&message.body).is_some() {
+                    quorum.trusted_confirmations.record(message)?;
+                } else {
+                    quorum
+                        .pending_trusted_confirmations
+                        .insert(message.header.sender, message);
+                }
+            } else {
+                if message.body.blocks != quorum.verified_blocks()
+                    || message.body.blocks_hash != quorum.verified_blocks_hash()
+                {
+                    return Err(BlossomError::WireProtocol(
+                        "verification references block set that has not been locally verified"
+                            .to_string(),
+                    ));
+                }
+                quorum.verifications.record(message);
+            }
             if !self.inner.trust_mode.is_trusted() {
                 activate_pending_proposals(quorum);
                 activate_pending_true_commits(quorum);
@@ -3461,6 +4232,10 @@ impl NodeRuntime {
                 }
             }
         }
+        if self.inner.trust_mode.is_trusted() {
+            self.try_complete_trusted_verification(message_round)?;
+            return Ok(MessageReceipt::accepted("verification"));
+        }
         if chain_extended {
             self.persist_snapshot()?;
             self.publish_epoch_commit()?;
@@ -3468,7 +4243,60 @@ impl NodeRuntime {
         Ok(MessageReceipt::accepted("verification"))
     }
 
+    fn receive_trusted_acknowledgement(
+        &self,
+        message: TrustedAcknowledgement,
+    ) -> Result<MessageReceipt> {
+        if !self.inner.trust_mode.is_trusted() {
+            return Err(BlossomError::InvalidConfiguration(
+                "verified mode does not accept trusted acknowledgements".to_string(),
+            ));
+        }
+        self.verify_message_signature(
+            &message.header,
+            MSGKey::TrustedAcknowledgement,
+            &message.body,
+        )?;
+        message.body.validate()?;
+        let mut state = self.inner.state.write().expect("state lock poisoned");
+        if message.header.verify_header(&mut state) == Some(false) {
+            return Err(BlossomError::UnknownSender);
+        }
+        let quorum = state.get_mut_quorum(
+            &message.header.last_epoch,
+            message.header.nonce,
+            message.header.round,
+        );
+        quorum.trusted_acknowledgements.validate_update(&message)?;
+        if let Some(pending) = quorum
+            .pending_trusted_acknowledgements
+            .get(&message.header.sender)
+            && !pending
+                .body
+                .blocks
+                .keys()
+                .all(|hash| message.body.blocks.contains_key(hash))
+        {
+            return Err(BlossomError::WireProtocol(
+                "trusted acknowledgement masks may only grow".to_string(),
+            ));
+        }
+        if quorum.trusted_candidate_blocks(&message.body).is_some() {
+            quorum.trusted_acknowledgements.record(message)?;
+        } else {
+            quorum
+                .pending_trusted_acknowledgements
+                .insert(message.header.sender, message);
+        }
+        Ok(MessageReceipt::accepted("trusted_acknowledgement"))
+    }
+
     fn receive_proposal(&self, message: Proposal) -> Result<MessageReceipt> {
+        if self.inner.trust_mode.is_trusted() {
+            return Err(BlossomError::InvalidConfiguration(
+                "trusted mode does not accept proposal votes".to_string(),
+            ));
+        }
         self.verify_message_signature(&message.header, MSGKey::Proposal, &message.body)?;
         message.body.validate()?;
         let mut chain_extended = false;
@@ -3505,6 +4333,11 @@ impl NodeRuntime {
     }
 
     fn receive_commit(&self, message: Commit) -> Result<MessageReceipt> {
+        if self.inner.trust_mode.is_trusted() {
+            return Err(BlossomError::InvalidConfiguration(
+                "trusted mode does not accept commit votes".to_string(),
+            ));
+        }
         self.verify_message_signature(&message.header, MSGKey::Commit, &message.body)?;
         let mut chain_extended = false;
         {
@@ -4105,6 +4938,12 @@ fn message_telemetry_meta(message: &Msg) -> RuntimeTelemetryMeta {
             &message.header,
             Some("Verification"),
         ),
+        Msg::TrustedAcknowledgement(message) => header_telemetry_meta(
+            "trusted_acknowledgement",
+            "trusted_acknowledgement_received",
+            &message.header,
+            Some("TrustedAcknowledgement"),
+        ),
         Msg::Proposal(message) => header_telemetry_meta(
             "proposal",
             "proposal_received",
@@ -4204,6 +5043,11 @@ fn message_header_kind_hash(message: &Msg) -> Option<(&Header, MSGKey, HashType)
         Msg::Verification(message) => {
             Some((&message.header, MSGKey::Verification, message.body_hash()))
         }
+        Msg::TrustedAcknowledgement(message) => Some((
+            &message.header,
+            MSGKey::TrustedAcknowledgement,
+            message.body_hash(),
+        )),
         Msg::Proposal(message) => Some((&message.header, MSGKey::Proposal, message.body_hash())),
         Msg::Commit(message) => Some((&message.header, MSGKey::Commit, message.body_hash())),
         Msg::EpochStarted(message) => {
@@ -4423,6 +5267,7 @@ mod tests {
     use crate::crypto::Keypair;
     use crate::round_skip::{RoundSkipCertificate, RoundSkipVote};
     use crate::telemetry::InMemoryTelemetrySink;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     fn runtime() -> (NodeRuntime, Keypair) {
         let keypair = Keypair::generate();
@@ -4481,6 +5326,21 @@ mod tests {
     }
 
     fn runtime_with_node_count(node_count: usize) -> (NodeRuntime, Vec<Keypair>, EpochTarget) {
+        runtime_with_node_count_mode(node_count, TrustMode::Verified)
+    }
+
+    fn runtime_with_node_count_mode(
+        node_count: usize,
+        trust_mode: TrustMode,
+    ) -> (NodeRuntime, Vec<Keypair>, EpochTarget) {
+        runtime_with_node_count_mode_and_quorum(node_count, trust_mode, QuorumSize::DEFAULT)
+    }
+
+    fn runtime_with_node_count_mode_and_quorum(
+        node_count: usize,
+        trust_mode: TrustMode,
+        quorum_size: QuorumSize,
+    ) -> (NodeRuntime, Vec<Keypair>, EpochTarget) {
         let keypairs = (0..node_count)
             .map(|_| Keypair::generate())
             .collect::<Vec<_>>();
@@ -4498,9 +5358,14 @@ mod tests {
                 )
             })
             .collect::<Vec<_>>();
-        let genesis = genesis_epoch(nodes.clone());
-        let mut config = RuntimeConfig::new(nodes[0].clone());
+        let genesis = genesis_epoch_for_group_with_parameters(
+            ConsensusGroupId::root(),
+            nodes.clone(),
+            ConsensusParameters::new(quorum_size),
+        );
+        let mut config = RuntimeConfig::new(nodes[0].clone()).with_quorum_size(quorum_size);
         config.genesis = Some(genesis.clone());
+        config.trust_mode = trust_mode;
         let runtime = NodeRuntime::new(config);
         let target = EpochTarget {
             group_id: genesis.body.group_id,
@@ -4508,6 +5373,34 @@ mod tests {
             nonce: genesis.body.nonce.new_next(),
         };
         (runtime, keypairs, target)
+    }
+
+    fn establish_trusted_acknowledgement_quorum(
+        runtime: &NodeRuntime,
+        target: &EpochTarget,
+        round: u8,
+        peers: &[PubKey],
+    ) -> TrustedAcknowledgement {
+        let local = runtime
+            .try_produce_trusted_acknowledgement(round)
+            .unwrap()
+            .expect("trusted dispatch threshold should produce an acknowledgement");
+        let required_peers = supermajority_count(peers.len() + 1).saturating_sub(1);
+        for peer in peers.iter().take(required_peers) {
+            runtime
+                .receive_message(Msg::TrustedAcknowledgement(TrustedAcknowledgement {
+                    header: Header {
+                        sender: *peer,
+                        last_epoch: target.last_epoch,
+                        nonce: target.nonce,
+                        round,
+                        signature: Signature::default(),
+                    },
+                    body: local.body.clone(),
+                }))
+                .unwrap();
+        }
+        local
     }
 
     #[test]
@@ -5276,6 +6169,15 @@ mod tests {
         target: &EpochTarget,
         blocks: BTreeMap<HashType, Block>,
     ) -> Dispatch {
+        signed_dispatch_for_blocks_round(signer, target, 0, blocks)
+    }
+
+    fn signed_dispatch_for_blocks_round(
+        signer: &Keypair,
+        target: &EpochTarget,
+        round: u8,
+        blocks: BTreeMap<HashType, Block>,
+    ) -> Dispatch {
         let body = DispatchBody {
             blocks_hash: blocks.hash(),
             blocks,
@@ -5283,7 +6185,7 @@ mod tests {
             signature_tree_hash: crate::SignatureTree::default().hash(),
         };
         Dispatch {
-            header: signed_test_header(signer, target, MSGKey::Dispatch, &body),
+            header: signed_test_header_for_round(signer, target, round, MSGKey::Dispatch, &body),
             body,
         }
     }
@@ -6946,7 +7848,7 @@ mod tests {
     }
 
     #[test]
-    fn trusted_complete_block_set_advances_after_local_receipt_without_votes() {
+    fn trusted_dispatch_quorum_advances_after_matching_confirmation_supermajority() {
         let (runtime, keypairs, target) = runtime_with_peers_mode(TrustMode::Trusted);
         let local_block =
             signed_block_for_target(&keypairs[0], &target, b"trusted-stage-driver-local");
@@ -6982,20 +7884,20 @@ mod tests {
 
         assert_eq!(runtime.status().unwrap().last_epoch_nonce, Nonce::new(0));
         assert!(
-            runtime
+            !runtime
                 .complete_trusted_verification(0, expected_blocks.hash())
-                .is_err(),
-            "trusted node must send its receipt before advancing"
+                .unwrap()
         );
 
-        let receipt = runtime
+        establish_trusted_acknowledgement_quorum(&runtime, &target, 0, &round_peers);
+        let confirmation = runtime
             .try_produce_verification(0)
             .unwrap()
-            .expect("complete trusted dispatch set should produce one receipt");
-        assert_eq!(receipt.header.signature, Signature::default());
-        assert_eq!(receipt.body.blocks_hash, expected_blocks.hash());
+            .expect("matching trusted acknowledgements should produce one confirmation");
+        assert_eq!(confirmation.header.signature, Signature::default());
+        assert_eq!(confirmation.body.blocks_hash, expected_blocks.hash());
         assert_eq!(
-            receipt.body.blocks,
+            confirmation.body.blocks,
             expected_blocks
                 .keys()
                 .map(|hash| (*hash, ()))
@@ -7003,10 +7905,24 @@ mod tests {
         );
 
         assert!(
-            runtime
-                .complete_trusted_verification(0, receipt.body.blocks_hash)
+            !runtime
+                .complete_trusted_verification(0, confirmation.body.blocks_hash)
                 .unwrap()
         );
+        for peer in round_peers.iter().take(3) {
+            runtime
+                .receive_message(Msg::Verification(Verification {
+                    header: Header {
+                        sender: *peer,
+                        last_epoch: target.last_epoch,
+                        nonce: target.nonce,
+                        round: 0,
+                        signature: Signature::default(),
+                    },
+                    body: confirmation.body.clone(),
+                }))
+                .unwrap();
+        }
 
         let state = runtime.inner.state.read().expect("state lock poisoned");
         assert_eq!(state.epochchain.epochchain.len(), 2);
@@ -7022,6 +7938,755 @@ mod tests {
             .expect("trusted round remains available for diagnostics");
         assert!(old_quorum.proposals.proposals.is_empty());
         assert!(old_quorum.commit_senders.is_empty());
+    }
+
+    #[test]
+    fn trusted_confirmation_quorum_tolerates_two_of_six_inactive_members() {
+        let (runtime, keypairs, target) = runtime_with_peers_mode(TrustMode::Trusted);
+        let local_block = signed_block_for_target(&keypairs[0], &target, b"trusted-local");
+        runtime.submit_block(local_block).unwrap();
+        runtime.try_produce_dispatch(0).unwrap().unwrap();
+        let round_peers = {
+            let mut state = runtime.inner.state.write().expect("state lock poisoned");
+            state
+                .get_mut_consensus(&target.last_epoch, target.nonce)
+                .peers(0)
+        };
+
+        for (index, peer) in round_peers.iter().take(3).enumerate() {
+            let signer = keypairs
+                .iter()
+                .find(|keypair| keypair.public == *peer)
+                .unwrap();
+            let block = signed_block_for_target(signer, &target, format!("trusted-active-{index}"));
+            runtime
+                .receive_message(Msg::Dispatch(signed_dispatch_for_blocks(
+                    signer,
+                    &target,
+                    BTreeMap::from([(block.hash, block)]),
+                )))
+                .unwrap();
+        }
+        establish_trusted_acknowledgement_quorum(&runtime, &target, 0, &round_peers);
+        let local_confirmation = runtime
+            .try_produce_verification(0)
+            .unwrap()
+            .expect("four of six dispatchers satisfy the trusted threshold");
+
+        for peer in round_peers.iter().take(2) {
+            runtime
+                .receive_message(Msg::Verification(Verification {
+                    header: Header {
+                        sender: *peer,
+                        last_epoch: target.last_epoch,
+                        nonce: target.nonce,
+                        round: 0,
+                        signature: Signature::default(),
+                    },
+                    body: local_confirmation.body.clone(),
+                }))
+                .unwrap();
+        }
+        assert_eq!(runtime.status().unwrap().last_epoch_nonce, Nonce::new(0));
+
+        let third = round_peers[2];
+        runtime
+            .receive_message(Msg::Verification(Verification {
+                header: Header {
+                    sender: third,
+                    last_epoch: target.last_epoch,
+                    nonce: target.nonce,
+                    round: 0,
+                    signature: Signature::default(),
+                },
+                body: local_confirmation.body,
+            }))
+            .unwrap();
+        let committed = runtime.epochchain().epochchain.pop().unwrap();
+        assert_eq!(committed.body.nonce, target.nonce);
+        assert_eq!(committed.body.blocks.len(), 4);
+
+        let (blocked, blocked_keys, blocked_target) = runtime_with_peers_mode(TrustMode::Trusted);
+        blocked
+            .submit_block(signed_block_for_target(
+                &blocked_keys[0],
+                &blocked_target,
+                b"blocked-local",
+            ))
+            .unwrap();
+        blocked.try_produce_dispatch(0).unwrap().unwrap();
+        let blocked_peers = {
+            let mut state = blocked.inner.state.write().expect("state lock poisoned");
+            state
+                .get_mut_consensus(&blocked_target.last_epoch, blocked_target.nonce)
+                .peers(0)
+        };
+        for peer in blocked_peers.iter().take(2) {
+            let signer = blocked_keys
+                .iter()
+                .find(|keypair| keypair.public == *peer)
+                .unwrap();
+            let block = signed_block_for_target(signer, &blocked_target, b"blocked-peer");
+            blocked
+                .receive_message(Msg::Dispatch(signed_dispatch_for_blocks(
+                    signer,
+                    &blocked_target,
+                    BTreeMap::from([(block.hash, block)]),
+                )))
+                .unwrap();
+        }
+        assert!(blocked.try_produce_verification(0).unwrap().is_none());
+    }
+
+    #[test]
+    fn verified_runtime_rejects_trusted_acknowledgements_without_state_change() {
+        let (runtime, keypairs, target) = runtime_with_peers();
+        let peer = round_signer(&runtime, &keypairs, &target, 0);
+        let body = VerificationBody {
+            blocks_hash: BTreeMap::<HashType, ()>::new().hash(),
+            blocks: BTreeMap::new(),
+        };
+        let message = TrustedAcknowledgement {
+            header: signed_test_header(peer, &target, MSGKey::TrustedAcknowledgement, &body),
+            body,
+        };
+        let consensus_count_before = runtime
+            .inner
+            .state
+            .read()
+            .expect("state lock poisoned")
+            .consensus
+            .len();
+
+        assert!(matches!(
+            runtime.receive_message(Msg::TrustedAcknowledgement(message)),
+            Err(BlossomError::InvalidConfiguration(message))
+                if message.contains("verified mode")
+        ));
+        let state = runtime.inner.state.read().expect("state lock poisoned");
+        assert_eq!(state.consensus.len(), consensus_count_before);
+    }
+
+    #[test]
+    fn trusted_confirmation_before_late_dispatch_commits_original_candidate() {
+        let (runtime, keypairs, target) = runtime_with_node_count_mode_and_quorum(
+            3,
+            TrustMode::Trusted,
+            QuorumSize::new(3).unwrap(),
+        );
+        let local = signed_block_for_target(&keypairs[0], &target, b"trusted-a");
+        let local_hash = local.hash;
+        runtime.submit_block(local).unwrap();
+        runtime.try_produce_dispatch(0).unwrap().unwrap();
+        let peers = {
+            let mut state = runtime.inner.state.write().expect("state lock poisoned");
+            state
+                .get_mut_consensus(&target.last_epoch, target.nonce)
+                .peers(0)
+        };
+        let b = keypairs
+            .iter()
+            .find(|keypair| keypair.public == peers[0])
+            .unwrap();
+        let c = keypairs
+            .iter()
+            .find(|keypair| keypair.public == peers[1])
+            .unwrap();
+        let block_b = signed_block_for_target(b, &target, b"trusted-b");
+        let block_b_hash = block_b.hash;
+        runtime
+            .receive_message(Msg::Dispatch(signed_dispatch_for_blocks(
+                b,
+                &target,
+                BTreeMap::from([(block_b.hash, block_b)]),
+            )))
+            .unwrap();
+        let acknowledgement = runtime
+            .try_produce_trusted_acknowledgement(0)
+            .unwrap()
+            .unwrap();
+        runtime
+            .receive_message(Msg::TrustedAcknowledgement(TrustedAcknowledgement {
+                header: Header {
+                    sender: b.public,
+                    last_epoch: target.last_epoch,
+                    nonce: target.nonce,
+                    round: 0,
+                    signature: Signature::default(),
+                },
+                body: acknowledgement.body.clone(),
+            }))
+            .unwrap();
+        let confirmation = runtime.try_produce_verification(0).unwrap().unwrap();
+
+        let block_c = signed_block_for_target(c, &target, b"trusted-c-late");
+        let block_c_hash = block_c.hash;
+        runtime
+            .receive_message(Msg::Dispatch(signed_dispatch_for_blocks(
+                c,
+                &target,
+                BTreeMap::from([(block_c.hash, block_c)]),
+            )))
+            .unwrap();
+        let expanded = runtime
+            .try_produce_trusted_acknowledgement(0)
+            .unwrap()
+            .expect("late dispatch should expand the mutable acknowledgement");
+        assert!(expanded.body.blocks.contains_key(&block_c_hash));
+        assert!(runtime.try_produce_verification(0).unwrap().is_none());
+
+        runtime
+            .receive_message(Msg::Verification(Verification {
+                header: Header {
+                    sender: b.public,
+                    last_epoch: target.last_epoch,
+                    nonce: target.nonce,
+                    round: 0,
+                    signature: Signature::default(),
+                },
+                body: confirmation.body,
+            }))
+            .unwrap();
+        let epoch = runtime.epochchain().epochchain.pop().unwrap();
+        assert_eq!(epoch.body.nonce, target.nonce);
+        assert!(epoch.body.blocks.contains_key(&local_hash));
+        assert!(epoch.body.blocks.contains_key(&block_b_hash));
+        assert!(!epoch.body.blocks.contains_key(&block_c_hash));
+    }
+
+    #[test]
+    fn trusted_failed_stage_broadcasts_retry_the_exact_messages() {
+        let (runtime, keypairs, target) = runtime_with_node_count_mode_and_quorum(
+            3,
+            TrustMode::Trusted,
+            QuorumSize::new(3).unwrap(),
+        );
+        runtime
+            .submit_block(signed_block_for_target(
+                &keypairs[0],
+                &target,
+                b"trusted-retry-a",
+            ))
+            .unwrap();
+        let dispatch = runtime.try_produce_dispatch(0).unwrap().unwrap();
+        runtime
+            .schedule_trusted_dispatch_retry(0, dispatch.body.blocks_hash)
+            .unwrap();
+        let retried_dispatch = runtime.try_produce_dispatch(0).unwrap().unwrap();
+        assert_eq!(
+            borsh::to_vec(&retried_dispatch).unwrap(),
+            borsh::to_vec(&dispatch).unwrap()
+        );
+
+        let peer = {
+            let mut state = runtime.inner.state.write().expect("state lock poisoned");
+            let peer = state
+                .get_mut_consensus(&target.last_epoch, target.nonce)
+                .peers(0)[0];
+            keypairs
+                .iter()
+                .find(|keypair| keypair.public == peer)
+                .unwrap()
+                .clone()
+        };
+        let peer_block = signed_block_for_target(&peer, &target, b"trusted-retry-b");
+        runtime
+            .receive_message(Msg::Dispatch(signed_dispatch_for_blocks(
+                &peer,
+                &target,
+                BTreeMap::from([(peer_block.hash, peer_block)]),
+            )))
+            .unwrap();
+
+        let acknowledgement = runtime
+            .try_produce_trusted_acknowledgement(0)
+            .unwrap()
+            .unwrap();
+        runtime
+            .schedule_trusted_acknowledgement_retry(0, acknowledgement.body.blocks_hash)
+            .unwrap();
+        let retried_acknowledgement = runtime
+            .try_produce_trusted_acknowledgement(0)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            borsh::to_vec(&retried_acknowledgement).unwrap(),
+            borsh::to_vec(&acknowledgement).unwrap()
+        );
+
+        runtime
+            .receive_message(Msg::TrustedAcknowledgement(TrustedAcknowledgement {
+                header: Header {
+                    sender: peer.public,
+                    last_epoch: target.last_epoch,
+                    nonce: target.nonce,
+                    round: 0,
+                    signature: Signature::default(),
+                },
+                body: acknowledgement.body,
+            }))
+            .unwrap();
+        let confirmation = runtime.try_produce_verification(0).unwrap().unwrap();
+        runtime
+            .schedule_trusted_confirmation_retry(0, confirmation.body.blocks_hash)
+            .unwrap();
+        let retried_confirmation = runtime.try_produce_verification(0).unwrap().unwrap();
+        assert_eq!(
+            borsh::to_vec(&retried_confirmation).unwrap(),
+            borsh::to_vec(&confirmation).unwrap()
+        );
+    }
+
+    #[test]
+    fn trusted_late_dispatch_before_confirmation_expands_candidate() {
+        let (runtime, keypairs, target) = runtime_with_node_count_mode_and_quorum(
+            3,
+            TrustMode::Trusted,
+            QuorumSize::new(3).unwrap(),
+        );
+        let local = signed_block_for_target(&keypairs[0], &target, b"trusted-a");
+        runtime.submit_block(local).unwrap();
+        runtime.try_produce_dispatch(0).unwrap().unwrap();
+        let peers = {
+            let mut state = runtime.inner.state.write().expect("state lock poisoned");
+            state
+                .get_mut_consensus(&target.last_epoch, target.nonce)
+                .peers(0)
+        };
+        let b = keypairs
+            .iter()
+            .find(|keypair| keypair.public == peers[0])
+            .unwrap();
+        let c = keypairs
+            .iter()
+            .find(|keypair| keypair.public == peers[1])
+            .unwrap();
+        let block_b = signed_block_for_target(b, &target, b"trusted-b");
+        runtime
+            .receive_message(Msg::Dispatch(signed_dispatch_for_blocks(
+                b,
+                &target,
+                BTreeMap::from([(block_b.hash, block_b)]),
+            )))
+            .unwrap();
+        let first_acknowledgement = runtime
+            .try_produce_trusted_acknowledgement(0)
+            .unwrap()
+            .unwrap();
+
+        let block_c = signed_block_for_target(c, &target, b"trusted-c-before-confirm");
+        let block_c_hash = block_c.hash;
+        runtime
+            .receive_message(Msg::Dispatch(signed_dispatch_for_blocks(
+                c,
+                &target,
+                BTreeMap::from([(block_c.hash, block_c)]),
+            )))
+            .unwrap();
+        let expanded = runtime
+            .try_produce_trusted_acknowledgement(0)
+            .unwrap()
+            .unwrap();
+        assert_ne!(
+            expanded.body.blocks_hash,
+            first_acknowledgement.body.blocks_hash
+        );
+        assert!(expanded.body.blocks.contains_key(&block_c_hash));
+        assert!(runtime.try_produce_verification(0).unwrap().is_none());
+
+        runtime
+            .receive_message(Msg::TrustedAcknowledgement(TrustedAcknowledgement {
+                header: Header {
+                    sender: b.public,
+                    last_epoch: target.last_epoch,
+                    nonce: target.nonce,
+                    round: 0,
+                    signature: Signature::default(),
+                },
+                body: expanded.body.clone(),
+            }))
+            .unwrap();
+        let confirmation = runtime.try_produce_verification(0).unwrap().unwrap();
+        runtime
+            .receive_message(Msg::Verification(Verification {
+                header: Header {
+                    sender: b.public,
+                    last_epoch: target.last_epoch,
+                    nonce: target.nonce,
+                    round: 0,
+                    signature: Signature::default(),
+                },
+                body: confirmation.body,
+            }))
+            .unwrap();
+
+        let epoch = runtime.epochchain().epochchain.pop().unwrap();
+        assert_eq!(epoch.body.blocks.len(), 3);
+        assert!(epoch.body.blocks.contains_key(&block_c_hash));
+    }
+
+    #[test]
+    fn durable_trusted_confirmation_lock_retransmits_identically_after_restart() {
+        let keypairs = (0..6).map(|_| Keypair::generate()).collect::<Vec<_>>();
+        let nodes = keypairs
+            .iter()
+            .enumerate()
+            .map(|(index, keypair)| {
+                NodeIdentity::new(
+                    keypair.public,
+                    (index == 0).then_some(keypair.secret),
+                    "tcp",
+                    "127.0.0.1",
+                    9_000 + index as u16,
+                    false,
+                )
+            })
+            .collect::<Vec<_>>();
+        let genesis = genesis_epoch(nodes.clone());
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "blossom-trusted-runtime-lock-{}-{unique}.redb",
+            std::process::id()
+        ));
+        let open = || {
+            let mut config = RuntimeConfig::new(nodes[0].clone());
+            config.genesis = Some(genesis.clone());
+            config.trust_mode = TrustMode::Trusted;
+            config.trusted_epoch_log_path = Some(path.clone());
+            NodeRuntime::try_new(config).unwrap()
+        };
+        let runtime = open();
+        let target = runtime.next_epoch_target().unwrap();
+        runtime
+            .submit_block(signed_block_for_target(
+                &keypairs[0],
+                &target,
+                b"durable-local",
+            ))
+            .unwrap();
+        runtime.try_produce_dispatch(0).unwrap().unwrap();
+        let peers = {
+            let mut state = runtime.inner.state.write().expect("state lock poisoned");
+            state
+                .get_mut_consensus(&target.last_epoch, target.nonce)
+                .peers(0)
+        };
+        for peer in peers.iter().take(3) {
+            let signer = keypairs
+                .iter()
+                .find(|keypair| keypair.public == *peer)
+                .unwrap();
+            let block = signed_block_for_target(signer, &target, b"durable-peer");
+            runtime
+                .receive_message(Msg::Dispatch(signed_dispatch_for_blocks(
+                    signer,
+                    &target,
+                    BTreeMap::from([(block.hash, block)]),
+                )))
+                .unwrap();
+        }
+        establish_trusted_acknowledgement_quorum(&runtime, &target, 0, &peers);
+        let first = runtime.try_produce_verification(0).unwrap().unwrap();
+        let status = runtime.trusted_operational_status().unwrap();
+        assert!(status.durable);
+        assert!(status.pending_round_lock);
+        assert_eq!(status.health, TrustedServiceHealth::Degraded);
+        drop(runtime);
+
+        let restarted = open();
+        assert_eq!(restarted.status().unwrap().last_epoch_nonce, Nonce::new(0));
+        let retransmitted = restarted.try_produce_verification(0).unwrap().unwrap();
+        assert_eq!(retransmitted.header.last_epoch, first.header.last_epoch);
+        assert_eq!(retransmitted.header.nonce, first.header.nonce);
+        assert_eq!(retransmitted.body.blocks_hash, first.body.blocks_hash);
+        assert_eq!(retransmitted.body.blocks, first.body.blocks);
+        drop(restarted);
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn durable_trusted_hierarchical_round_restarts_from_highest_lock() {
+        let keypairs = (0..6).map(|_| Keypair::generate()).collect::<Vec<_>>();
+        let nodes = keypairs
+            .iter()
+            .enumerate()
+            .map(|(index, keypair)| {
+                NodeIdentity::new(
+                    keypair.public,
+                    (index == 0).then_some(keypair.secret),
+                    "tcp",
+                    "127.0.0.1",
+                    9_050 + index as u16,
+                    false,
+                )
+            })
+            .collect::<Vec<_>>();
+        let quorum_size = QuorumSize::new(3).unwrap();
+        let genesis = genesis_epoch_for_group_with_parameters(
+            ConsensusGroupId::root(),
+            nodes.clone(),
+            ConsensusParameters::new(quorum_size),
+        );
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "blossom-trusted-hierarchical-restart-{}-{unique}.redb",
+            std::process::id()
+        ));
+        let open = || {
+            let mut config = RuntimeConfig::new(nodes[0].clone()).with_quorum_size(quorum_size);
+            config.genesis = Some(genesis.clone());
+            config.trust_mode = TrustMode::Trusted;
+            config.trusted_epoch_log_path = Some(path.clone());
+            NodeRuntime::try_new(config).unwrap()
+        };
+        let runtime = open();
+        let target = runtime.next_epoch_target().unwrap();
+        runtime
+            .submit_block(signed_block_for_target(
+                &keypairs[0],
+                &target,
+                b"hierarchical-local",
+            ))
+            .unwrap();
+        runtime.try_produce_dispatch(0).unwrap().unwrap();
+        let round_zero_peers = {
+            let mut state = runtime.inner.state.write().expect("state lock poisoned");
+            state
+                .get_mut_consensus(&target.last_epoch, target.nonce)
+                .peers(0)
+        };
+        for peer in &round_zero_peers {
+            let signer = keypairs
+                .iter()
+                .find(|keypair| keypair.public == *peer)
+                .unwrap();
+            let block = signed_block_for_target(signer, &target, b"hierarchical-round-zero");
+            runtime
+                .receive_message(Msg::Dispatch(signed_dispatch_for_blocks(
+                    signer,
+                    &target,
+                    BTreeMap::from([(block.hash, block)]),
+                )))
+                .unwrap();
+        }
+        establish_trusted_acknowledgement_quorum(&runtime, &target, 0, &round_zero_peers);
+        let round_zero_confirmation = runtime.try_produce_verification(0).unwrap().unwrap();
+        runtime
+            .receive_message(Msg::Verification(Verification {
+                header: Header {
+                    sender: round_zero_peers[0],
+                    last_epoch: target.last_epoch,
+                    nonce: target.nonce,
+                    round: 0,
+                    signature: Signature::default(),
+                },
+                body: round_zero_confirmation.body,
+            }))
+            .unwrap();
+        assert_eq!(runtime.current_consensus_round().unwrap(), 1);
+
+        runtime.try_produce_dispatch(1).unwrap().unwrap();
+        let round_one_peers = {
+            let mut state = runtime.inner.state.write().expect("state lock poisoned");
+            state
+                .get_mut_consensus(&target.last_epoch, target.nonce)
+                .peers(1)
+        };
+        let carried_blocks = runtime
+            .inner
+            .state
+            .read()
+            .expect("state lock poisoned")
+            .get_quorum(&target.last_epoch, target.nonce, 1)
+            .unwrap()
+            .canonical_verified_blocks();
+        for peer in &round_one_peers {
+            let signer = keypairs
+                .iter()
+                .find(|keypair| keypair.public == *peer)
+                .unwrap();
+            let block = signed_block_for_target(signer, &target, b"hierarchical-round-one");
+            let mut blocks = carried_blocks.clone();
+            if !blocks
+                .values()
+                .any(|carried| carried.body.validator == block.body.validator)
+            {
+                blocks.insert(block.hash, block);
+            }
+            runtime
+                .receive_message(Msg::Dispatch(signed_dispatch_for_blocks_round(
+                    signer, &target, 1, blocks,
+                )))
+                .unwrap();
+        }
+        establish_trusted_acknowledgement_quorum(&runtime, &target, 1, &round_one_peers);
+        let round_one_confirmation = runtime.try_produce_verification(1).unwrap().unwrap();
+        assert_eq!(
+            runtime
+                .inner
+                .trusted_epoch_log
+                .as_ref()
+                .unwrap()
+                .round_locks()
+                .unwrap()
+                .len(),
+            2
+        );
+        drop(runtime);
+
+        let restarted = open();
+        assert_eq!(restarted.current_consensus_round().unwrap(), 1);
+        let retransmitted = restarted.try_produce_verification(1).unwrap().unwrap();
+        assert_eq!(
+            retransmitted.body.blocks_hash,
+            round_one_confirmation.body.blocks_hash
+        );
+        assert_eq!(
+            retransmitted.body.blocks,
+            round_one_confirmation.body.blocks
+        );
+        drop(restarted);
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn durable_trusted_local_submission_survives_restart_before_dispatch() {
+        let keypairs = (0..3).map(|_| Keypair::generate()).collect::<Vec<_>>();
+        let nodes = keypairs
+            .iter()
+            .enumerate()
+            .map(|(index, keypair)| {
+                NodeIdentity::new(
+                    keypair.public,
+                    (index == 0).then_some(keypair.secret),
+                    "tcp",
+                    "127.0.0.1",
+                    9_100 + index as u16,
+                    false,
+                )
+            })
+            .collect::<Vec<_>>();
+        let genesis = genesis_epoch(nodes.clone());
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "blossom-trusted-local-submit-{}-{unique}.redb",
+            std::process::id()
+        ));
+        let open = || {
+            let mut config = RuntimeConfig::new(nodes[0].clone());
+            config.genesis = Some(genesis.clone());
+            config.trust_mode = TrustMode::Trusted;
+            config.trusted_epoch_log_path = Some(path.clone());
+            NodeRuntime::try_new(config).unwrap()
+        };
+        let runtime = open();
+        let target = runtime.next_epoch_target().unwrap();
+        let block = signed_block_for_target(&keypairs[0], &target, b"survive-before-dispatch");
+        let expected_hash = block.hash;
+        runtime.submit_block(block).unwrap();
+        drop(runtime);
+
+        let restarted = open();
+        assert_eq!(restarted.status().unwrap().pending_blocks, 1);
+        let dispatch = restarted.try_produce_dispatch(0).unwrap().unwrap();
+        assert!(dispatch.body.blocks.contains_key(&expected_hash));
+        drop(restarted);
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn durable_trusted_catch_up_retargets_omitted_local_work_without_restart() {
+        let keypairs = (0..3).map(|_| Keypair::generate()).collect::<Vec<_>>();
+        let nodes = keypairs
+            .iter()
+            .enumerate()
+            .map(|(index, keypair)| {
+                NodeIdentity::new(
+                    keypair.public,
+                    (index == 0).then_some(keypair.secret),
+                    "tcp",
+                    "127.0.0.1",
+                    9_150 + index as u16,
+                    false,
+                )
+            })
+            .collect::<Vec<_>>();
+        let genesis = genesis_epoch(nodes.clone());
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "blossom-trusted-live-retarget-{}-{unique}.redb",
+            std::process::id()
+        ));
+        let mut config = RuntimeConfig::new(nodes[0].clone());
+        config.genesis = Some(genesis.clone());
+        config.trust_mode = TrustMode::Trusted;
+        config.trusted_epoch_log_path = Some(path.clone());
+        let runtime = NodeRuntime::try_new(config).unwrap();
+        let target = runtime.next_epoch_target().unwrap();
+        let block = signed_block_for_target(&keypairs[0], &target, b"retarget-without-restart");
+        let transaction_hashes = block
+            .body
+            .txs
+            .iter()
+            .map(|transaction| transaction.hash)
+            .collect::<Vec<_>>();
+        runtime.submit_block(block).unwrap();
+
+        let mut remote_epoch = Epoch {
+            hash: HashType::default(),
+            signatures: BTreeMap::new(),
+            body: EpochBody {
+                group_id: genesis.body.group_id,
+                verifiers: genesis.body.verifiers.clone(),
+                last_epoch: genesis.hash,
+                previous_nonce: Some(genesis.body.nonce),
+                nonce: genesis.body.nonce.new_next(),
+                merkle_root: HashType::default(),
+                blocks: BTreeMap::new(),
+                consensus_parameters: Some(genesis.body.effective_consensus_parameters()),
+            },
+        };
+        remote_epoch.set_hash();
+        assert!(
+            runtime
+                .catch_up_from_epoch_started(EpochChain {
+                    epochchain: vec![remote_epoch.clone()],
+                })
+                .unwrap()
+        );
+
+        assert_eq!(
+            runtime.status().unwrap().last_epoch_nonce,
+            remote_epoch.body.nonce
+        );
+        assert_eq!(runtime.status().unwrap().pending_blocks, 1);
+        let dispatch = runtime.try_produce_dispatch(0).unwrap().unwrap();
+        let retried = dispatch.body.blocks.values().next().unwrap();
+        assert_eq!(retried.body.last_epoch, remote_epoch.hash);
+        assert_eq!(retried.body.nonce, remote_epoch.body.nonce.new_next());
+        assert_eq!(
+            retried
+                .body
+                .txs
+                .iter()
+                .map(|transaction| transaction.hash)
+                .collect::<Vec<_>>(),
+            transaction_hashes
+        );
+        drop(runtime);
+        std::fs::remove_file(path).ok();
     }
 
     #[test]

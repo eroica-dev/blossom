@@ -62,7 +62,20 @@ impl SimulatedCluster {
     }
 
     pub async fn spawn_with_trust_mode(count: usize, trust_mode: TrustMode) -> Result<Self> {
-        Self::spawn_with_options(count, trust_mode, None, QuorumSize::DEFAULT).await
+        Self::spawn_with_options(count, trust_mode, None, QuorumSize::DEFAULT, false).await
+    }
+
+    /// Starts consensus-capable TCP nodes without autonomous consensus drivers.
+    ///
+    /// This is useful for deterministic protocol tests and benchmarks that
+    /// need to establish an admission barrier before any node begins
+    /// dispatching. Callers drive rounds explicitly with [`TcpNode`].
+    pub async fn spawn_manual_with_trust_mode_and_quorum(
+        count: usize,
+        trust_mode: TrustMode,
+        quorum_size: QuorumSize,
+    ) -> Result<Self> {
+        Self::spawn_with_options(count, trust_mode, None, quorum_size, true).await
     }
 
     pub async fn spawn_autonomous(count: usize) -> Result<Self> {
@@ -96,7 +109,7 @@ impl SimulatedCluster {
         trust_mode: TrustMode,
         quorum_size: QuorumSize,
     ) -> Result<Self> {
-        Self::spawn_with_options(count, trust_mode, Some(driver), quorum_size).await
+        Self::spawn_with_options(count, trust_mode, Some(driver), quorum_size, true).await
     }
 
     async fn spawn_with_options(
@@ -104,6 +117,7 @@ impl SimulatedCluster {
         trust_mode: TrustMode,
         driver: Option<ConsensusDriverConfig>,
         quorum_size: QuorumSize,
+        configure_consensus_peers: bool,
     ) -> Result<Self> {
         if count == 0 {
             return Err(BlossomError::WireProtocol(
@@ -164,7 +178,7 @@ impl SimulatedCluster {
             let mut config = RuntimeConfig::new(identity.clone()).with_quorum_size(quorum_size);
             config.genesis = Some(genesis.clone());
             config.trust_mode = trust_mode;
-            if driver.is_some() {
+            if configure_consensus_peers {
                 for service in &services {
                     config.address_book.add(service.clone());
                 }
@@ -283,6 +297,10 @@ impl Drop for SimulatedCluster {
 }
 
 impl SimulatedNode {
+    pub fn client(&self) -> crate::TcpServiceClient {
+        self.client.clone()
+    }
+
     pub fn addr(&self) -> String {
         self.service.socket_addr()
     }

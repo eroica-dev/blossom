@@ -16,6 +16,8 @@ fair-block-ordering = []
 filtered-transactions = []
 high-availability = ["dep:hmac"]
 insecure-fast-hash = ["dep:xxhash-rust"]
+trusted-checkpoint-dag = []
+parallel-networks = ["high-availability", "trusted-checkpoint-dag"]
 propagation-adaptive = [
     "propagation-push",
     "propagation-inventory",

@@ -114,6 +114,20 @@ impl LocalBlock {
         Ok(hash)
     }
 
+    pub(crate) fn can_enqueue_preverified_block(&self, block: &Block) -> Result<()> {
+        self.ensure_enqueueable(block)
+    }
+
+    /// Replaces the volatile trusted queue with the pending block recovered
+    /// from the authoritative durable epoch log.
+    pub(crate) fn reconcile_durable_pending_block(&mut self, block: Option<Block>) -> Result<()> {
+        self.block_deque.clear();
+        if let Some(block) = block {
+            self.enqueue_preverified_block(block)?;
+        }
+        Ok(())
+    }
+
     fn ensure_enqueueable(&self, block: &Block) -> Result<()> {
         if self
             .block_deque

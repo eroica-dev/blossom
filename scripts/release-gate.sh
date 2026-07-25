@@ -28,6 +28,7 @@ run_step cargo-test-all-features cargo test --workspace --all-features
 run_step cargo-test-no-default cargo test -p blossom --no-default-features
 run_step cargo-test-insecure-fast-hash cargo test -p blossom --features insecure-fast-hash
 run_step cargo-clippy cargo clippy --workspace --all-features --all-targets -- -D warnings
+run_step trusted-production-validation ./scripts/trusted-production-validation.sh
 run_step ha-production-validation ./scripts/ha-production-validation.sh
 run_step formal ./verification/run-formal.sh
 

@@ -1600,12 +1600,26 @@ impl DurableAdmissionStore {
         state: &DurableOrderedState,
         milestone: Option<&MilestoneEvent>,
     ) -> Result<()> {
+        self.persist_ordered_state_with_milestones(
+            machine,
+            state,
+            milestone.map(std::slice::from_ref).unwrap_or_default(),
+        )
+    }
+
+    fn persist_ordered_state_with_milestones(
+        &self,
+        machine: &SharedStateMachine,
+        state: &DurableOrderedState,
+        milestones: &[MilestoneEvent],
+    ) -> Result<()> {
         let machine_bytes =
             borsh::to_vec(&(machine, state.applied_watermark)).map_err(encode_error)?;
         let ordered_bytes = borsh::to_vec(state).map_err(encode_error)?;
-        let milestone_bytes = milestone
+        let milestone_bytes = milestones
+            .iter()
             .map(borsh::to_vec)
-            .transpose()
+            .collect::<std::result::Result<Vec<_>, _>>()
             .map_err(encode_error)?;
         let mut transaction = self.database.begin_write().map_err(storage_error)?;
         transaction
@@ -1621,22 +1635,29 @@ impl DurableAdmissionStore {
             table
                 .insert(ORDERED_ENGINE_KEY, ordered_bytes.as_slice())
                 .map_err(storage_error)?;
-            if let Some(milestone_bytes) = milestone_bytes.as_deref() {
-                let mut meta = transaction.open_table(META_TABLE).map_err(storage_error)?;
-                let sequence = meta
+            if !milestone_bytes.is_empty() {
+                let mut sequence = transaction
+                    .open_table(META_TABLE)
+                    .map_err(storage_error)?
                     .get("next_milestone_sequence")
                     .map_err(storage_error)?
                     .map_or(0, |value| value.value());
-                let next = sequence.checked_add(1).ok_or_else(|| {
-                    BlossomError::InvalidConfiguration("milestone sequence overflow".to_string())
-                })?;
-                meta.insert("next_milestone_sequence", next)
-                    .map_err(storage_error)?;
                 let mut events = transaction
                     .open_table(MILESTONES_TABLE)
                     .map_err(storage_error)?;
-                events
-                    .insert(sequence, milestone_bytes)
+                for event_bytes in &milestone_bytes {
+                    events
+                        .insert(sequence, event_bytes.as_slice())
+                        .map_err(storage_error)?;
+                    sequence = sequence.checked_add(1).ok_or_else(|| {
+                        BlossomError::InvalidConfiguration(
+                            "milestone sequence overflow".to_string(),
+                        )
+                    })?;
+                }
+                drop(events);
+                let mut meta = transaction.open_table(META_TABLE).map_err(storage_error)?;
+                meta.insert("next_milestone_sequence", sequence)
                     .map_err(storage_error)?;
             }
         }
@@ -1936,7 +1957,13 @@ impl GlobalOrderedEngine {
             .values()
             .copied()
             .collect::<BTreeSet<_>>();
+        let finalized_positions = self
+            .final_reference_by_position
+            .iter()
+            .map(|(position, hash)| (*hash, *position))
+            .collect::<BTreeMap<_, _>>();
         let mut epoch_references = BTreeSet::new();
+        let mut existing_positions = Vec::with_capacity(references.len());
         for reference in &references {
             self.validate_orderable_reference(reference)?;
             let reference_hash = reference.hash()?;
@@ -1953,13 +1980,113 @@ impl GlobalOrderedEngine {
                 ));
             }
             known_predecessors.insert(reference_hash);
+            existing_positions.push(finalized_positions.get(&reference_hash).copied());
         }
 
-        let mut events = Vec::with_capacity(references.len());
-        for reference in &references {
-            let statement = self.order_statement_for_reference(reference, epoch.hash)?;
-            events.push(self.finalize_trusted(statement)?);
+        let existing_count = existing_positions
+            .iter()
+            .filter(|position| position.is_some())
+            .count();
+        if existing_count != 0 {
+            if existing_count != references.len() {
+                return Err(BlossomError::InvalidConfiguration(
+                    "trusted epoch replay is only partially present in the finality log"
+                        .to_string(),
+                ));
+            }
+            let first_position = existing_positions
+                .first()
+                .and_then(|position| *position)
+                .ok_or_else(|| {
+                    BlossomError::InvalidConfiguration(
+                        "trusted epoch replay has no first order position".to_string(),
+                    )
+                })?;
+            let mut events = Vec::with_capacity(references.len());
+            for (index, (reference, position)) in
+                references.iter().zip(existing_positions).enumerate()
+            {
+                let position = position.expect("all replay positions checked above");
+                if position
+                    != first_position
+                        .checked_add(u64::try_from(index).map_err(|_| {
+                            BlossomError::InvalidConfiguration(
+                                "trusted epoch reference index overflow".to_string(),
+                            )
+                        })?)
+                        .ok_or_else(|| {
+                            BlossomError::InvalidConfiguration(
+                                "trusted epoch replay position overflow".to_string(),
+                            )
+                        })?
+                {
+                    return Err(BlossomError::InvalidConfiguration(
+                        "trusted epoch replay is not a contiguous canonical order".to_string(),
+                    ));
+                }
+                let certificate = self.finalized.get(&position).ok_or_else(|| {
+                    BlossomError::InvalidConfiguration(
+                        "trusted epoch replay is missing its order receipt".to_string(),
+                    )
+                })?;
+                certificate.verify_trusted(self.validator_generation)?;
+                if certificate.statement.blossom_epoch_hash != epoch.hash
+                    || certificate.statement.reference_hash != reference.hash()?
+                {
+                    return Err(BlossomError::InvalidConfiguration(
+                        "trusted epoch replay conflicts with its durable order receipt".to_string(),
+                    ));
+                }
+                events.push(milestone_event(
+                    self.mode,
+                    certificate.statement.reference_hash,
+                    Milestone::Finalized,
+                    Some(certificate.statement.position),
+                ));
+            }
+            return Ok(events);
         }
+
+        let mut durable = self.durable_state();
+        let mut events = Vec::with_capacity(references.len());
+        let mut next_position = self.last_finalized_position;
+        let mut previous_certificate_hash = self.last_order_certificate_hash;
+        for reference in references {
+            let reference_hash = reference.hash()?;
+            next_position = next_position.checked_add(1).ok_or_else(|| {
+                BlossomError::InvalidConfiguration("order position overflow".to_string())
+            })?;
+            let statement = OrderStatement {
+                consensus_group_id: reference.consensus_group_id,
+                blossom_epoch_hash: epoch.hash,
+                position: Watermark {
+                    position: next_position,
+                },
+                reference_hash,
+                previous_order_certificate_hash: previous_certificate_hash,
+                validator_generation: self.validator_generation,
+            };
+            let receipt = OrderCertificate::trusted(statement);
+            receipt.verify_trusted(self.validator_generation)?;
+            previous_certificate_hash = receipt.hash()?;
+            durable.finalized.insert(next_position, receipt);
+            durable
+                .final_reference_by_position
+                .insert(next_position, reference_hash);
+            events.push(milestone_event(
+                self.mode,
+                reference_hash,
+                Milestone::Finalized,
+                Some(Watermark {
+                    position: next_position,
+                }),
+            ));
+        }
+        durable.last_finalized_position = next_position;
+        durable.last_order_certificate_hash = previous_certificate_hash;
+        self.store
+            .persist_ordered_state_with_milestones(&self.state_machine, &durable, &events)?;
+        self.install_durable_state(durable);
         Ok(events)
     }
 
@@ -3116,6 +3243,20 @@ mod tests {
                 .values()
                 .all(|receipt| receipt.signatures.is_empty())
         );
+        let milestone_count = engine.store.milestones().unwrap().len();
+        let replayed_events = engine.finalize_trusted_epoch(&epoch).unwrap();
+        assert_eq!(
+            replayed_events
+                .iter()
+                .map(|event| (event.reference_hash, event.milestone, event.watermark))
+                .collect::<Vec<_>>(),
+            events
+                .iter()
+                .map(|event| (event.reference_hash, event.milestone, event.watermark))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(engine.last_finalized_position, 3);
+        assert_eq!(engine.store.milestones().unwrap().len(), milestone_count);
         assert!(matches!(
             engine.apply_through(Watermark { position: 3 }).unwrap(),
             ApplyProgress::Applied {

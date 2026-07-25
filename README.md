@@ -31,7 +31,10 @@ semantics.
 - [Feature Flags](guides/feature-flags.md)
 - [Operations](guides/operations.md)
 - [Testing And Validation](guides/testing-and-validation.md)
+- [Direct Active-Active Integration](guides/active-active-integration.md)
+- [Trusted Network Durability and Recovery](guides/trusted-network-durability.md)
 - [Small-Cluster High Availability](guides/high-availability.md)
+- [Parallel HA and Global Blossom Networks](guides/parallel-ha-global-blossom.md)
 
 ## Workspace
 

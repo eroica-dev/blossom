@@ -8,9 +8,10 @@ use blossom::{
     CommandBatch, CommandResult, ConsensusDriverConfig, ConsensusGroupId, DurableAdmissionStore,
     Epoch, GlobalOrderedEngine, HashType, HolderMembership, LocalAdmissionCertificate,
     LocalAdmissionPolicy, Nonce, QuorumSize, ReplicaMembershipEpoch, SharedStateMachine,
-    SimulatedCluster, SiteId, StoreGeneration, TcpNodeMetricsSnapshot, Transaction, TrustMode,
-    ValidatorGeneration, Watermark, WireRequest, WireResponse, find_round_number_with_size,
-    ordered_batch_references, ordered_batch_references_trusted, supermajority_count,
+    SimulatedCluster, SiteId, StoreGeneration, TcpNode, TcpNodeMetricsSnapshot, Transaction,
+    TrustMode, ValidatorGeneration, Watermark, WireRequest, WireResponse,
+    find_round_number_with_size, ordered_batch_references, ordered_batch_references_trusted,
+    supermajority_count,
 };
 use serde::{Deserialize, Serialize};
 use tokio::task::JoinSet;
@@ -20,12 +21,14 @@ const TRUSTED_DIRECT_COMMAND_DOMAIN: &[u8] = b"blossom/benchmark/trusted-direct-
 
 /// A native Blossom TCP cluster used by the comparison harness.
 ///
-/// Every participant runs an autonomous consensus driver. The adapter submits
-/// availability-certified compact references at their writers and empty blocks
-/// at the remaining validators, waits for trusted local finality or verified
-/// global finality, and measures all-node convergence separately.
+/// The adapter submits availability-certified compact references at their
+/// writers and empty blocks at the remaining validators before manually
+/// driving consensus. This admission barrier makes universal-writer benchmark
+/// epochs deterministic without weakening the protocol's quorum finality.
 pub struct BlossomTcpOrderCluster {
     cluster: SimulatedCluster,
+    drivers: Vec<TcpNode>,
+    driver: ConsensusDriverConfig,
     finality_timeout: Duration,
     trust_mode: TrustMode,
     max_round: u8,
@@ -214,15 +217,21 @@ impl BlossomTcpOrderCluster {
             return Err("Blossom finality timeout must be non-zero".into());
         }
         let max_round = driver.max_round;
-        let cluster = SimulatedCluster::spawn_autonomous_with_config_trust_mode_and_quorum(
+        let cluster = SimulatedCluster::spawn_manual_with_trust_mode_and_quorum(
             participant_count,
-            driver,
             trust_mode,
             quorum_size,
         )
         .await?;
+        let drivers = cluster
+            .nodes()
+            .iter()
+            .map(|node| TcpNode::with_services(node.runtime.clone(), node.client()))
+            .collect();
         Ok(Self {
             cluster,
+            drivers,
+            driver,
             finality_timeout,
             trust_mode,
             max_round,
@@ -405,17 +414,47 @@ impl BlossomTcpOrderCluster {
         nonce: Nonce,
     ) -> Result<(Epoch, Vec<usize>), BoxError> {
         if self.trust_mode.is_trusted() {
-            let epoch = self
-                .cluster
-                .node(0)
-                .runtime
-                .wait_for_committed_epoch(nonce, self.finality_timeout)
-                .await?;
-            return Ok((epoch, vec![0]));
+            let deadline = Instant::now() + self.finality_timeout;
+            loop {
+                if let Some(epoch) = self
+                    .cluster
+                    .node(0)
+                    .runtime
+                    .epochchain()
+                    .epochchain
+                    .into_iter()
+                    .find(|epoch| epoch.body.nonce == nonce)
+                {
+                    return Ok((epoch, vec![0]));
+                }
+                let drive_errors = self.drive_cluster_once().await?;
+                if Instant::now() >= deadline {
+                    let progress =
+                        self.cluster
+                            .nodes()
+                            .iter()
+                            .enumerate()
+                            .map(|(index, node)| {
+                                let round = node.runtime.current_consensus_round();
+                                let status = round.as_ref().ok().and_then(|round| {
+                                    node.runtime.consensus_round_status(*round).ok()
+                                });
+                                (index, round, status)
+                            })
+                            .collect::<Vec<_>>();
+                    return Err(format!(
+                        "timed out waiting for local epoch {nonce} commit; trusted progress: \
+                         {progress:?}; last drive errors: {drive_errors:?}"
+                    )
+                    .into());
+                }
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
         }
         let deadline = Instant::now() + self.finality_timeout;
         let required = supermajority_count(self.cluster.len());
         loop {
+            let _drive_errors = self.drive_cluster_once().await?;
             let mut finalized = BTreeMap::<HashType, Vec<(usize, Epoch)>>::new();
             let mut progress = Vec::with_capacity(self.cluster.len());
             for index in 0..self.cluster.len() {
@@ -506,6 +545,62 @@ impl BlossomTcpOrderCluster {
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
+    }
+
+    async fn drive_cluster_once(&self) -> Result<Vec<String>, BoxError> {
+        let mut errors = self.drive_cluster_dispatch_stage_once().await?;
+        errors.extend(
+            self.drive_cluster_once_with_config(self.driver.clone())
+                .await?,
+        );
+        Ok(errors)
+    }
+
+    async fn drive_cluster_dispatch_stage_once(&self) -> Result<Vec<String>, BoxError> {
+        let mut drives = JoinSet::new();
+        for node in &self.drivers {
+            let node = node.clone();
+            let max_round = self.max_round;
+            drives.spawn(async move { node.drive_dispatch_stage_once(max_round).await });
+        }
+        let mut errors = Vec::new();
+        while let Some(result) = drives.join_next().await {
+            match result {
+                Ok(Ok(_)) => {}
+                Ok(Err(error)) if self.driver.continue_after_error => {
+                    errors.push(error.to_string());
+                }
+                Ok(Err(error)) => return Err(error.into()),
+                Err(error) => {
+                    return Err(format!("manual dispatch-stage driver failed: {error}").into());
+                }
+            }
+        }
+        Ok(errors)
+    }
+
+    async fn drive_cluster_once_with_config(
+        &self,
+        config: ConsensusDriverConfig,
+    ) -> Result<Vec<String>, BoxError> {
+        let mut drives = JoinSet::new();
+        for node in &self.drivers {
+            let node = node.clone();
+            let config = config.clone();
+            drives.spawn(async move { node.drive_consensus_once(&config).await });
+        }
+        let mut errors = Vec::new();
+        while let Some(result) = drives.join_next().await {
+            match result {
+                Ok(Ok(_)) => {}
+                Ok(Err(error)) if config.continue_after_error => {
+                    errors.push(error.to_string());
+                }
+                Ok(Err(error)) => return Err(error.into()),
+                Err(error) => return Err(format!("manual consensus driver failed: {error}").into()),
+            }
+        }
+        Ok(errors)
     }
 
     async fn wait_for_converged_epoch(

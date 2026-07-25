@@ -1597,6 +1597,211 @@ pub enum HaServiceDirective {
     AwaitReactivation,
     RestartOrRedeploy,
     QuarantinePeer,
+    AwaitLeader,
+}
+
+/// Service-level replication choice for a 2–7 node HA deployment.
+///
+/// `LeaderlessActiveActive` is implemented by [`HighAvailabilityRuntime`].
+/// `MajorityLeaderActivePassive` is an integration contract for an external
+/// leader-based engine such as Raft; Blossom core intentionally does not
+/// depend on or implement that engine.
+#[derive(
+    Serialize, Deserialize, BorshSerialize, BorshDeserialize, Debug, Clone, Copy, PartialEq, Eq,
+)]
+pub enum HaReplicationMode {
+    LeaderlessActiveActive,
+    MajorityLeaderActivePassive,
+}
+
+#[derive(
+    Serialize, Deserialize, BorshSerialize, BorshDeserialize, Debug, Clone, Copy, PartialEq, Eq,
+)]
+pub enum HaWriteRoute {
+    AnyActiveMember,
+    CurrentLeader,
+}
+
+/// Leadership observation supplied by the service's active-passive driver.
+///
+/// Leaderless Blossom HA callers must use `NotApplicable`. The service API
+/// never attempts to infer leadership from Blossom HA state.
+#[derive(
+    Serialize, Deserialize, BorshSerialize, BorshDeserialize, Debug, Clone, Copy, PartialEq, Eq,
+)]
+pub enum HaLeadershipStatus {
+    NotApplicable,
+    Unavailable,
+    Elected,
+}
+
+/// Validated physical and voting layout for one HA service deployment.
+///
+/// Active-active Blossom uses every physical member as a voter. Active-passive
+/// deployments may use non-voting learners, but majority leadership and write
+/// availability are always derived from `voting_nodes`.
+#[derive(
+    Serialize, Deserialize, BorshSerialize, BorshDeserialize, Debug, Clone, Copy, PartialEq, Eq,
+)]
+pub struct HaServiceTopology {
+    pub mode: HaReplicationMode,
+    pub physical_nodes: u8,
+    pub voting_nodes: u8,
+}
+
+#[derive(Serialize, Deserialize, BorshSerialize, BorshDeserialize, Debug, Clone, PartialEq, Eq)]
+pub struct HaModeOperationalStatus {
+    pub topology: HaServiceTopology,
+    pub write_route: HaWriteRoute,
+    pub leadership: HaLeadershipStatus,
+    pub responsive_voters: u8,
+    pub required_voters: u8,
+    pub tolerated_voter_failures: u8,
+    pub health: HaServiceHealth,
+    pub accepts_writes: bool,
+    pub serves_local_reads: bool,
+    pub directives: Vec<HaServiceDirective>,
+}
+
+impl HaServiceTopology {
+    pub fn active_active(member_count: usize) -> Result<Self> {
+        let member_count = validated_ha_node_count(member_count)?;
+        Ok(Self {
+            mode: HaReplicationMode::LeaderlessActiveActive,
+            physical_nodes: member_count,
+            voting_nodes: member_count,
+        })
+    }
+
+    pub fn active_passive(physical_nodes: usize, voting_nodes: usize) -> Result<Self> {
+        let physical_nodes = validated_ha_node_count(physical_nodes)?;
+        let voting_nodes = validated_ha_node_count(voting_nodes)?;
+        if voting_nodes > physical_nodes {
+            return Err(BlossomError::InvalidConfiguration(
+                "HA active-passive voting nodes cannot exceed physical nodes".to_string(),
+            ));
+        }
+        Ok(Self {
+            mode: HaReplicationMode::MajorityLeaderActivePassive,
+            physical_nodes,
+            voting_nodes,
+        })
+    }
+
+    pub const fn write_route(self) -> HaWriteRoute {
+        match self.mode {
+            HaReplicationMode::LeaderlessActiveActive => HaWriteRoute::AnyActiveMember,
+            HaReplicationMode::MajorityLeaderActivePassive => HaWriteRoute::CurrentLeader,
+        }
+    }
+
+    pub fn required_voters(self) -> u8 {
+        u8::try_from(high_availability_majority(usize::from(self.voting_nodes)))
+            .expect("validated HA topology has at most seven voters")
+    }
+
+    pub fn tolerated_voter_failures(self) -> u8 {
+        self.voting_nodes.saturating_sub(self.required_voters())
+    }
+
+    /// Converts protocol reachability and leadership observations into one
+    /// service-facing write/readiness decision.
+    ///
+    /// A two-voter topology requires both voters. With only one responsive
+    /// voter, both replication modes remain locally readable but reject new
+    /// consensus writes.
+    pub fn assess(
+        self,
+        responsive_voters: usize,
+        leadership: HaLeadershipStatus,
+    ) -> Result<HaModeOperationalStatus> {
+        if responsive_voters > usize::from(self.voting_nodes) {
+            return Err(BlossomError::InvalidConfiguration(
+                "responsive HA voters cannot exceed configured voting nodes".to_string(),
+            ));
+        }
+        match (self.mode, leadership) {
+            (HaReplicationMode::LeaderlessActiveActive, HaLeadershipStatus::NotApplicable)
+            | (
+                HaReplicationMode::MajorityLeaderActivePassive,
+                HaLeadershipStatus::Unavailable | HaLeadershipStatus::Elected,
+            ) => {}
+            (HaReplicationMode::LeaderlessActiveActive, _) => {
+                return Err(BlossomError::InvalidConfiguration(
+                    "leaderless active-active HA does not accept a leadership state".to_string(),
+                ));
+            }
+            (HaReplicationMode::MajorityLeaderActivePassive, HaLeadershipStatus::NotApplicable) => {
+                return Err(BlossomError::InvalidConfiguration(
+                    "active-passive HA requires an observation from its majority-leader driver"
+                        .to_string(),
+                ));
+            }
+        }
+
+        let responsive_voters = u8::try_from(responsive_voters)
+            .expect("validated HA topology has at most seven voters");
+        let required_voters = self.required_voters();
+        let has_quorum = responsive_voters >= required_voters;
+        let has_write_authority = match self.mode {
+            HaReplicationMode::LeaderlessActiveActive => true,
+            HaReplicationMode::MajorityLeaderActivePassive => {
+                leadership == HaLeadershipStatus::Elected
+            }
+        };
+        let accepts_writes = has_quorum && has_write_authority;
+        let health = if !accepts_writes {
+            HaServiceHealth::Unavailable
+        } else if responsive_voters < self.voting_nodes {
+            HaServiceHealth::Degraded
+        } else {
+            HaServiceHealth::Ready
+        };
+        let directives = if !has_quorum {
+            vec![
+                HaServiceDirective::NotifyOperators,
+                HaServiceDirective::NotifyUsers,
+                HaServiceDirective::DrainWrites,
+                HaServiceDirective::AwaitQuorum {
+                    required: required_voters,
+                    responsive: responsive_voters,
+                },
+            ]
+        } else if !has_write_authority {
+            vec![
+                HaServiceDirective::NotifyOperators,
+                HaServiceDirective::DrainWrites,
+                HaServiceDirective::AwaitLeader,
+            ]
+        } else if responsive_voters < self.voting_nodes {
+            vec![
+                HaServiceDirective::Continue,
+                HaServiceDirective::NotifyOperators,
+            ]
+        } else {
+            vec![HaServiceDirective::Continue]
+        };
+
+        Ok(HaModeOperationalStatus {
+            topology: self,
+            write_route: self.write_route(),
+            leadership,
+            responsive_voters,
+            required_voters,
+            tolerated_voter_failures: self.tolerated_voter_failures(),
+            health,
+            accepts_writes,
+            serves_local_reads: true,
+            directives,
+        })
+    }
+}
+
+fn validated_ha_node_count(node_count: usize) -> Result<u8> {
+    if !(MIN_HA_NODES..=MAX_HA_NODES).contains(&node_count) {
+        return Err(BlossomError::InvalidHighAvailabilityNodeCount(node_count));
+    }
+    Ok(u8::try_from(node_count).expect("validated HA node count is at most seven"))
 }
 
 /// Machine-readable classification for mapping HA failures into service
@@ -3436,6 +3641,15 @@ impl HighAvailabilityRuntime {
         Ok(self.status()?.operational_status())
     }
 
+    pub const fn replication_mode(&self) -> HaReplicationMode {
+        HaReplicationMode::LeaderlessActiveActive
+    }
+
+    pub fn service_topology(&self) -> HaServiceTopology {
+        HaServiceTopology::active_active(self.state.members.member_count())
+            .expect("validated HA runtime membership is between two and seven")
+    }
+
     pub fn assess_peer_status(&self, peer: &HaNodeStatus) -> Result<HaPeerAssessment> {
         Ok(self.status()?.assess_peer(peer))
     }
@@ -5050,6 +5264,112 @@ mod tests {
             suspended_operational
                 .directives
                 .contains(&HaServiceDirective::AwaitReactivation)
+        );
+    }
+
+    #[test]
+    fn service_topologies_expose_distinct_write_paths_and_majorities() {
+        for nodes in MIN_HA_NODES..=MAX_HA_NODES {
+            let active_active = HaServiceTopology::active_active(nodes).unwrap();
+            assert_eq!(
+                active_active.mode,
+                HaReplicationMode::LeaderlessActiveActive
+            );
+            assert_eq!(active_active.write_route(), HaWriteRoute::AnyActiveMember);
+            assert_eq!(usize::from(active_active.physical_nodes), nodes);
+            assert_eq!(usize::from(active_active.voting_nodes), nodes);
+            assert_eq!(
+                usize::from(active_active.required_voters()),
+                high_availability_majority(nodes)
+            );
+
+            let active_passive = HaServiceTopology::active_passive(nodes, nodes).unwrap();
+            assert_eq!(
+                active_passive.mode,
+                HaReplicationMode::MajorityLeaderActivePassive
+            );
+            assert_eq!(active_passive.write_route(), HaWriteRoute::CurrentLeader);
+            assert_eq!(
+                usize::from(active_passive.required_voters()),
+                high_availability_majority(nodes)
+            );
+        }
+
+        assert!(HaServiceTopology::active_active(1).is_err());
+        assert!(HaServiceTopology::active_active(8).is_err());
+        assert!(HaServiceTopology::active_passive(4, 5).is_err());
+        assert!(HaServiceTopology::active_passive(7, 1).is_err());
+    }
+
+    #[test]
+    fn two_node_loss_is_readable_but_never_write_available() {
+        let active_active = HaServiceTopology::active_active(2)
+            .unwrap()
+            .assess(1, HaLeadershipStatus::NotApplicable)
+            .unwrap();
+        assert_eq!(active_active.required_voters, 2);
+        assert_eq!(active_active.health, HaServiceHealth::Unavailable);
+        assert!(!active_active.accepts_writes);
+        assert!(active_active.serves_local_reads);
+        assert!(
+            active_active
+                .directives
+                .contains(&HaServiceDirective::AwaitQuorum {
+                    required: 2,
+                    responsive: 1,
+                })
+        );
+
+        let active_passive = HaServiceTopology::active_passive(2, 2)
+            .unwrap()
+            .assess(1, HaLeadershipStatus::Elected)
+            .unwrap();
+        assert_eq!(active_passive.required_voters, 2);
+        assert_eq!(active_passive.health, HaServiceHealth::Unavailable);
+        assert!(!active_passive.accepts_writes);
+        assert!(active_passive.serves_local_reads);
+    }
+
+    #[test]
+    fn majority_leader_mode_requires_both_quorum_and_an_elected_leader() {
+        let topology = HaServiceTopology::active_passive(6, 5).unwrap();
+        let electing = topology.assess(5, HaLeadershipStatus::Unavailable).unwrap();
+        assert_eq!(electing.required_voters, 3);
+        assert!(!electing.accepts_writes);
+        assert!(
+            electing
+                .directives
+                .contains(&HaServiceDirective::AwaitLeader)
+        );
+
+        let elected = topology.assess(3, HaLeadershipStatus::Elected).unwrap();
+        assert_eq!(elected.health, HaServiceHealth::Degraded);
+        assert!(elected.accepts_writes);
+        assert_eq!(elected.write_route, HaWriteRoute::CurrentLeader);
+
+        assert!(
+            topology
+                .assess(5, HaLeadershipStatus::NotApplicable)
+                .is_err()
+        );
+        assert!(
+            HaServiceTopology::active_active(3)
+                .unwrap()
+                .assess(3, HaLeadershipStatus::Elected)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn runtime_reports_the_leaderless_active_active_service_contract() {
+        let nodes = runtimes(3);
+        assert_eq!(
+            nodes[0].replication_mode(),
+            HaReplicationMode::LeaderlessActiveActive
+        );
+        assert_eq!(
+            nodes[0].service_topology(),
+            HaServiceTopology::active_active(3).unwrap()
         );
     }
 

@@ -40,6 +40,8 @@ struct Args {
     state_snapshot: Option<PathBuf>,
     #[arg(long, env = "BLOSSOM_BLOCK_STORE")]
     block_store: Option<PathBuf>,
+    #[arg(long, env = "BLOSSOM_TRUSTED_EPOCH_LOG")]
+    trusted_epoch_log: Option<PathBuf>,
     #[arg(
         long,
         env = "BLOSSOM_SYNC_BOOTSTRAP_ADDRESS_BOOKS",
@@ -80,6 +82,7 @@ async fn main() -> MainResult<()> {
     };
     config.snapshot_path = args.state_snapshot.clone();
     config.block_store_path = args.block_store.clone();
+    config.trusted_epoch_log_path = args.trusted_epoch_log.clone();
     if !restored_from_snapshot {
         config.block_cap = args.block_cap;
     }

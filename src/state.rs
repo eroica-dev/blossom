@@ -17,7 +17,7 @@ use crate::block::{Block, Transaction};
 use crate::block::{fair_ordered_block_commitments, fair_ordered_blocks};
 use crate::blossom::{
     Commit, Dispatch, EchoReDispatch, EchoRequest, EchoResponse, Proposal, SignatureTree,
-    SignaturesForHash, Verification,
+    SignaturesForHash, TrustedAcknowledgement, Verification, VerificationBody,
 };
 use crate::crypto::{PubKey, Signature};
 use crate::error::{BlossomError, Result};
@@ -295,6 +295,159 @@ impl LocalState {
             .retain(|EpochNonce(_, nonce), _| nonce.value() + 1 >= new_epoch.body.nonce.value());
         self.epochchain.epochchain.push(new_epoch);
         true
+    }
+
+    /// Builds the immutable epoch a trusted confirmation quorum would commit without
+    /// mutating the local stable prefix.
+    ///
+    /// Trusted runtimes use this to fsync the epoch log before exposing the new
+    /// head. The verified protocol continues to use [`Self::advance_epoch`].
+    pub(crate) fn prepare_trusted_epoch(
+        &self,
+        proposed_last_epoch_hash: &HashType,
+        proposed_new_epoch_nonce: Nonce,
+        current_round: u8,
+        confirmed_blocks: &BTreeMap<HashType, ()>,
+    ) -> Result<Epoch> {
+        let last_epoch = self
+            .epochchain
+            .epochchain
+            .last()
+            .ok_or(BlossomError::EmptyEpochChain)?;
+        let expected_nonce = last_epoch.body.nonce.new_next();
+        if last_epoch.hash != *proposed_last_epoch_hash
+            || expected_nonce != proposed_new_epoch_nonce
+        {
+            return Err(BlossomError::InvalidEpochNonce);
+        }
+        let current_consensus = self
+            .consensus
+            .get(&EpochNonce(
+                *proposed_last_epoch_hash,
+                proposed_new_epoch_nonce,
+            ))
+            .ok_or(BlossomError::FailedConsensus)?;
+        if current_consensus.peers.len() > current_round as usize + 1 {
+            return Err(BlossomError::FailedConsensus);
+        }
+        let quorum = current_consensus
+            .quorum
+            .get(&current_round)
+            .ok_or(BlossomError::FailedConsensus)?;
+        let blocks = quorum
+            .trusted_candidate_blocks(&VerificationBody {
+                blocks_hash: confirmed_blocks.hash(),
+                blocks: confirmed_blocks.clone(),
+            })
+            .ok_or_else(|| {
+                BlossomError::InvalidConfiguration(
+                    "trusted confirmation references unavailable local blocks".to_string(),
+                )
+            })?;
+        let (verifiers, _) = apply_epoch_membership_transition(
+            &last_epoch.body.verifiers,
+            &blocks,
+            *proposed_last_epoch_hash,
+            expected_nonce,
+            self.consensus_node_removal_policy,
+        );
+        let mut epoch = Epoch {
+            hash: HashType::default(),
+            signatures: BTreeMap::default(),
+            body: EpochBody {
+                group_id: last_epoch.body.group_id,
+                verifiers,
+                last_epoch: *proposed_last_epoch_hash,
+                previous_nonce: Some(last_epoch.body.nonce),
+                nonce: expected_nonce,
+                merkle_root: block_merkle_root(&blocks),
+                blocks,
+                consensus_parameters: Some(last_epoch.body.effective_consensus_parameters()),
+            },
+        };
+        epoch.set_hash();
+        Ok(epoch)
+    }
+
+    /// Carries one confirmed trusted candidate into the next hierarchical
+    /// quorum round without changing the immutable epoch chain.
+    pub(crate) fn advance_trusted_round(
+        &mut self,
+        proposed_last_epoch_hash: &HashType,
+        proposed_new_epoch_nonce: Nonce,
+        current_round: u8,
+        confirmed_blocks: &BTreeMap<HashType, ()>,
+    ) -> Result<bool> {
+        let last_epoch = self
+            .epochchain
+            .epochchain
+            .last()
+            .ok_or(BlossomError::EmptyEpochChain)?;
+        if last_epoch.hash != *proposed_last_epoch_hash
+            || last_epoch.body.nonce.new_next() != proposed_new_epoch_nonce
+        {
+            return Err(BlossomError::InvalidEpochNonce);
+        }
+        let consensus = self
+            .consensus
+            .get_mut(&EpochNonce(
+                *proposed_last_epoch_hash,
+                proposed_new_epoch_nonce,
+            ))
+            .ok_or(BlossomError::FailedConsensus)?;
+        if consensus.peers.len() <= current_round as usize + 1 {
+            return Ok(false);
+        }
+        let current = consensus
+            .quorum
+            .get(&current_round)
+            .ok_or(BlossomError::FailedConsensus)?;
+        let carried_blocks = current
+            .trusted_candidate_blocks(&VerificationBody {
+                blocks_hash: confirmed_blocks.hash(),
+                blocks: confirmed_blocks.clone(),
+            })
+            .ok_or_else(|| {
+                BlossomError::InvalidConfiguration(
+                    "trusted round confirmation references unavailable blocks".to_string(),
+                )
+            })?;
+        let next_round = current_round.checked_add(1).ok_or_else(|| {
+            BlossomError::InvalidConfiguration("trusted round overflow".to_string())
+        })?;
+        let next_peers = consensus.peers_with_us(next_round);
+        let next_quorum = consensus.quorum.entry(next_round).or_insert_with(|| {
+            init_quorum(next_peers.len() as u32, &next_peers, &consensus.self_key)
+        });
+        for (hash, block) in carried_blocks {
+            next_quorum.record_verified_block(hash, block);
+        }
+        next_quorum.verified_blocks_hash = Some(next_quorum.verified_blocks_hash());
+        consensus.round = next_round;
+        Ok(true)
+    }
+
+    /// Installs an epoch that was already durably appended by the trusted
+    /// runtime.
+    pub(crate) fn install_trusted_epoch(&mut self, epoch: Epoch) -> Result<bool> {
+        let current = self
+            .epochchain
+            .epochchain
+            .last()
+            .ok_or(BlossomError::EmptyEpochChain)?;
+        if epoch.body.last_epoch != current.hash
+            || epoch.body.previous_nonce != Some(current.body.nonce)
+            || epoch.body.nonce != current.body.nonce.new_next()
+            || epoch.hash != HashType::hash(&epoch.body.to_bytes())
+        {
+            return Err(BlossomError::InvalidConfiguration(
+                "durable trusted epoch does not extend the in-memory stable prefix".to_string(),
+            ));
+        }
+        self.consensus
+            .retain(|EpochNonce(_, nonce), _| nonce.value() + 1 >= epoch.body.nonce.value());
+        self.epochchain.epochchain.push(epoch);
+        Ok(true)
     }
 
     fn peers_in_consensus(&self, epoch_hash: &HashType) -> Vec<BTreeMap<PubKey, NodeType>> {
@@ -710,6 +863,15 @@ pub struct TempQuorum {
     pub verified_blocks_hash: Option<HashType>,
     pub processed_txs: HashMap<String, bool>,
     pub last_signature_tree: SignatureTree,
+    pub trusted_local_dispatch: Option<Dispatch>,
+    pub trusted_dispatch_retry: bool,
+    pub trusted_acknowledgements: TrustedAcknowledgementCount,
+    pub trusted_confirmations: TrustedConfirmationCount,
+    pub pending_trusted_acknowledgements: BTreeMap<PubKey, TrustedAcknowledgement>,
+    pub pending_trusted_confirmations: BTreeMap<PubKey, Verification>,
+    pub last_trusted_acknowledgement_hash: Option<HashType>,
+    pub trusted_acknowledgement_retry: Option<HashType>,
+    pub trusted_confirmation_retry: Option<HashType>,
     pub verifications: VerifCount,
     pub verification_sent: bool,
     pub proposals: PropCount,
@@ -726,6 +888,54 @@ pub struct TempQuorum {
 }
 
 impl TempQuorum {
+    pub(crate) fn trusted_candidate_blocks(
+        &self,
+        body: &VerificationBody,
+    ) -> Option<BTreeMap<HashType, Block>> {
+        let verified = self.canonical_verified_blocks();
+        body.blocks
+            .keys()
+            .map(|hash| verified.get(hash).cloned().map(|block| (*hash, block)))
+            .collect()
+    }
+
+    pub(crate) fn activate_pending_trusted_messages(&mut self) -> Result<()> {
+        let acknowledgement_senders = self
+            .pending_trusted_acknowledgements
+            .iter()
+            .filter_map(|(sender, acknowledgement)| {
+                self.trusted_candidate_blocks(&acknowledgement.body)
+                    .is_some()
+                    .then_some(*sender)
+            })
+            .collect::<Vec<_>>();
+        for sender in acknowledgement_senders {
+            let acknowledgement = self
+                .pending_trusted_acknowledgements
+                .remove(&sender)
+                .expect("pending trusted acknowledgement sender exists");
+            self.trusted_acknowledgements.record(acknowledgement)?;
+        }
+
+        let confirmation_senders = self
+            .pending_trusted_confirmations
+            .iter()
+            .filter_map(|(sender, confirmation)| {
+                self.trusted_candidate_blocks(&confirmation.body)
+                    .is_some()
+                    .then_some(*sender)
+            })
+            .collect::<Vec<_>>();
+        for sender in confirmation_senders {
+            let confirmation = self
+                .pending_trusted_confirmations
+                .remove(&sender)
+                .expect("pending trusted confirmation sender exists");
+            self.trusted_confirmations.record(confirmation)?;
+        }
+        Ok(())
+    }
+
     pub fn try_push_pending_dispatch(
         &mut self,
         dispatch: PendingDispatch,
@@ -897,6 +1107,14 @@ impl TempQuorum {
                 >= self.msg_matrix.quorum_nodes.len()
     }
 
+    /// Returns true once enough trusted members have dispatched to preserve
+    /// quorum intersection even if the remaining members are inactive.
+    pub fn has_trusted_dispatch_quorum(&self) -> bool {
+        let members = self.msg_matrix.quorum_nodes.len();
+        self.dispatch_status == Some(true)
+            && self.received_dispatches.len().saturating_add(1) >= supermajority_count(members)
+    }
+
     pub fn record_verified_block(&mut self, block_hash: HashType, block: Block) -> bool {
         let validator = block.body.validator;
         if self.equivocating_validators.contains(&validator)
@@ -981,6 +1199,113 @@ pub struct VerifCount {
     pub count: BTreeMap<HashType, u8>,
     pub quorum: u32,
     pub supermajority: u32,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+pub struct TrustedAcknowledgementCount {
+    pub acknowledgements: BTreeMap<PubKey, TrustedAcknowledgement>,
+    pub count: BTreeMap<HashType, u32>,
+    pub quorum: u32,
+    pub supermajority: u32,
+}
+
+impl TrustedAcknowledgementCount {
+    pub fn validate_update(&self, acknowledgement: &TrustedAcknowledgement) -> Result<bool> {
+        let sender = acknowledgement.header.sender;
+        let blocks_hash = acknowledgement.body.blocks_hash;
+        if let Some(previous) = self.acknowledgements.get(&sender) {
+            if !previous
+                .body
+                .blocks
+                .keys()
+                .all(|hash| acknowledgement.body.blocks.contains_key(hash))
+            {
+                return Err(BlossomError::WireProtocol(
+                    "trusted acknowledgement masks may only grow".to_string(),
+                ));
+            }
+            if previous.body.blocks_hash == blocks_hash {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    pub fn record(&mut self, acknowledgement: TrustedAcknowledgement) -> Result<bool> {
+        if !self.validate_update(&acknowledgement)? {
+            return Ok(false);
+        }
+        let sender = acknowledgement.header.sender;
+        let blocks_hash = acknowledgement.body.blocks_hash;
+        if let Some(previous) = self.acknowledgements.insert(sender, acknowledgement) {
+            decrement_count_u32(&mut self.count, previous.body.blocks_hash);
+        }
+        let count = self.count.entry(blocks_hash).or_default();
+        *count = count.checked_add(1).ok_or_else(|| {
+            BlossomError::InvalidConfiguration("trusted acknowledgement count overflow".to_string())
+        })?;
+        Ok(true)
+    }
+
+    pub fn consensus_hash(&self) -> Option<HashType> {
+        self.count
+            .iter()
+            .find_map(|(hash, count)| (*count >= self.supermajority).then_some(*hash))
+    }
+
+    pub fn consensus_body(&self) -> Option<&VerificationBody> {
+        let hash = self.consensus_hash()?;
+        self.acknowledgements
+            .values()
+            .find(|acknowledgement| acknowledgement.body.blocks_hash == hash)
+            .map(|acknowledgement| &acknowledgement.body)
+    }
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+pub struct TrustedConfirmationCount {
+    pub confirmations: BTreeMap<PubKey, Verification>,
+    pub count: BTreeMap<HashType, u32>,
+    pub quorum: u32,
+    pub supermajority: u32,
+}
+
+impl TrustedConfirmationCount {
+    pub fn validate_update(&self, confirmation: &Verification) -> Result<bool> {
+        let sender = confirmation.header.sender;
+        let blocks_hash = confirmation.body.blocks_hash;
+        if let Some(previous) = self.confirmations.get(&sender) {
+            if previous.body.blocks_hash != blocks_hash
+                || previous.body.blocks != confirmation.body.blocks
+            {
+                return Err(BlossomError::WireProtocol(
+                    "trusted member confirmed two candidates for one round".to_string(),
+                ));
+            }
+            return Ok(false);
+        }
+        Ok(true)
+    }
+
+    pub fn record(&mut self, confirmation: Verification) -> Result<bool> {
+        if !self.validate_update(&confirmation)? {
+            return Ok(false);
+        }
+        let sender = confirmation.header.sender;
+        let blocks_hash = confirmation.body.blocks_hash;
+        self.confirmations.insert(sender, confirmation);
+        let count = self.count.entry(blocks_hash).or_default();
+        *count = count.checked_add(1).ok_or_else(|| {
+            BlossomError::InvalidConfiguration("trusted confirmation count overflow".to_string())
+        })?;
+        Ok(true)
+    }
+
+    pub fn consensus_hash(&self) -> Option<HashType> {
+        self.count
+            .iter()
+            .find_map(|(hash, count)| (*count >= self.supermajority).then_some(*hash))
+    }
 }
 
 impl VerifCount {
@@ -1226,6 +1551,15 @@ pub fn init_quorum(quorum: u32, peers: &[PubKey], self_key: &PubKey) -> TempQuor
         processed_txs: HashMap::new(),
         last_signature_tree: Default::default(),
         verified_blocks_hash: Default::default(),
+        trusted_local_dispatch: None,
+        trusted_dispatch_retry: false,
+        trusted_acknowledgements: init_trusted_acknowledgements(quorum),
+        trusted_confirmations: init_trusted_confirmations(quorum),
+        pending_trusted_acknowledgements: BTreeMap::new(),
+        pending_trusted_confirmations: BTreeMap::new(),
+        last_trusted_acknowledgement_hash: None,
+        trusted_acknowledgement_retry: None,
+        trusted_confirmation_retry: None,
         verifications: init_verifications(quorum),
         verification_sent: false,
         proposals: init_proposals(quorum),
@@ -1266,6 +1600,24 @@ pub fn init_verifications(quorum: u32) -> VerifCount {
     }
 }
 
+pub fn init_trusted_acknowledgements(quorum: u32) -> TrustedAcknowledgementCount {
+    TrustedAcknowledgementCount {
+        acknowledgements: BTreeMap::new(),
+        count: BTreeMap::new(),
+        quorum,
+        supermajority: supermajority_count(quorum as usize) as u32,
+    }
+}
+
+pub fn init_trusted_confirmations(quorum: u32) -> TrustedConfirmationCount {
+    TrustedConfirmationCount {
+        confirmations: BTreeMap::new(),
+        count: BTreeMap::new(),
+        quorum,
+        supermajority: supermajority_count(quorum as usize) as u32,
+    }
+}
+
 pub fn init_proposals(quorum: u32) -> PropCount {
     PropCount {
         proposals: BTreeMap::new(),
@@ -1275,7 +1627,7 @@ pub fn init_proposals(quorum: u32) -> PropCount {
     }
 }
 
-fn block_merkle_root(blocks: &BTreeMap<HashType, Block>) -> HashType {
+pub(crate) fn block_merkle_root(blocks: &BTreeMap<HashType, Block>) -> HashType {
     #[cfg(feature = "fair-block-ordering")]
     let leaves = fair_ordered_block_commitments(blocks);
 
@@ -1311,8 +1663,8 @@ mod tests {
 
     use crate::block::Transaction;
     use crate::blossom::{
-        Dispatch, DispatchBody, Header, Proposal, ProposalBody, SignatureTree, Verification,
-        VerificationBody,
+        Dispatch, DispatchBody, Header, Proposal, ProposalBody, SignatureTree,
+        TrustedAcknowledgement, Verification, VerificationBody,
     };
     use crate::crypto::{Keypair, Signature};
     use crate::encounter::{
@@ -2111,6 +2463,39 @@ mod tests {
         assert_eq!(count.count.get(&first), None);
         assert_eq!(count.count.get(&second), Some(&1));
         assert_eq!(count.verifications.len(), 1);
+    }
+
+    #[test]
+    fn trusted_acknowledgements_must_converge_before_confirmation() {
+        let a = PubKey([1; 32]);
+        let b = PubKey([2; 32]);
+        let block_a = HashType([0xA1; 32]);
+        let block_b = HashType([0xB1; 32]);
+        let block_c = HashType([0xC1; 32]);
+        let ab = BTreeMap::from([(block_a, ()), (block_b, ())]);
+        let abc = BTreeMap::from([(block_a, ()), (block_b, ()), (block_c, ())]);
+        let acknowledgement = |sender, blocks: &BTreeMap<HashType, ()>| TrustedAcknowledgement {
+            header: Header {
+                sender,
+                ..Default::default()
+            },
+            body: VerificationBody {
+                blocks_hash: blocks.hash(),
+                blocks: blocks.clone(),
+            },
+        };
+        let mut count = init_trusted_acknowledgements(3);
+
+        count.record(acknowledgement(a, &ab)).unwrap();
+        count.record(acknowledgement(b, &ab)).unwrap();
+        assert_eq!(count.consensus_hash(), Some(ab.hash()));
+
+        count.record(acknowledgement(b, &abc)).unwrap();
+        assert_eq!(count.consensus_hash(), None);
+        count.record(acknowledgement(a, &abc)).unwrap();
+        assert_eq!(count.consensus_hash(), Some(abc.hash()));
+
+        assert!(count.record(acknowledgement(a, &ab)).is_err());
     }
 
     #[test]
