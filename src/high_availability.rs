@@ -238,7 +238,7 @@ struct HaTransportSessionSeed {
 /// existing verified and trusted wire protocol.
 #[derive(BorshSerialize, BorshDeserialize, Debug, Clone)]
 pub enum HaWireRequest {
-    Message(HaMessage),
+    Message(Box<HaMessage>),
     Status,
     Health,
 }
@@ -247,7 +247,7 @@ pub enum HaWireRequest {
 #[derive(BorshSerialize, BorshDeserialize, Debug, Clone)]
 pub enum HaWireResponse {
     Receipt(HaWireReceipt),
-    Status(HaNodeStatus),
+    Status(Box<HaNodeStatus>),
     Error(String),
 }
 
@@ -2867,7 +2867,7 @@ impl HighAvailabilityTcpClient {
 
     pub async fn status(&self, service: &Service) -> Result<HaNodeStatus> {
         match self.request(service, &HaWireRequest::Status).await? {
-            HaWireResponse::Status(status) => Ok(status),
+            HaWireResponse::Status(status) => Ok(*status),
             HaWireResponse::Error(message) => Err(BlossomError::ExternalService(message)),
             response => Err(BlossomError::WireProtocol(format!(
                 "expected HA status, got {}",
@@ -2882,7 +2882,7 @@ impl HighAvailabilityTcpClient {
         message: HaMessage,
     ) -> Result<HaWireReceipt> {
         match self
-            .request(service, &HaWireRequest::Message(message))
+            .request(service, &HaWireRequest::Message(Box::new(message)))
             .await?
         {
             HaWireResponse::Receipt(receipt) => Ok(receipt),
@@ -3083,15 +3083,15 @@ impl HighAvailabilityTcpNode {
                         "HA message sender does not match authenticated transport peer".to_string(),
                     ));
                 }
-                let event = runtime.receive_message(message)?;
+                let event = runtime.receive_message(*message)?;
                 let nonce = runtime.head().nonce;
                 Ok(HaWireResponse::Receipt(HaWireReceipt::from_event(
                     &event, nonce,
                 )))
             }
-            HaWireRequest::Status => {
-                Ok(HaWireResponse::Status(self.runtime.lock().await.status()?))
-            }
+            HaWireRequest::Status => Ok(HaWireResponse::Status(Box::new(
+                self.runtime.lock().await.status()?,
+            ))),
             _ => Err(BlossomError::WireProtocol(
                 "HA service accepts only high-availability messages and status requests"
                     .to_string(),
