@@ -220,6 +220,7 @@ dependencies = [
  "deterministic-test-env",
  "serde",
  "serde_json",
+ "tempfile",
  "tokio",
 ]
 
@@ -668,6 +669,9 @@ dependencies = [
 name = "deterministic-test-env"
 version = "2.0.0-pre-release"
 dependencies = [
+ "serde",
+ "serde_json",
+ "sha2",
  "tokio",
 ]
 

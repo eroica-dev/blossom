@@ -252,6 +252,32 @@ pub enum RaftStorageProfile {
     DurableRedbImmediate { root: PathBuf },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RaftDeterministicFault {
+    None,
+    FollowerPause,
+    LeaderPause,
+    AsymmetricFollowerPartition,
+    DurableFollowerRestart,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RaftDeterministicReport {
+    pub physical_nodes: usize,
+    pub voters: usize,
+    pub learners: usize,
+    pub commands: u64,
+    pub seed: u64,
+    pub durable: bool,
+    pub fault: RaftDeterministicFault,
+    pub expected_stalls: u64,
+    pub leader_changes: u64,
+    pub final_value: Vec<u8>,
+    pub all_nodes_converged: bool,
+    pub linearizable_read_passed: bool,
+    pub history_linearizable: bool,
+}
+
 impl BenchmarkDurableStores {
     pub fn open(path: impl AsRef<Path>, max_reorder: u64) -> Result<Self, StorageError<NodeId>> {
         let log_store = BenchmarkRedbLogStore::open(path)?;
@@ -957,6 +983,231 @@ impl InProcessRaftCluster {
         for raft in self.nodes.into_values() {
             let _ = raft.shutdown().await;
         }
+    }
+}
+
+pub async fn run_raft_deterministic_campaign(
+    physical_nodes: usize,
+    commands: u64,
+    seed: u64,
+    durable: bool,
+    fault: RaftDeterministicFault,
+) -> Result<RaftDeterministicReport, Box<dyn std::error::Error + Send + Sync>> {
+    if !(2..=7).contains(&physical_nodes) {
+        return Err("deterministic OpenRaft physical node count must be 2..=7".into());
+    }
+    if commands == 0 {
+        return Err("deterministic OpenRaft command count must be positive".into());
+    }
+    if !durable && fault == RaftDeterministicFault::DurableFollowerRestart {
+        return Err("OpenRaft kill/restart requires durable storage".into());
+    }
+    let voters = match physical_nodes {
+        2 => 2,
+        3 | 4 => 3,
+        5 | 6 => 5,
+        7 => 7,
+        _ => unreachable!("physical node count was validated"),
+    };
+    let learners = physical_nodes.saturating_sub(voters);
+    let root = std::env::temp_dir().join(format!(
+        "blossom-raft-dst-{}-{}-{}",
+        std::process::id(),
+        physical_nodes,
+        seed
+    ));
+    let storage = if durable {
+        if root.exists() {
+            std::fs::remove_dir_all(&root)?;
+        }
+        RaftStorageProfile::DurableRedbImmediate { root: root.clone() }
+    } else {
+        RaftStorageProfile::InMemory
+    };
+    let mut cluster = InProcessRaftCluster::start_with_storage(voters, learners, storage).await?;
+    let initial_leader = cluster.current_leader().await?;
+    let mut expected_stalls = 0u64;
+    let mut leader_changes = 0u64;
+    let fault_at = (commands / 2).max(1);
+    let key = format!("raft-dst-key-{seed}").into_bytes();
+    let mut history = Vec::with_capacity(usize::try_from(commands).unwrap_or(usize::MAX));
+
+    for sequence in 1..=commands {
+        let mut heal_after_write = false;
+        if sequence == fault_at {
+            let leader = cluster.current_leader().await?;
+            let follower = cluster
+                .voters
+                .iter()
+                .copied()
+                .find(|node| *node != leader)
+                .ok_or("deterministic OpenRaft campaign requires a follower")?;
+            match fault {
+                RaftDeterministicFault::None => {}
+                RaftDeterministicFault::FollowerPause => {
+                    cluster.pause_node(follower).await?;
+                    if voters == 2 {
+                        expected_stalls = expected_stalls.saturating_add(1);
+                        assert_raft_write_stalls(
+                            &mut cluster,
+                            deterministic_raft_command(&key, sequence, seed),
+                        )
+                        .await?;
+                    }
+                    cluster.resume_node(follower).await?;
+                }
+                RaftDeterministicFault::LeaderPause => {
+                    cluster.pause_node(leader).await?;
+                    if voters == 2 {
+                        expected_stalls = expected_stalls.saturating_add(1);
+                        assert_raft_write_stalls(
+                            &mut cluster,
+                            deterministic_raft_command(&key, sequence, seed),
+                        )
+                        .await?;
+                        cluster.resume_node(leader).await?;
+                    } else {
+                        let replacement = cluster.wait_for_leader(Duration::from_secs(10)).await?;
+                        if replacement != leader {
+                            leader_changes = leader_changes.saturating_add(1);
+                        }
+                        cluster.resume_node(leader).await?;
+                    }
+                }
+                RaftDeterministicFault::AsymmetricFollowerPartition => {
+                    cluster
+                        .network_control
+                        .set_link(leader, follower, LinkState::Blocked)
+                        .await;
+                    if voters == 2 {
+                        expected_stalls = expected_stalls.saturating_add(1);
+                        assert_raft_write_stalls(
+                            &mut cluster,
+                            deterministic_raft_command(&key, sequence, seed),
+                        )
+                        .await?;
+                        cluster.network_control.heal().await;
+                    } else {
+                        heal_after_write = true;
+                    }
+                }
+                RaftDeterministicFault::DurableFollowerRestart => {
+                    cluster.kill_and_restart_node(follower).await?;
+                }
+            }
+        }
+
+        let command = deterministic_raft_command(&key, sequence, seed);
+        let response = deterministic_raft_write(&mut cluster, command.clone()).await?;
+        if response.application_error.is_some() || response.result != Some(CommandResult::Written) {
+            return Err(format!(
+                "OpenRaft deterministic write {sequence} did not apply: {:?}",
+                response
+            )
+            .into());
+        }
+        history.push(crate::correctness::HistoryOperation {
+            operation_id: sequence,
+            invocation_nanos: u128::from(sequence).saturating_mul(2),
+            response_nanos: u128::from(sequence).saturating_mul(2).saturating_add(1),
+            command,
+            result: CommandResult::Written,
+        });
+        if heal_after_write {
+            cluster.network_control.heal().await;
+        }
+    }
+
+    let final_value = deterministic_raft_value(commands, seed);
+    let linearizable_read_passed =
+        cluster.read_linearizable(&key).await? == Some(final_value.clone());
+    let history_linearizable = history
+        .chunks(63)
+        .all(|segment| crate::correctness::check_linearizable_history(segment, 64).linearizable);
+    cluster.trigger_snapshot().await?;
+    let all_nodes_converged = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let mut converged = true;
+            for machine in cluster.state_machines.values() {
+                if machine.get(&key).await != Some(final_value.clone()) {
+                    converged = false;
+                    break;
+                }
+            }
+            if converged {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap_or(false);
+    let final_leader = cluster.current_leader().await?;
+    if final_leader != initial_leader {
+        leader_changes = leader_changes.saturating_add(1);
+    }
+    cluster.shutdown().await;
+    if durable {
+        std::fs::remove_dir_all(&root).ok();
+    }
+    Ok(RaftDeterministicReport {
+        physical_nodes,
+        voters,
+        learners,
+        commands,
+        seed,
+        durable,
+        fault,
+        expected_stalls,
+        leader_changes,
+        final_value,
+        all_nodes_converged,
+        linearizable_read_passed,
+        history_linearizable,
+    })
+}
+
+fn deterministic_raft_command(key: &[u8], sequence: u64, seed: u64) -> ActiveActiveCommand {
+    use blossom::{ClientEpoch, ClientId, CommandIdentity, CommandOperation};
+
+    let mut client = [0u8; 16];
+    client[..8].copy_from_slice(&seed.to_le_bytes());
+    client[8..].copy_from_slice(&(seed ^ sequence).rotate_left(17).to_le_bytes());
+    ActiveActiveCommand {
+        identity: CommandIdentity {
+            client_id: ClientId(client),
+            client_epoch: ClientEpoch(1),
+            sequence: 1,
+        },
+        operation: CommandOperation::BlindWrite {
+            key: key.to_vec(),
+            value: deterministic_raft_value(sequence, seed),
+        },
+    }
+}
+
+fn deterministic_raft_value(sequence: u64, seed: u64) -> Vec<u8> {
+    [sequence.to_le_bytes(), seed.to_le_bytes()].concat()
+}
+
+async fn deterministic_raft_write(
+    cluster: &mut InProcessRaftCluster,
+    command: ActiveActiveCommand,
+) -> Result<RaftAppliedResponse, Box<dyn std::error::Error + Send + Sync>> {
+    cluster
+        .client_write_concurrent(vec![command])
+        .await?
+        .pop()
+        .ok_or_else(|| "deterministic OpenRaft write returned no response".into())
+}
+
+async fn assert_raft_write_stalls(
+    cluster: &mut InProcessRaftCluster,
+    command: ActiveActiveCommand,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    match tokio::time::timeout(Duration::from_millis(250), cluster.client_write(command)).await {
+        Err(_) | Ok(Err(_)) => Ok(()),
+        Ok(Ok(_)) => Err("two-voter OpenRaft write unexpectedly committed without quorum".into()),
     }
 }
 

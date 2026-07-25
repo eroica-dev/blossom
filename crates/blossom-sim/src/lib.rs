@@ -1,5 +1,7 @@
 pub mod chaos;
 pub mod data;
+#[cfg(feature = "high-availability")]
+pub mod deterministic;
 pub mod epoch;
 pub mod fuzz;
 #[cfg(feature = "high-availability")]
@@ -10,6 +12,12 @@ pub use chaos::{
     CHAOS_RATE_DENOMINATOR, NetworkChaos, NetworkChaosConfig, NetworkChaosReport, SimTcpCluster,
 };
 pub use data::{DataPattern, DeterministicData};
+#[cfg(feature = "high-availability")]
+pub use deterministic::{
+    DeterministicCampaignArtifact, DeterministicCampaignProfile, DeterministicCampaignReport,
+    HaDeterministicConfig, HaFaultPlan, ProtocolCellReport, run_deterministic_campaign,
+    run_ha_deterministic,
+};
 pub use epoch::{
     EpochChaosConfig, EpochChaosEpochReport, EpochChaosReport, EpochReconciliationCheck,
     EpochStageProgressRecord, EpochTransportTotals, run_epoch_chaos,

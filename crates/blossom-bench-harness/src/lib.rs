@@ -30,5 +30,6 @@ pub use harness::{
 pub use raft_adapter::{
     BenchmarkDurableStores, BenchmarkRaft, BenchmarkRaftConfig, BenchmarkRedbLogStore,
     BenchmarkStateMachineStore, InProcessNetworkControl, InProcessRaftCluster, LinkState,
-    RaftAppliedResponse, RaftStorageProfile,
+    RaftAppliedResponse, RaftDeterministicFault, RaftDeterministicReport, RaftStorageProfile,
+    run_raft_deterministic_campaign,
 };

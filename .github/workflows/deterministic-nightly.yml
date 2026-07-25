@@ -1,0 +1,40 @@
+name: Deterministic Protocol Nightly
+
+on:
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: deterministic-protocol-nightly
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  deterministic-nightly:
+    name: Two-hour HA and trusted Blossom campaign
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust 1.90
+        uses: dtolnay/rust-toolchain@1.90.0
+
+      - name: Cache Cargo build outputs
+        uses: Swatinem/rust-cache@v2
+
+      - name: Run two-hour deterministic campaign
+        run: ./scripts/deterministic-campaign.sh --profile nightly --budget 2h
+
+      - name: Publish deterministic artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: deterministic-nightly-${{ github.run_id }}
+          path: target/deterministic-sandbox
+          if-no-files-found: error
+          retention-days: 30

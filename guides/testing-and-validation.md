@@ -61,3 +61,37 @@ benchmarks/scripts/run-epoch-chaos.sh
 benchmarks/scripts/run-prefill-head-to-head.sh
 benchmarks/scripts/run-proof-validation-matrix.sh
 ```
+# Deterministic protocol exploration
+
+`deterministic-test-env` provides a protocol-agnostic, discrete-event scheduler
+with virtual microsecond time, stable choice identities, exact replay,
+directed-link faults, process and storage faults, client `Unknown` outcomes,
+global property aggregation, partial-order reduction, and trace minimization.
+The existing `HermeticPlan` API remains available as a compatibility wrapper.
+
+Run the merge-sized gate with:
+
+```sh
+./scripts/deterministic-pr-gate.sh
+```
+
+Run the nightly-grade campaign with:
+
+```sh
+./scripts/deterministic-campaign.sh --profile nightly --budget 2h
+```
+
+Campaign artifacts are written below `target/deterministic-sandbox/`. Each HA
+cell includes its scenario, compact event/state-digest stream, client history,
+property report, fault coverage, and replay manifest. Full traces are retained
+for failures, along with their minimized regression. Generated traces are not
+committed; only minimized regression scenarios belong in source control.
+
+The HA adapter drives the real `HighAvailabilityRuntime` one dispatch,
+acknowledgement, confirmation, fault, and recovery event at a time. Trusted
+global Blossom continues through the existing epoch simulator with long
+partitioned runs. Parallel-network cells cover every 2–7-node HA group against
+6- and 12-node Global Blossom networks and verify that one network's outage
+does not cross-advance or stop the other. OpenRaft remains a harness-only
+active-passive control, covers every 2–7-node physical footprint, and is not
+linked into Blossom core.
