@@ -30,8 +30,8 @@ blossom = { version = "2.0.0-pre-release", path = "../..", default-features = fa
 deterministic-test-env = { version = "2.0.0-pre-release", path = "../deterministic-test-env" }
 deterministic-sim-engine = { git = "https://github.com/eden-dev-inc/deterministic-simulation.git", rev = "bd1c4ba7eff99a5f324a5434b1a9d23444e32582" }
 clap = { version = "4.5", features = ["derive", "env"] }
-eden_logger = { version = "=0.1.1", default-features = false, features = ["log-info", "log-warn", "log-error", "log-internal", "fast-telemetry-context"], optional = true }
-fast-telemetry = { version = "=0.8.1", default-features = false, features = ["runtime"], optional = true }
+eden_logger = { version = "=0.1.2", default-features = false, features = ["log-info", "log-warn", "log-error", "log-internal", "fast-telemetry-context"], optional = true }
+fast-telemetry = { version = "=0.9.0", default-features = false, features = ["runtime"], optional = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tempfile = "3.23"
