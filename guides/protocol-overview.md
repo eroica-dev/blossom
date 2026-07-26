@@ -16,8 +16,19 @@ validator membership by itself.
 ## Quorums And Rounds
 
 Blossom derives deterministic sub-quorums from the current validator set, epoch
-context, and quorum size. The default quorum size is six. Supermajority checks
-use two-thirds-plus-one and reject duplicate or unknown senders.
+context, and configured branching factor. `BLOSSOM_QUORUM_SIZE` accepts integers
+`q >= 3` divisible by three and defaults to six. `--quorum-size` takes
+precedence over the environment.
+
+The configured value is a branching factor, not a global finality threshold.
+The effective size is `min(q, validator_count)`, local thresholds derive from
+the selected committee, and global finality derives independently from the
+complete validator set. The resolved value is committed in consensus
+parameters. A joining or restored node must match the committed value; changing
+the process environment cannot change a live network.
+
+Supermajority checks use two-thirds-plus-one and reject duplicate or unknown
+senders. Topology and threshold calculations use checked integer arithmetic.
 
 ## v2 Prefill Dispatch
 
@@ -41,9 +52,27 @@ The default path is trustless: signed blocks, signed messages, SHA-256
 commitments, fair block ordering, membership gates, and Byzantine-safe
 thresholds.
 
-Trusted mode is for private known-member deployments. It can skip some
-signature checks for dispatch throughput, while still enforcing sender,
-membership, hash, and Merkle gates.
+Trusted Global Blossom is for private known-member networks with at least six
+logical members. It retains sequential quorum ordering while using a durable
+confirmation log, append-only origin continuity, and service-facing recovery
+status. The optional `trusted-checkpoint-dag` profile adds append-only DAG
+dissemination and repair beneath sequential quorum checkpoints. The trusted
+mode changes the threat model; it does not weaken hash, membership, continuity,
+or durability validation.
+
+Small-cluster HA is a separate trusted protocol and wire profile:
+
+- `high-availability` supports 2–7 fixed identities for leaderless
+  active-active replication using fixed slots and strict majorities.
+- Active-passive deployments use an external Raft driver; Blossom core exposes
+  the service integration contract but does not depend on OpenRaft.
+- `parallel-networks` allows an independent Global Blossom network to order
+  sealed HA references. It never combines HA and Global Blossom membership,
+  voting, availability, or health.
+
+See [Small-Cluster High Availability](high-availability.md),
+[Trusted Network Durability and Recovery](trusted-network-durability.md), and
+[Parallel HA and Global Blossom Networks](parallel-ha-global-blossom.md).
 
 ## Consensus Groups
 

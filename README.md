@@ -17,8 +17,14 @@ Whitepaper: [Blossom Consensus Protocol v2](Blossom-Consensus-Protocol-v2-Whitep
   primitives.
 - v2 prefill dispatch, recovery, reconciliation, fair block ordering, and
   trusted/trustless execution paths.
-- Deterministic simulation, fault injection, profiling, and telemetry observer
-  crates.
+- Durable active-active admission and ordered-application APIs for embedding
+  directly in storage and streaming services.
+- A separate trusted, fixed-membership HA protocol for leaderless active-active
+  replication across 2–7 nodes.
+- Global trusted checkpoint-DAG and parallel-network APIs for coordinating
+  state across independent HA groups without merging their memberships.
+- A reusable deterministic discrete-event sandbox, protocol fault adapters,
+  OpenRaft comparison harness, profiling, and telemetry observer crates.
 
 Blossom is not a turnkey blockchain, database, wallet, public discovery network,
 or validator marketplace. Applications own their transaction bytes and domain
@@ -32,6 +38,7 @@ semantics.
 - [Operations](guides/operations.md)
 - [Observability](guides/observability.md)
 - [Testing And Validation](guides/testing-and-validation.md)
+- [Deterministic Verification Sandbox](guides/deterministic-sandbox.md)
 - [Direct Active-Active Integration](guides/active-active-integration.md)
 - [Trusted Network Durability and Recovery](guides/trusted-network-durability.md)
 - [Small-Cluster High Availability](guides/high-availability.md)
@@ -42,10 +49,11 @@ semantics.
 | Crate | Purpose |
 | --- | --- |
 | `blossom` | Protocol core, runtime, TCP node, wire protocol, blocks, membership, telemetry events, and benchmarks. |
+| `blossom-bench-harness` | Shared command model and correctness-gated Blossom HA/OpenRaft comparison harness. |
 | `blossom-propagation` | Feature-gated push, inventory, and adaptive propagation policy primitives. |
 | `blossom-sim` | Deterministic Blossom simulation environment for epochs, faults, churn, reconnects, and profiling. |
 | `blossom-observer` | Telemetry collector and analyzer for multi-node stage/span health. |
-| `deterministic-test-env` | Generic deterministic network, CPU, hardware-fault, and replay primitives used by the simulator. |
+| `deterministic-test-env` | Protocol-independent deterministic scheduling, virtual time, fault injection, replay, properties, exploration, and trace reduction. |
 
 ## Release Status
 

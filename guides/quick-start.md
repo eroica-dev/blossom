@@ -1,5 +1,8 @@
 # Quick Start
 
+Blossom requires Rust 1.93. The repository's `rust-toolchain.toml` selects the
+matching compiler, Rustfmt, and Clippy components.
+
 ## Test
 
 ```sh
@@ -40,3 +43,25 @@ cargo run --bin blossom-harness -- --nodes 6 --transactions 3
 cargo run -p blossom-observer --bin blossom-observer -- --help
 benchmarks/scripts/run-epoch-chaos.sh
 ```
+
+## Embed A Protocol Profile
+
+Applications import Blossom directly and select only the profiles they need:
+
+```toml
+[dependencies]
+blossom = { version = "2.0.0-pre-release", features = [
+    "high-availability",
+    "trusted-checkpoint-dag",
+] }
+```
+
+- Use the default features for verified Global Blossom.
+- Use `RuntimeConfig::trust_mode = TrustMode::Trusted` plus a trusted epoch-log
+  path for durable known-member Global Blossom.
+- Use `HighAvailabilityRuntime` for an independent 2–7-node active-active HA
+  group.
+
+See [Feature Flags](feature-flags.md), [Direct Active-Active
+Integration](active-active-integration.md), and [Small-Cluster High
+Availability](high-availability.md) before choosing a production profile.

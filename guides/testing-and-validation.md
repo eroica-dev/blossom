@@ -13,6 +13,8 @@ The release gate runs:
 - `cargo test --workspace --all-features`
 - `cargo test -p blossom --no-default-features`
 - `cargo test -p blossom --features insecure-fast-hash`
+- standalone `telemetry`, `eden-logger`, and combined
+  `observability,high-availability,trusted-checkpoint-dag` compile checks
 - `cargo clippy --workspace --all-features --all-targets -- -D warnings`
 - `scripts/trusted-production-validation.sh`
 - `scripts/ha-production-validation.sh`
@@ -21,6 +23,10 @@ The release gate runs:
 The GitHub Actions workflow `HA Merge Gate` runs this complete command on every
 pull request and push to `main`. Repository branch protection must require its
 `Release and HA production gate` job.
+
+The separate GitHub Actions workflow `Deterministic Protocol Gate` runs
+`scripts/deterministic-pr-gate.sh` on the same events. Production branch
+protection should require both jobs.
 
 ## Production Validation
 
@@ -95,3 +101,13 @@ partitioned runs. Parallel-network cells cover every 2–7-node HA group against
 does not cross-advance or stop the other. OpenRaft remains a harness-only
 active-passive control, covers every 2–7-node physical footprint, and is not
 linked into Blossom core.
+
+The nightly workflow runs the two-hour profile on a schedule. The manual
+release profile adds the longest small-cluster and OpenRaft soaks:
+
+```sh
+./scripts/deterministic-campaign.sh --profile release --budget 12h
+```
+
+For adapter contracts, replay rules, property semantics, and artifact layout,
+see [Deterministic Verification Sandbox](deterministic-sandbox.md).

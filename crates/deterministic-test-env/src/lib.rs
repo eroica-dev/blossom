@@ -1,12 +1,16 @@
-//! Generic deterministic testing environment primitives.
+//! Protocol-independent deterministic testing primitives.
 //!
-//! This crate is intentionally protocol-agnostic. Applications provide their
-//! own node type by implementing [`HermeticNode`] and can attach app-specific
-//! configuration to [`HermeticPlan::app_config`]. The environment owns the
-//! reusable mechanics: deterministic event ordering, node up/down transitions,
-//! latency and drop injection, CPU throttling/stalls, hardware-style faults,
-//! replayable logs, and network chaos sampling. `blossom-sim` wraps these
-//! pieces for Blossom `WireRequest` handling.
+//! New adapters implement [`DeterministicNode`] and return explicit [`Effect`]s
+//! for protocol messages, responses, timers, and persistence. A
+//! [`DeterministicCluster`] controls virtual time, event order, directed-link
+//! faults, process lifecycle, storage faults, replay, and global properties.
+//! [`SystematicExplorer`] and [`TraceReducer`] provide bounded schedule
+//! exploration and failure minimization.
+//!
+//! [`HermeticPlan`] and [`HermeticCluster`] remain available as compatibility
+//! wrappers for existing request-level simulators. `blossom-sim` supplies the
+//! Blossom-specific HA, trusted, and parallel-network adapters; this crate has
+//! no dependency on Blossom.
 
 mod chaos;
 mod deterministic;

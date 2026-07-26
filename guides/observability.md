@@ -33,9 +33,16 @@ The features may also be selected independently:
 The base `TelemetryEvent`, `TelemetryHandle`, JSONL sink, in-memory sink, and
 custom-sink trait remain available without these features.
 
-When the bundled `blossom-node` binary is compiled with either adapter feature,
-it activates that adapter automatically. `BLOSSOM_OBSERVER_ADDR` is composed
-with those adapters instead of replacing them.
+The default `TelemetryHandle` is disabled. Protocol hot paths check that state
+before constructing event payloads, so applications that do not opt in do not
+pay for event allocation or sink dispatch.
+
+When the bundled `blossom-node` binary is compiled with an adapter feature, it
+initializes the selected logger adapter and/or in-process Fast Telemetry
+registration. It does not start a metrics or span exporter. A hosting service
+must retain the Fast Telemetry runtime and expose or drain its data.
+`BLOSSOM_OBSERVER_ADDR` is composed with those adapters instead of replacing
+them.
 
 ## Service Setup
 
