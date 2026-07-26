@@ -25,6 +25,11 @@ jobs:
         with:
           fetch-depth: 0
 
+      - name: Configure deterministic-simulation access
+        uses: ./.github/actions/setup-deterministic-simulation
+        with:
+          deploy-key: ${{ secrets.DETERMINISTIC_SIM_DEPLOY_KEY }}
+
       - name: Install Rust 1.93
         uses: dtolnay/rust-toolchain@1.93.0
         with:

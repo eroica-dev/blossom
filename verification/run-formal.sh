@@ -5,6 +5,26 @@ ROOT="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)"
 cd "$ROOT"
 
 STATUS=0
+REQUIRED_TOOLS="${BLOSSOM_FORMAL_REQUIRED_TOOLS:-}"
+
+tool_is_required() {
+  tool="$1"
+  case ",$REQUIRED_TOOLS," in
+    *,"$tool",*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+missing_tool() {
+  tool="$1"
+  detail="$2"
+  if tool_is_required "$tool"; then
+    echo "fail: required formal tool '$tool' is unavailable ($detail)"
+    STATUS=1
+  else
+    echo "skip: $detail"
+  fi
+}
 
 run_step() {
   name="$1"
@@ -30,24 +50,24 @@ if cargo kani --version >/dev/null 2>&1; then
   run_step "kani HA strict-majority intersection" \
     cargo kani --features high-availability --harness ha_strict_majorities_intersect
 else
-  echo "skip: cargo kani is not installed"
+  missing_tool "kani" "cargo kani is not installed"
 fi
 
 if cargo creusot help >/dev/null 2>&1; then
   run_step "creusot threshold crate" \
     sh -c 'cd verification/creusot/thresholds && cargo creusot prove --why3find-arg=-P --why3find-arg=alt-ergo --why3find-arg=-P --why3find-arg=z3'
 else
-  echo "skip: cargo creusot is not installed"
+  missing_tool "creusot" "cargo creusot is not installed"
 fi
 
 if command -v verus >/dev/null 2>&1; then
   if verus --version 2>&1 | grep -qi "placeholder crate"; then
-    echo "skip: installed verus is the crates.io placeholder, not the verifier"
+    missing_tool "verus" "installed verus is the crates.io placeholder, not the verifier"
   else
     run_step "verus thresholds" verus verification/verus/thresholds.rs
   fi
 else
-  echo "skip: verus is not installed"
+  missing_tool "verus" "verus is not installed"
 fi
 
 if command -v quint >/dev/null 2>&1; then
@@ -64,7 +84,7 @@ if command -v quint >/dev/null 2>&1; then
   run_step "quint HA strict-majority intersection" \
     quint run verification/quint/blossom_thresholds.qnt --invariant=ha_strict_majorities_intersect
 else
-  echo "skip: quint is not installed"
+  missing_tool "quint" "quint is not installed"
 fi
 
 JAVA_BIN="/opt/homebrew/opt/openjdk@17/bin"
@@ -81,7 +101,7 @@ if [ -x "$APALACHE_BIN" ]; then
       --inv=UnsafeBoundary \
       verification/tla/BlossomThresholds.tla
 else
-  echo "skip: apalache-mc is not installed or has not been downloaded by Quint"
+  missing_tool "apalache" "apalache-mc is not installed or has not been downloaded by Quint"
 fi
 
 exit "$STATUS"

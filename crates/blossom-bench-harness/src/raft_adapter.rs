@@ -258,7 +258,12 @@ pub enum RaftDeterministicFault {
     FollowerPause,
     LeaderPause,
     AsymmetricFollowerPartition,
+    QuorumLossPartition,
+    NetworkDelay,
+    ResponseLossAfterCommit,
+    RepeatedLeaderChurn,
     DurableFollowerRestart,
+    DurableLeaderRestart,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -271,6 +276,8 @@ pub struct RaftDeterministicReport {
     pub durable: bool,
     pub fault: RaftDeterministicFault,
     pub expected_stalls: u64,
+    pub ambiguous_outcomes: u64,
+    pub ambiguous_outcomes_resolved: bool,
     pub leader_changes: u64,
     pub final_value: Vec<u8>,
     pub all_nodes_converged: bool,
@@ -999,7 +1006,13 @@ pub async fn run_raft_deterministic_campaign(
     if commands == 0 {
         return Err("deterministic OpenRaft command count must be positive".into());
     }
-    if !durable && fault == RaftDeterministicFault::DurableFollowerRestart {
+    if !durable
+        && matches!(
+            fault,
+            RaftDeterministicFault::DurableFollowerRestart
+                | RaftDeterministicFault::DurableLeaderRestart
+        )
+    {
         return Err("OpenRaft kill/restart requires durable storage".into());
     }
     let voters = match physical_nodes {
@@ -1027,6 +1040,8 @@ pub async fn run_raft_deterministic_campaign(
     let mut cluster = InProcessRaftCluster::start_with_storage(voters, learners, storage).await?;
     let initial_leader = cluster.current_leader().await?;
     let mut expected_stalls = 0u64;
+    let mut ambiguous_outcomes = 0u64;
+    let mut ambiguous_outcomes_resolved = true;
     let mut leader_changes = 0u64;
     let fault_at = (commands / 2).max(1);
     let key = format!("raft-dst-key-{seed}").into_bytes();
@@ -1034,6 +1049,7 @@ pub async fn run_raft_deterministic_campaign(
 
     for sequence in 1..=commands {
         let mut heal_after_write = false;
+        let mut response_was_lost_after_commit = false;
         if sequence == fault_at {
             let leader = cluster.current_leader().await?;
             let follower = cluster
@@ -1091,8 +1107,86 @@ pub async fn run_raft_deterministic_campaign(
                         heal_after_write = true;
                     }
                 }
+                RaftDeterministicFault::QuorumLossPartition => {
+                    let quorum = voters / 2 + 1;
+                    let pause_count = voters.saturating_sub(quorum.saturating_sub(1));
+                    let unavailable = cluster
+                        .voters
+                        .iter()
+                        .copied()
+                        .filter(|node| *node != leader)
+                        .take(pause_count)
+                        .collect::<Vec<_>>();
+                    for node in &unavailable {
+                        cluster.pause_node(*node).await?;
+                    }
+                    expected_stalls = expected_stalls.saturating_add(1);
+                    assert_raft_write_stalls(
+                        &mut cluster,
+                        deterministic_raft_command(&key, sequence, seed),
+                    )
+                    .await?;
+                    for node in unavailable {
+                        cluster.resume_node(node).await?;
+                    }
+                }
+                RaftDeterministicFault::NetworkDelay => {
+                    for node in cluster
+                        .voters
+                        .iter()
+                        .copied()
+                        .filter(|node| *node != leader)
+                    {
+                        cluster
+                            .network_control
+                            .set_link(leader, node, LinkState::Delayed(Duration::from_millis(25)))
+                            .await;
+                    }
+                    heal_after_write = true;
+                }
+                RaftDeterministicFault::ResponseLossAfterCommit => {
+                    let command = deterministic_raft_command(&key, sequence, seed);
+                    let response = deterministic_raft_write(&mut cluster, command).await?;
+                    if response.application_error.is_some()
+                        || response.result != Some(CommandResult::Written)
+                    {
+                        return Err("OpenRaft response-loss setup write did not apply".into());
+                    }
+                    ambiguous_outcomes = ambiguous_outcomes.saturating_add(1);
+                    response_was_lost_after_commit = true;
+                }
+                RaftDeterministicFault::RepeatedLeaderChurn => {
+                    if voters == 2 {
+                        cluster.pause_node(leader).await?;
+                        expected_stalls = expected_stalls.saturating_add(1);
+                        assert_raft_write_stalls(
+                            &mut cluster,
+                            deterministic_raft_command(&key, sequence, seed),
+                        )
+                        .await?;
+                        cluster.resume_node(leader).await?;
+                    } else {
+                        for _ in 0..3 {
+                            let previous = cluster.current_leader().await?;
+                            cluster.pause_node(previous).await?;
+                            let replacement =
+                                cluster.wait_for_leader(Duration::from_secs(10)).await?;
+                            if replacement != previous {
+                                leader_changes = leader_changes.saturating_add(1);
+                            }
+                            cluster.resume_node(previous).await?;
+                        }
+                    }
+                }
                 RaftDeterministicFault::DurableFollowerRestart => {
                     cluster.kill_and_restart_node(follower).await?;
+                }
+                RaftDeterministicFault::DurableLeaderRestart => {
+                    cluster.kill_and_restart_node(leader).await?;
+                    let replacement = cluster.wait_for_leader(Duration::from_secs(10)).await?;
+                    if replacement != leader {
+                        leader_changes = leader_changes.saturating_add(1);
+                    }
                 }
             }
         }
@@ -1105,6 +1199,9 @@ pub async fn run_raft_deterministic_campaign(
                 response
             )
             .into());
+        }
+        if response_was_lost_after_commit {
+            ambiguous_outcomes_resolved &= response.result == Some(CommandResult::Written);
         }
         history.push(crate::correctness::HistoryOperation {
             operation_id: sequence,
@@ -1159,6 +1256,8 @@ pub async fn run_raft_deterministic_campaign(
         durable,
         fault,
         expected_stalls,
+        ambiguous_outcomes,
+        ambiguous_outcomes_resolved,
         leader_changes,
         final_value,
         all_nodes_converged,
@@ -1207,7 +1306,7 @@ async fn assert_raft_write_stalls(
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     match tokio::time::timeout(Duration::from_millis(250), cluster.client_write(command)).await {
         Err(_) | Ok(Err(_)) => Ok(()),
-        Ok(Ok(_)) => Err("two-voter OpenRaft write unexpectedly committed without quorum".into()),
+        Ok(Ok(_)) => Err("OpenRaft write unexpectedly committed without quorum".into()),
     }
 }
 

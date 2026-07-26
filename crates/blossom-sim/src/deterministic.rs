@@ -4,11 +4,16 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use blossom::high_availability::{
+    AmendmentPayload, AmendmentRecord, ClientEpoch as HaClientEpoch, ClientId as HaClientId,
+    CommandIdentity as HaCommandIdentity, Watermark as HaWatermark,
+};
 use blossom::{
-    ConsensusGroupId, HaMessage, HaReplicationMode, HashType, HighAvailabilityParameters,
-    HighAvailabilityRuntime, Keypair, NodeIdentity, Nonce, SecKey, TelemetryEvent,
-    TelemetryEventKind, TelemetryHandle, Transaction, TrustMode, high_availability_majority,
-    supermajority_count,
+    ActiveActiveCommand, ClientEpoch, ClientId, CommandIdentity, CommandOperation, CommandResult,
+    ConsensusGroupId, HaDispatch, HaMessage, HaRecoverySnapshot, HaReplicationMode, HashType,
+    HighAvailabilityParameters, HighAvailabilityRuntime, Keypair, NodeIdentity, Nonce, SecKey,
+    SharedStateMachine, TelemetryEvent, TelemetryEventKind, TelemetryHandle, Transaction,
+    TrustMode, high_availability_majority, supermajority_count,
 };
 #[cfg(feature = "parallel-networks")]
 use blossom::{
@@ -21,7 +26,7 @@ use blossom::{QuorumSize, run_sequential_quorum_dag_experiment};
 use deterministic_test_env::{
     ClientOutcome, ClusterView, DeterministicCluster, DeterministicNode, Effect, EventKey,
     ExecutionTrace, ExplorationBounds, GlobalObserver, LinkFault, NodeContext, NodeEvent,
-    NodeFault, PropertyKind, PropertyRegistry, RunMode, Scenario, ScenarioAction,
+    NodeFault, PropertyKind, PropertyRegistry, RegionFault, RunMode, Scenario, ScenarioAction,
     ScenarioActionKind, SimChannel, SimTime, StorageFault, SystematicExplorer, TraceReducer,
 };
 use serde::{Deserialize, Serialize};
@@ -34,6 +39,7 @@ type BoxError = Box<dyn std::error::Error + Send + Sync>;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DeterministicCampaignProfile {
     Pr,
+    Novelty,
     Nightly,
     Release,
 }
@@ -42,6 +48,7 @@ impl DeterministicCampaignProfile {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Pr => "pr",
+            Self::Novelty => "novelty",
             Self::Nightly => "nightly",
             Self::Release => "release",
         }
@@ -53,12 +60,20 @@ pub enum HaFaultPlan {
     None,
     AsymmetricPartition,
     MinorityPartition,
+    RegionalPartition,
+    RegionalOutage,
     DelayAndDuplicate,
     Corruption,
     ProcessPauseAndThrottle,
+    GracefulRedeploy,
     CrashAfterConfirmation,
+    StorageDelay,
+    StorageFull,
+    StorageIo,
     StorageFailure,
     StorageTornWrite,
+    StorageCorruption,
+    StorageDiskReplacement,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -126,7 +141,8 @@ pub struct DeterministicCampaignArtifact {
 enum HaCommand {
     Dispatch {
         expected_nonce: u64,
-        payload: Vec<u8>,
+        command: ActiveActiveCommand,
+        duplicate_retry: bool,
     },
     Acknowledge {
         expected_nonce: u64,
@@ -134,7 +150,26 @@ enum HaCommand {
     Confirm {
         expected_nonce: u64,
     },
+    Amend {
+        expected_nonce: u64,
+        target_nonce: u64,
+        sequence: u64,
+        payload: Vec<u8>,
+    },
+    RequireSealed {
+        required_nonce: u64,
+    },
+    RecoverFrom {
+        source: usize,
+    },
     Status,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+enum HaSimMessage {
+    Protocol(Box<HaMessage>),
+    RecoveryRequest,
+    RecoverySnapshot(Box<HaRecoverySnapshot>),
 }
 
 struct HaDeterministicNode {
@@ -148,6 +183,19 @@ struct HaDeterministicNode {
     rejected_messages: u64,
     command_failures: u64,
     finalized: BTreeMap<u64, HashType>,
+    sealed: BTreeMap<u64, HashType>,
+    historical_conflict: bool,
+    sealed_conflict: bool,
+    amendment_attempts: u64,
+    amendment_successes: u64,
+    recovery_attempts: u64,
+    recovery_successes: u64,
+    sealed_check_attempts: u64,
+    sealed_check_failures: u64,
+    application_hash: HashType,
+    application_results: BTreeMap<CommandIdentity, CommandResult>,
+    application_apply_failures: u64,
+    injected_fault_observations: u64,
 }
 
 impl HaDeterministicNode {
@@ -163,7 +211,13 @@ impl HaDeterministicNode {
         })
     }
 
-    fn peer_effects(&self, message: HaMessage, operation: u64, stage: &'static str) -> Vec<Effect> {
+    fn peer_effects(
+        &self,
+        message: HaSimMessage,
+        operation: u64,
+        stage: &'static str,
+        channel: SimChannel,
+    ) -> Vec<Effect> {
         let payload = serde_json::to_vec(&message).expect("HA message serializes");
         self.identities
             .iter()
@@ -171,7 +225,7 @@ impl HaDeterministicNode {
             .filter(|(_, identity)| identity.public_key() != self.self_key)
             .map(|(target, _)| Effect::Send {
                 target,
-                channel: SimChannel::Protocol,
+                channel,
                 payload: payload.clone(),
                 delay_micros: 0,
                 key: EventKey::new(
@@ -184,22 +238,158 @@ impl HaDeterministicNode {
             .collect()
     }
 
+    fn send_effect(
+        &self,
+        target: usize,
+        message: HaSimMessage,
+        operation: u64,
+        stage: &'static str,
+        channel: SimChannel,
+    ) -> Effect {
+        Effect::Send {
+            target,
+            channel,
+            payload: serde_json::to_vec(&message).expect("HA simulation message serializes"),
+            delay_micros: 0,
+            key: EventKey::new(
+                stage,
+                u32::try_from(target).unwrap_or(u32::MAX),
+                operation,
+                0,
+            ),
+        }
+    }
+
     fn current_nonce(&self) -> Option<u64> {
         self.runtime()
             .map(|runtime| runtime.current_round().round_id.nonce.value())
+    }
+
+    fn install_recovery_snapshot(&mut self, snapshot: HaRecoverySnapshot) -> blossom::Result<()> {
+        let safe_prefix = self.runtime().is_some_and(|runtime| {
+            runtime.epochs().len() <= snapshot.epochs.len()
+                && runtime
+                    .epochs()
+                    .iter()
+                    .zip(&snapshot.epochs)
+                    .all(|(local, recovered)| {
+                        local.nonce == recovered.nonce && local.hash == recovered.hash
+                    })
+        });
+        if !safe_prefix {
+            return Err(blossom::BlossomError::WireProtocol(
+                "recovery snapshot does not extend the local immutable prefix".to_string(),
+            ));
+        }
+        if self
+            .runtime_mut()
+            .and_then(|runtime| runtime.install_recovery_snapshot(snapshot.clone()))
+            .is_ok()
+        {
+            return Ok(());
+        }
+
+        // Production services redeploy a node onto a fresh durable volume when
+        // transient round state prevents an in-place snapshot install. The
+        // deterministic adapter mirrors that service-facing recovery path, but
+        // only after proving the local immutable history is a prefix.
+        self.runtime.take();
+        if let Some(path) = &self.durable_path {
+            crate::deterministic_durable::replace_store(path)?;
+        }
+        let mut replacement = if let Some(path) = &self.durable_path {
+            HighAvailabilityRuntime::open(
+                path,
+                self.group_id,
+                self.self_key,
+                self.identities.clone(),
+                self.parameters,
+            )
+        } else {
+            HighAvailabilityRuntime::new(
+                self.group_id,
+                self.self_key,
+                self.identities.clone(),
+                self.parameters,
+            )
+        }?;
+        replacement.install_recovery_snapshot(snapshot)?;
+        self.runtime = Some(replacement);
+        Ok(())
     }
 
     fn record_finalized(&mut self) {
         let Some(runtime) = self.runtime() else {
             return;
         };
+        let sealed_through = runtime.sealed_watermark().position;
         let entries = runtime
             .epochs()
             .iter()
             .map(|epoch| (epoch.nonce.value(), epoch.hash))
             .collect::<Vec<_>>();
         for (nonce, hash) in entries {
-            self.finalized.entry(nonce).or_insert(hash);
+            if self
+                .finalized
+                .insert(nonce, hash)
+                .is_some_and(|existing| existing != hash)
+            {
+                self.historical_conflict = true;
+            }
+            if nonce <= sealed_through
+                && self
+                    .sealed
+                    .insert(nonce, hash)
+                    .is_some_and(|existing| existing != hash)
+            {
+                self.sealed_conflict = true;
+            }
+        }
+        self.refresh_application_state();
+    }
+
+    fn refresh_application_state(&mut self) {
+        let Some(runtime) = self.runtime() else {
+            return;
+        };
+        let commands = runtime
+            .epochs()
+            .iter()
+            .flat_map(|epoch| epoch.ordered_blocks())
+            .flat_map(|(_, block)| block.body.txs.iter())
+            .filter_map(|transaction| transaction.payload_as_borsh::<ActiveActiveCommand>().ok())
+            .collect::<Vec<_>>();
+        let Ok(mut application) = SharedStateMachine::new(4_096) else {
+            self.application_apply_failures = self.application_apply_failures.saturating_add(1);
+            return;
+        };
+        let mut results = BTreeMap::new();
+        for command in commands {
+            match application.apply(&command) {
+                Ok(result) => {
+                    if results
+                        .insert(command.identity, result.clone())
+                        .is_some_and(|existing| existing != result)
+                    {
+                        self.application_apply_failures =
+                            self.application_apply_failures.saturating_add(1);
+                    }
+                }
+                Err(_) => {
+                    self.application_apply_failures =
+                        self.application_apply_failures.saturating_add(1);
+                    return;
+                }
+            }
+        }
+        match application.canonical_hash() {
+            Ok(hash) => {
+                self.application_hash = hash;
+                self.application_results = results;
+            }
+            Err(_) => {
+                self.application_apply_failures = self.application_apply_failures.saturating_add(1);
+            }
         }
     }
 
@@ -210,15 +400,62 @@ impl HaDeterministicNode {
         client_id: u64,
         operation_id: u64,
     ) -> Vec<Effect> {
+        if context.storage_fault != StorageFault::Healthy {
+            self.injected_fault_observations = self.injected_fault_observations.saturating_add(1);
+        }
         let is_status = matches!(command, HaCommand::Status);
         let expected_nonce = match &command {
             HaCommand::Dispatch { expected_nonce, .. }
             | HaCommand::Acknowledge { expected_nonce }
-            | HaCommand::Confirm { expected_nonce } => Some(*expected_nonce),
-            HaCommand::Status => None,
+            | HaCommand::Confirm { expected_nonce }
+            | HaCommand::Amend { expected_nonce, .. } => Some(*expected_nonce),
+            HaCommand::RequireSealed { .. } | HaCommand::RecoverFrom { .. } | HaCommand::Status => {
+                None
+            }
         };
-        if expected_nonce.is_some_and(|expected| self.current_nonce() != Some(expected)) {
-            return vec![response_ok(client_id, operation_id, b"already-advanced")];
+        if let Some(expected) = expected_nonce {
+            match self.current_nonce() {
+                Some(current) if current > expected => {
+                    return vec![response_ok(client_id, operation_id, b"already-advanced")];
+                }
+                Some(current) if current < expected => {
+                    self.command_failures = self.command_failures.saturating_add(1);
+                    return vec![Effect::Respond {
+                        client_id,
+                        operation_id,
+                        outcome: ClientOutcome::Fail {
+                            error: format!(
+                                "HA round {expected} is not ready; current round is {current}"
+                            ),
+                        },
+                        delay_micros: 0,
+                        key: EventKey::new(
+                            "ha-command-not-ready",
+                            u32::try_from(context.node).unwrap_or(u32::MAX),
+                            operation_id,
+                            0,
+                        ),
+                    }];
+                }
+                Some(_) => {}
+                None => {
+                    self.command_failures = self.command_failures.saturating_add(1);
+                    return vec![Effect::Respond {
+                        client_id,
+                        operation_id,
+                        outcome: ClientOutcome::Fail {
+                            error: "deterministic HA node is not running".to_string(),
+                        },
+                        delay_micros: 0,
+                        key: EventKey::new(
+                            "ha-command-not-running",
+                            u32::try_from(context.node).unwrap_or(u32::MAX),
+                            operation_id,
+                            0,
+                        ),
+                    }];
+                }
+            }
         }
         let storage_blocked = matches!(
             context.storage_fault,
@@ -227,20 +464,30 @@ impl HaDeterministicNode {
                 | StorageFault::Fsync
                 | StorageFault::TornWrite { .. }
                 | StorageFault::Corrupt { .. }
+                | StorageFault::ReplaceDisk
         );
         let result: blossom::Result<Vec<Effect>> = match command {
             HaCommand::Dispatch {
                 expected_nonce,
-                payload,
+                command,
+                duplicate_retry,
             } => {
+                let transaction = Transaction::from_borsh(&command);
                 let dispatch = self.runtime_mut().and_then(|runtime| {
-                    runtime.build_dispatch_at(
-                        vec![Transaction::new(payload)],
-                        u128::from(context.now.0),
-                    )
+                    let transaction = transaction?;
+                    let mut transactions = vec![transaction.clone()];
+                    if duplicate_retry {
+                        transactions.push(transaction);
+                    }
+                    replay_or_build_dispatch(runtime, transactions, expected_nonce)
                 });
                 dispatch.map(|dispatch| {
-                    self.peer_effects(HaMessage::Dispatch(dispatch), expected_nonce, "ha-dispatch")
+                    self.peer_effects(
+                        HaSimMessage::Protocol(Box::new(HaMessage::Dispatch(dispatch))),
+                        expected_nonce,
+                        "ha-dispatch",
+                        SimChannel::Protocol,
+                    )
                 })
             }
             HaCommand::Acknowledge { expected_nonce } => {
@@ -253,9 +500,12 @@ impl HaDeterministicNode {
                         .and_then(HighAvailabilityRuntime::acknowledge)
                         .map(|acknowledgement| {
                             self.peer_effects(
-                                HaMessage::Acknowledge(acknowledgement),
+                                HaSimMessage::Protocol(Box::new(HaMessage::Acknowledge(
+                                    acknowledgement,
+                                ))),
                                 expected_nonce,
                                 "ha-acknowledge",
+                                SimChannel::Protocol,
                             )
                         })
                 }
@@ -270,11 +520,103 @@ impl HaDeterministicNode {
                         .and_then(HighAvailabilityRuntime::confirm)
                         .map(|(confirmation, _)| {
                             self.peer_effects(
-                                HaMessage::Confirm(confirmation),
+                                HaSimMessage::Protocol(Box::new(HaMessage::Confirm(confirmation))),
                                 expected_nonce,
                                 "ha-confirm",
+                                SimChannel::Protocol,
                             )
                         })
+                }
+            }
+            HaCommand::Amend {
+                expected_nonce,
+                target_nonce,
+                sequence,
+                payload,
+            } => {
+                self.amendment_attempts = self.amendment_attempts.saturating_add(1);
+                let client_id = HaClientId(
+                    self.self_key.0[..16]
+                        .try_into()
+                        .expect("public key prefix has exactly sixteen bytes"),
+                );
+                let transaction = self.runtime_mut().and_then(|runtime| {
+                    let target = runtime
+                        .epochs()
+                        .iter()
+                        .find(|epoch| epoch.nonce.value() == target_nonce)
+                        .ok_or_else(|| {
+                            blossom::BlossomError::InvalidConfiguration(format!(
+                                "deterministic amendment target nonce {target_nonce} is unavailable"
+                            ))
+                        })?;
+                    let amendment = AmendmentRecord {
+                        target_epoch_hash: target.hash,
+                        target_epoch_nonce: target.nonce,
+                        containing_epoch_nonce: Nonce::new(expected_nonce),
+                        origin_slot: runtime.self_slot(),
+                        command_identity: HaCommandIdentity {
+                            client_id,
+                            client_epoch: HaClientEpoch(1),
+                            sequence,
+                        },
+                        supersedes: None,
+                        payload: AmendmentPayload::Compensation {
+                            command_bytes: payload,
+                        },
+                    };
+                    runtime.amendment_transaction(&amendment)
+                });
+                transaction
+                    .and_then(|transaction| {
+                        self.runtime_mut().and_then(|runtime| {
+                            runtime.build_dispatch_at(vec![transaction], u128::from(context.now.0))
+                        })
+                    })
+                    .map(|dispatch| {
+                        self.amendment_successes = self.amendment_successes.saturating_add(1);
+                        self.peer_effects(
+                            HaSimMessage::Protocol(Box::new(HaMessage::Dispatch(dispatch))),
+                            expected_nonce,
+                            "ha-amendment-dispatch",
+                            SimChannel::Protocol,
+                        )
+                    })
+            }
+            HaCommand::RequireSealed { required_nonce } => {
+                self.sealed_check_attempts = self.sealed_check_attempts.saturating_add(1);
+                let result = self
+                    .runtime()
+                    .ok_or_else(|| {
+                        blossom::BlossomError::InvalidConfiguration(
+                            "deterministic HA node is not running".to_string(),
+                        )
+                    })
+                    .and_then(|runtime| {
+                        runtime.require_sealed(HaWatermark {
+                            position: required_nonce,
+                        })
+                    })
+                    .map(|()| Vec::new());
+                if result.is_err() {
+                    self.sealed_check_failures = self.sealed_check_failures.saturating_add(1);
+                }
+                result
+            }
+            HaCommand::RecoverFrom { source } => {
+                self.recovery_attempts = self.recovery_attempts.saturating_add(1);
+                if source >= self.identities.len() || source == context.node {
+                    Err(blossom::BlossomError::InvalidConfiguration(
+                        "deterministic recovery source must be a different HA member".to_string(),
+                    ))
+                } else {
+                    Ok(vec![self.send_effect(
+                        source,
+                        HaSimMessage::RecoveryRequest,
+                        operation_id,
+                        "ha-recovery-request",
+                        SimChannel::Repair,
+                    )])
                 }
             }
             HaCommand::Status => self
@@ -349,19 +691,52 @@ impl DeterministicNode for HaDeterministicNode {
                     .map_err(|error| deterministic_test_env::SimEnvError::App(error.to_string()))?;
                 Ok(self.handle_command(command, context, client_id, operation_id))
             }
-            NodeEvent::Message { payload, .. } => {
-                let Ok(message) = serde_json::from_slice::<HaMessage>(&payload) else {
+            NodeEvent::Message {
+                source, payload, ..
+            } => {
+                let Ok(message) = serde_json::from_slice::<HaSimMessage>(&payload) else {
                     self.rejected_messages = self.rejected_messages.saturating_add(1);
                     return Ok(Vec::new());
                 };
-                let result = self
-                    .runtime_mut()
-                    .and_then(|runtime| runtime.receive_message(message));
-                if result.is_err() {
-                    self.rejected_messages = self.rejected_messages.saturating_add(1);
+                let effects = match message {
+                    HaSimMessage::Protocol(message) => {
+                        if self
+                            .runtime_mut()
+                            .and_then(|runtime| runtime.receive_message(*message))
+                            .is_err()
+                        {
+                            self.rejected_messages = self.rejected_messages.saturating_add(1);
+                        }
+                        Vec::new()
+                    }
+                    HaSimMessage::RecoveryRequest => {
+                        let Some(runtime) = self.runtime() else {
+                            return Ok(Vec::new());
+                        };
+                        vec![self.send_effect(
+                            source,
+                            HaSimMessage::RecoverySnapshot(Box::new(runtime.recovery_snapshot())),
+                            context.now.0,
+                            "ha-recovery-snapshot",
+                            SimChannel::Repair,
+                        )]
+                    }
+                    HaSimMessage::RecoverySnapshot(snapshot) => {
+                        match self.install_recovery_snapshot(*snapshot) {
+                            Ok(()) => {
+                                self.recovery_successes = self.recovery_successes.saturating_add(1);
+                            }
+                            Err(_) => {
+                                self.rejected_messages = self.rejected_messages.saturating_add(1);
+                            }
+                        }
+                        Vec::new()
+                    }
+                };
+                if self.runtime().is_some() {
+                    self.record_finalized();
                 }
-                self.record_finalized();
-                Ok(Vec::new())
+                Ok(effects)
             }
             NodeEvent::Timer { .. } | NodeEvent::StorageComplete { .. } | NodeEvent::Quiesce => {
                 Ok(Vec::new())
@@ -372,8 +747,15 @@ impl DeterministicNode for HaDeterministicNode {
     fn state_digest(&self) -> String {
         let Some(runtime) = self.runtime() else {
             return format!(
-                "crashed:{}:{}",
-                self.rejected_messages, self.command_failures
+                "crashed:{}:{}:{:?}:{:?}:{}:{}:{}:{}",
+                self.rejected_messages,
+                self.command_failures,
+                self.finalized,
+                self.sealed,
+                self.historical_conflict,
+                self.sealed_conflict,
+                self.application_hash,
+                self.application_apply_failures,
             );
         };
         let revision = runtime
@@ -381,12 +763,21 @@ impl DeterministicNode for HaDeterministicNode {
             .map(|revision| revision.revision_hash.to_string())
             .unwrap_or_else(|error| format!("error:{error}"));
         format!(
-            "{}:{}:{}:{}:{}",
+            "{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}",
             runtime.head().nonce,
             runtime.head().hash,
             runtime.sealed_watermark().position,
             revision,
-            runtime.members().active_mask()
+            runtime.members().active_mask(),
+            self.historical_conflict,
+            self.sealed_conflict,
+            self.amendment_successes,
+            self.recovery_successes,
+            self.sealed_check_attempts,
+            self.sealed_check_failures,
+            self.application_hash,
+            self.application_apply_failures,
+            self.injected_fault_observations,
         )
     }
 
@@ -396,6 +787,10 @@ impl DeterministicNode for HaDeterministicNode {
     }
 
     fn restart(&mut self) -> deterministic_test_env::Result<()> {
+        // Treat restart as an idempotent process boundary. A graceful-stop
+        // implementation from an older simulator may not have called
+        // `crash()`, so defensively release the database handle before reopen.
+        self.runtime.take();
         let runtime = if let Some(path) = &self.durable_path {
             HighAvailabilityRuntime::open(
                 path,
@@ -431,6 +826,49 @@ fn response_ok(client_id: u64, operation_id: u64, payload: &[u8]) -> Effect {
     }
 }
 
+fn replay_or_build_dispatch(
+    runtime: &mut HighAvailabilityRuntime,
+    transactions: Vec<Transaction>,
+    expected_nonce: u64,
+) -> blossom::Result<HaDispatch> {
+    let slot = runtime.self_slot();
+    let round_id = runtime.current_round().round_id;
+    if round_id.nonce.value() != expected_nonce {
+        return Err(blossom::BlossomError::InvalidEpochNonce);
+    }
+    if let Some(block) = runtime.current_round().blocks[slot.index()].clone() {
+        let matches_existing = block.body.txs.len() == transactions.len()
+            && block
+                .body
+                .txs
+                .iter()
+                .zip(&transactions)
+                .all(|(existing, requested)| {
+                    existing.hash == requested.hash
+                        && existing.payload.as_ref() == requested.payload.as_ref()
+                });
+        if !matches_existing {
+            return Err(blossom::BlossomError::WireProtocol(
+                "idempotent dispatch retry conflicts with the durable local block".to_string(),
+            ));
+        }
+        return Ok(HaDispatch {
+            round_id,
+            sender: slot,
+            block_hash: block.hash,
+            block,
+        });
+    }
+
+    // The logical dispatch timestamp is part of the block hash. Derive it from
+    // the round identity so a client retry after disk replacement recreates
+    // the exact bytes peers may already possess.
+    let created_micros = u128::from(expected_nonce)
+        .saturating_mul(1_000)
+        .saturating_add(10);
+    runtime.build_dispatch_at(transactions, created_micros)
+}
+
 pub fn run_ha_deterministic(config: HaDeterministicConfig) -> Result<ProtocolCellReport, BoxError> {
     if !(2..=7).contains(&config.nodes) {
         return Err("HA deterministic node count must be 2..=7"
@@ -445,12 +883,13 @@ pub fn run_ha_deterministic(config: HaDeterministicConfig) -> Result<ProtocolCel
     let parameters = HighAvailabilityParameters::default();
     let scenario = ha_scenario(&config)?;
     let report_scenario = scenario.clone();
-    let quiescence_time = SimTime(
-        u64::try_from(config.epochs)
-            .unwrap_or(u64::MAX)
-            .saturating_mul(1_000)
-            .saturating_add(900),
-    );
+    let quiescence_time = SimTime(ha_final_quiescence_time(&config));
+    // Reachability is a campaign-level concern. Healthy cells deliberately
+    // drive amendments, reordered sessions, and strict sealing to completion;
+    // fault cells continue checking the corresponding safety invariants while
+    // allowing the injected fault to cause safe non-progress.
+    let expect_amendment = config.fault_plan == HaFaultPlan::None && config.epochs >= 7;
+    let expect_reordered_sequences = config.fault_plan == HaFaultPlan::None && config.epochs >= 11;
     let make_nodes = || {
         build_ha_nodes(&identities, group_id, parameters, config.durable)
             .map_err(|error| deterministic_test_env::SimEnvError::App(error.to_string()))
@@ -467,6 +906,8 @@ pub fn run_ha_deterministic(config: HaDeterministicConfig) -> Result<ProtocolCel
         let report = explorer.explore_with_observer(&scenario, make_nodes, || HaObserver {
             quiescence_time,
             fault_plan: config.fault_plan,
+            expect_amendment,
+            expect_reordered_sequences,
         })?;
         let trace = report
             .failures
@@ -484,6 +925,8 @@ pub fn run_ha_deterministic(config: HaDeterministicConfig) -> Result<ProtocolCel
         .run_with_observer(&mut HaObserver {
             quiescence_time,
             fault_plan: config.fault_plan,
+            expect_amendment,
+            expect_reordered_sequences,
         })?;
         if trace.final_state_digest != replay.final_state_digest
             || trace.client_history != replay.client_history
@@ -502,6 +945,8 @@ pub fn run_ha_deterministic(config: HaDeterministicConfig) -> Result<ProtocolCel
             .run_with_observer(&mut HaObserver {
                 quiescence_time,
                 fault_plan: config.fault_plan,
+                expect_amendment,
+                expect_reordered_sequences,
             })?;
             if replay != second_replay {
                 return Err("systematic HA failure did not reproduce twice".into());
@@ -514,10 +959,17 @@ pub fn run_ha_deterministic(config: HaDeterministicConfig) -> Result<ProtocolCel
             make_nodes()?,
             RunMode::Random { seed: config.seed },
         )?;
-        define_ha_properties(cluster.properties_mut(), config.fault_plan);
+        define_ha_properties(
+            cluster.properties_mut(),
+            config.fault_plan,
+            expect_amendment,
+            expect_reordered_sequences,
+        );
         let trace = cluster.run_with_observer(&mut HaObserver {
             quiescence_time,
             fault_plan: config.fault_plan,
+            expect_amendment,
+            expect_reordered_sequences,
         })?;
         let replay = DeterministicCluster::new(
             scenario.clone(),
@@ -529,6 +981,8 @@ pub fn run_ha_deterministic(config: HaDeterministicConfig) -> Result<ProtocolCel
         .run_with_observer(&mut HaObserver {
             quiescence_time,
             fault_plan: config.fault_plan,
+            expect_amendment,
+            expect_reordered_sequences,
         })?;
         if trace.final_state_digest != replay.final_state_digest
             || trace.client_history != replay.client_history
@@ -547,6 +1001,8 @@ pub fn run_ha_deterministic(config: HaDeterministicConfig) -> Result<ProtocolCel
             .run_with_observer(&mut HaObserver {
                 quiescence_time,
                 fault_plan: config.fault_plan,
+                expect_amendment,
+                expect_reordered_sequences,
             })?;
             if replay != second_replay {
                 return Err("HA deterministic failure did not reproduce twice".into());
@@ -577,25 +1033,28 @@ pub fn run_ha_deterministic(config: HaDeterministicConfig) -> Result<ProtocolCel
             config.seed
         ),
     )?;
-    let minimized = if failures.is_empty() {
-        None
-    } else {
-        Some(TraceReducer::default().reduce(
-            &report_scenario,
-            &trace,
-            make_nodes,
-            || HaObserver {
-                quiescence_time,
-                fault_plan: config.fault_plan,
-            },
-            |candidate| {
-                candidate.properties.statuses.iter().any(|(name, status)| {
-                    failed_properties.contains(name)
-                        && *status != deterministic_test_env::PropertyStatus::Passing
-                })
-            },
-        )?)
-    };
+    let minimized =
+        if failures.is_empty() || std::env::var_os("BLOSSOM_SKIP_TRACE_REDUCTION").is_some() {
+            None
+        } else {
+            Some(TraceReducer::default().reduce(
+                &report_scenario,
+                &trace,
+                make_nodes,
+                || HaObserver {
+                    quiescence_time,
+                    fault_plan: config.fault_plan,
+                    expect_amendment,
+                    expect_reordered_sequences,
+                },
+                |candidate| {
+                    candidate.properties.statuses.iter().any(|(name, status)| {
+                        failed_properties.contains(name)
+                            && *status != deterministic_test_env::PropertyStatus::Passing
+                    })
+                },
+            )?)
+        };
     Ok(ProtocolCellReport {
         protocol: "blossom-ha-leaderless-active-active".to_string(),
         topology: format!(
@@ -686,6 +1145,19 @@ fn build_ha_nodes(
                 rejected_messages: 0,
                 command_failures: 0,
                 finalized: BTreeMap::new(),
+                sealed: BTreeMap::new(),
+                historical_conflict: false,
+                sealed_conflict: false,
+                amendment_attempts: 0,
+                amendment_successes: 0,
+                recovery_attempts: 0,
+                recovery_successes: 0,
+                sealed_check_attempts: 0,
+                sealed_check_failures: 0,
+                application_hash: SharedStateMachine::new(4_096)?.canonical_hash()?,
+                application_results: BTreeMap::new(),
+                application_apply_failures: 0,
+                injected_fault_observations: 0,
             })
         })
         .collect()
@@ -702,17 +1174,12 @@ fn ha_scenario(config: &HaDeterministicConfig) -> Result<Scenario, BoxError> {
     );
     scenario.seed = config.seed;
     scenario.max_events = config.max_events;
-    scenario.max_virtual_time = SimTime(
-        u64::try_from(config.epochs)
-            .unwrap_or(u64::MAX)
-            .saturating_add(2)
-            .saturating_mul(1_000),
-    );
+    scenario.max_virtual_time = SimTime(ha_final_quiescence_time(config).saturating_add(700));
     scenario.fault_depth = match config.fault_plan {
         HaFaultPlan::None => 0,
         _ => config.fault_depth,
     };
-    let fault_epoch = config.epochs.max(2) / 2;
+    let fault_epoch = ha_fault_epoch(config);
     let victim = config.nodes.saturating_sub(1);
     let mut operation = 0u64;
     for epoch in 1..=config.epochs {
@@ -722,67 +1189,7 @@ fn ha_scenario(config: &HaDeterministicConfig) -> Result<Scenario, BoxError> {
         if epoch == fault_epoch {
             schedule_ha_faults(&mut scenario, config, victim, base, &mut operation);
         }
-        for node in 0..config.nodes {
-            push_command(
-                &mut scenario,
-                base.saturating_add(10),
-                node,
-                &HaCommand::Dispatch {
-                    expected_nonce: epoch as u64,
-                    payload: format!("epoch-{epoch}-writer-{node}").into_bytes(),
-                },
-                &mut operation,
-            )?;
-            push_command(
-                &mut scenario,
-                base.saturating_add(150),
-                node,
-                &HaCommand::Acknowledge {
-                    expected_nonce: epoch as u64,
-                },
-                &mut operation,
-            )?;
-            push_command(
-                &mut scenario,
-                base.saturating_add(300),
-                node,
-                &HaCommand::Confirm {
-                    expected_nonce: epoch as u64,
-                },
-                &mut operation,
-            )?;
-            push_command(
-                &mut scenario,
-                base.saturating_add(700),
-                node,
-                &HaCommand::Acknowledge {
-                    expected_nonce: epoch as u64,
-                },
-                &mut operation,
-            )?;
-            push_command(
-                &mut scenario,
-                base.saturating_add(800),
-                node,
-                &HaCommand::Confirm {
-                    expected_nonce: epoch as u64,
-                },
-                &mut operation,
-            )?;
-        }
-        push_command(
-            &mut scenario,
-            base.saturating_add(850),
-            0,
-            &HaCommand::Status,
-            &mut operation,
-        )?;
-        scenario.push(ScenarioAction {
-            at: SimTime(base.saturating_add(900)),
-            key: EventKey::new("ha-quiesce", 0, operation, 0),
-            action: ScenarioActionKind::Quiesce,
-        });
-        operation = operation.saturating_add(1);
+        schedule_ha_epoch_commands(&mut scenario, config, epoch, base, &mut operation)?;
     }
     scenario.push(ScenarioAction {
         at: SimTime(
@@ -794,7 +1201,190 @@ fn ha_scenario(config: &HaDeterministicConfig) -> Result<Scenario, BoxError> {
         key: EventKey::new("ha-final-heal", 0, operation, 0),
         action: ScenarioActionKind::HealAll,
     });
+    if config.fault_plan != HaFaultPlan::None {
+        push_command(
+            &mut scenario,
+            u64::try_from(config.epochs)
+                .unwrap_or(u64::MAX)
+                .saturating_mul(1_000)
+                .saturating_add(950),
+            victim,
+            &HaCommand::RecoverFrom { source: 0 },
+            &mut operation,
+        )?;
+    }
+    if config.fault_plan == HaFaultPlan::StorageDiskReplacement {
+        let retry_start = u64::try_from(config.epochs)
+            .unwrap_or(u64::MAX)
+            .saturating_mul(1_000)
+            .saturating_add(1_100);
+        for (offset, epoch) in (fault_epoch..=config.epochs).enumerate() {
+            let retry_base = retry_start.saturating_add(
+                u64::try_from(offset)
+                    .unwrap_or(u64::MAX)
+                    .saturating_mul(1_000),
+            );
+            schedule_ha_epoch_commands(&mut scenario, config, epoch, retry_base, &mut operation)?;
+        }
+    }
+    let final_phase_base = ha_final_phase_base(config);
+    let final_sealed_nonce = config
+        .epochs
+        .saturating_sub(HighAvailabilityParameters::default().mutable_epoch_depth as usize);
+    push_command(
+        &mut scenario,
+        final_phase_base.saturating_add(1_100),
+        0,
+        &HaCommand::RequireSealed {
+            required_nonce: final_sealed_nonce as u64,
+        },
+        &mut operation,
+    )?;
+    scenario.push(ScenarioAction {
+        at: SimTime(final_phase_base.saturating_add(1_300)),
+        key: EventKey::new("ha-final-quiesce", 0, operation, 0),
+        action: ScenarioActionKind::Quiesce,
+    });
     Ok(scenario)
+}
+
+fn ha_fault_epoch(config: &HaDeterministicConfig) -> usize {
+    config.epochs.max(2) / 2
+}
+
+fn ha_final_phase_base(config: &HaDeterministicConfig) -> u64 {
+    let workload_end = u64::try_from(config.epochs)
+        .unwrap_or(u64::MAX)
+        .saturating_mul(1_000);
+    if config.fault_plan != HaFaultPlan::StorageDiskReplacement {
+        return workload_end;
+    }
+    let retry_count_after_first = config.epochs.saturating_sub(ha_fault_epoch(config));
+    workload_end.saturating_add(1_100).saturating_add(
+        u64::try_from(retry_count_after_first)
+            .unwrap_or(u64::MAX)
+            .saturating_mul(1_000),
+    )
+}
+
+fn ha_final_quiescence_time(config: &HaDeterministicConfig) -> u64 {
+    ha_final_phase_base(config).saturating_add(1_300)
+}
+
+fn schedule_ha_epoch_commands(
+    scenario: &mut Scenario,
+    config: &HaDeterministicConfig,
+    epoch: usize,
+    base: u64,
+    operation: &mut u64,
+) -> Result<(), BoxError> {
+    for node in 0..config.nodes {
+        push_command(
+            scenario,
+            base.saturating_add(10),
+            node,
+            &deterministic_dispatch_command(node, epoch, config.seed),
+            operation,
+        )?;
+        push_command(
+            scenario,
+            base.saturating_add(150),
+            node,
+            &HaCommand::Acknowledge {
+                expected_nonce: epoch as u64,
+            },
+            operation,
+        )?;
+        push_command(
+            scenario,
+            base.saturating_add(300),
+            node,
+            &HaCommand::Confirm {
+                expected_nonce: epoch as u64,
+            },
+            operation,
+        )?;
+        push_command(
+            scenario,
+            base.saturating_add(700),
+            node,
+            &HaCommand::Acknowledge {
+                expected_nonce: epoch as u64,
+            },
+            operation,
+        )?;
+        push_command(
+            scenario,
+            base.saturating_add(800),
+            node,
+            &HaCommand::Confirm {
+                expected_nonce: epoch as u64,
+            },
+            operation,
+        )?;
+    }
+    push_command(
+        scenario,
+        base.saturating_add(850),
+        0,
+        &HaCommand::Status,
+        operation,
+    )?;
+    scenario.push(ScenarioAction {
+        at: SimTime(base.saturating_add(900)),
+        key: EventKey::new("ha-quiesce", 0, *operation, 0),
+        action: ScenarioActionKind::Quiesce,
+    });
+    *operation = operation.saturating_add(1);
+    Ok(())
+}
+
+fn deterministic_application_command(node: usize, epoch: usize, seed: u64) -> ActiveActiveCommand {
+    let sequence = match (node, epoch) {
+        (0, 10) => 11,
+        (0, 11) => 10,
+        _ => epoch as u64,
+    };
+    let operation = match epoch % 3 {
+        0 => CommandOperation::Append {
+            key: b"shared-append-log".to_vec(),
+            value: format!("{seed}:{epoch}:{node};").into_bytes(),
+        },
+        1 => CommandOperation::BlindWrite {
+            key: format!("writer-{node}").into_bytes(),
+            value: format!("{seed}:{epoch}").into_bytes(),
+        },
+        _ => CommandOperation::CompareAndSwap {
+            key: b"shared-cas".to_vec(),
+            expected: None,
+            value: format!("{seed}:{epoch}:{node}").into_bytes(),
+        },
+    };
+    ActiveActiveCommand {
+        identity: CommandIdentity {
+            client_id: ClientId([u8::try_from(node).unwrap_or(u8::MAX); 16]),
+            client_epoch: ClientEpoch(1),
+            sequence,
+        },
+        operation,
+    }
+}
+
+fn deterministic_dispatch_command(node: usize, epoch: usize, seed: u64) -> HaCommand {
+    if node == 0 && epoch >= 7 && epoch.is_multiple_of(7) {
+        HaCommand::Amend {
+            expected_nonce: epoch as u64,
+            target_nonce: epoch.saturating_sub(1) as u64,
+            sequence: epoch as u64,
+            payload: format!("amend-epoch-{}-from-{epoch}", epoch.saturating_sub(1)).into_bytes(),
+        }
+    } else {
+        HaCommand::Dispatch {
+            expected_nonce: epoch as u64,
+            command: deterministic_application_command(node, epoch, seed),
+            duplicate_retry: epoch.is_multiple_of(5),
+        }
+    }
 }
 
 fn schedule_ha_faults(
@@ -840,6 +1430,43 @@ fn schedule_ha_faults(
                     operation,
                 );
             }
+        }
+        HaFaultPlan::RegionalPartition | HaFaultPlan::RegionalOutage => {
+            let fault = if config.fault_plan == HaFaultPlan::RegionalPartition {
+                RegionFault::Partition
+            } else {
+                RegionFault::Offline
+            };
+            scenario.push(ScenarioAction {
+                at: SimTime(base),
+                key: EventKey::new(
+                    "ha-region-fault",
+                    u32::try_from(victim).unwrap_or(u32::MAX),
+                    *operation,
+                    0,
+                ),
+                action: ScenarioActionKind::RegionFault {
+                    region: "ha-minority-region".to_string(),
+                    nodes: vec![victim],
+                    fault,
+                },
+            });
+            *operation = operation.saturating_add(1);
+            scenario.push(ScenarioAction {
+                at: SimTime(base.saturating_add(550)),
+                key: EventKey::new(
+                    "ha-region-heal",
+                    u32::try_from(victim).unwrap_or(u32::MAX),
+                    *operation,
+                    0,
+                ),
+                action: ScenarioActionKind::RegionFault {
+                    region: "ha-minority-region".to_string(),
+                    nodes: vec![victim],
+                    fault: RegionFault::Heal,
+                },
+            });
+            *operation = operation.saturating_add(1);
         }
         HaFaultPlan::DelayAndDuplicate => {
             let peer = usize::from(config.nodes > 2);
@@ -917,97 +1544,188 @@ fn schedule_ha_faults(
             });
             *operation = operation.saturating_add(1);
         }
+        HaFaultPlan::GracefulRedeploy => {
+            push_node_fault(
+                scenario,
+                base.saturating_add(50),
+                victim,
+                NodeFault::GracefulStop,
+                "ha-graceful-stop",
+                operation,
+            );
+            push_node_fault(
+                scenario,
+                base.saturating_add(550),
+                victim,
+                NodeFault::Restart,
+                "ha-redeploy",
+                operation,
+            );
+        }
         HaFaultPlan::CrashAfterConfirmation => {
-            scenario.push(ScenarioAction {
-                at: SimTime(base.saturating_add(350)),
-                key: EventKey::new(
-                    "ha-crash",
-                    u32::try_from(victim).unwrap_or(u32::MAX),
-                    *operation,
-                    0,
-                ),
-                action: ScenarioActionKind::NodeFault {
-                    node: victim,
-                    fault: NodeFault::Crash,
-                },
-            });
-            *operation = operation.saturating_add(1);
-            scenario.push(ScenarioAction {
-                at: SimTime(base.saturating_add(550)),
-                key: EventKey::new(
-                    "ha-restart",
-                    u32::try_from(victim).unwrap_or(u32::MAX),
-                    *operation,
-                    0,
-                ),
-                action: ScenarioActionKind::NodeFault {
-                    node: victim,
-                    fault: NodeFault::Restart,
-                },
-            });
-            *operation = operation.saturating_add(1);
+            push_node_fault(
+                scenario,
+                base.saturating_add(350),
+                victim,
+                NodeFault::Crash,
+                "ha-crash",
+                operation,
+            );
+            push_node_fault(
+                scenario,
+                base.saturating_add(550),
+                victim,
+                NodeFault::Restart,
+                "ha-restart",
+                operation,
+            );
+        }
+        HaFaultPlan::StorageDelay => {
+            push_storage_fault(
+                scenario,
+                base.saturating_add(100),
+                victim,
+                StorageFault::Delay { micros: 300 },
+                "ha-storage-delay",
+                operation,
+            );
+            push_node_fault(
+                scenario,
+                base.saturating_add(100),
+                victim,
+                NodeFault::Throttle { delay_micros: 300 },
+                "ha-storage-delay-throttle",
+                operation,
+            );
+            push_storage_fault(
+                scenario,
+                base.saturating_add(550),
+                victim,
+                StorageFault::Healthy,
+                "ha-storage-delay-heal",
+                operation,
+            );
+        }
+        HaFaultPlan::StorageFull => {
+            schedule_storage_fault_window(scenario, base, victim, StorageFault::Full, operation);
+        }
+        HaFaultPlan::StorageIo => {
+            schedule_storage_fault_window(scenario, base, victim, StorageFault::Io, operation);
         }
         HaFaultPlan::StorageFailure => {
-            scenario.push(ScenarioAction {
-                at: SimTime(base.saturating_add(100)),
-                key: EventKey::new(
-                    "ha-storage-fsync",
-                    u32::try_from(victim).unwrap_or(u32::MAX),
-                    *operation,
-                    0,
-                ),
-                action: ScenarioActionKind::StorageFault {
-                    node: victim,
-                    fault: StorageFault::Fsync,
-                },
-            });
-            *operation = operation.saturating_add(1);
-            scenario.push(ScenarioAction {
-                at: SimTime(base.saturating_add(550)),
-                key: EventKey::new(
-                    "ha-storage-heal",
-                    u32::try_from(victim).unwrap_or(u32::MAX),
-                    *operation,
-                    0,
-                ),
-                action: ScenarioActionKind::StorageFault {
-                    node: victim,
-                    fault: StorageFault::Healthy,
-                },
-            });
-            *operation = operation.saturating_add(1);
+            schedule_storage_fault_window(scenario, base, victim, StorageFault::Fsync, operation);
         }
         HaFaultPlan::StorageTornWrite => {
-            scenario.push(ScenarioAction {
-                at: SimTime(base.saturating_add(100)),
-                key: EventKey::new(
-                    "ha-storage-torn",
-                    u32::try_from(victim).unwrap_or(u32::MAX),
-                    *operation,
-                    0,
-                ),
-                action: ScenarioActionKind::StorageFault {
-                    node: victim,
-                    fault: StorageFault::TornWrite { keep_bytes: 8 },
-                },
-            });
-            *operation = operation.saturating_add(1);
-            scenario.push(ScenarioAction {
-                at: SimTime(base.saturating_add(550)),
-                key: EventKey::new(
-                    "ha-storage-torn-heal",
-                    u32::try_from(victim).unwrap_or(u32::MAX),
-                    *operation,
-                    0,
-                ),
-                action: ScenarioActionKind::StorageFault {
-                    node: victim,
-                    fault: StorageFault::Healthy,
-                },
-            });
-            *operation = operation.saturating_add(1);
+            schedule_storage_fault_window(
+                scenario,
+                base,
+                victim,
+                StorageFault::TornWrite { keep_bytes: 8 },
+                operation,
+            );
+        }
+        HaFaultPlan::StorageCorruption => {
+            schedule_storage_fault_window(
+                scenario,
+                base,
+                victim,
+                StorageFault::Corrupt { xor: 0x80 },
+                operation,
+            );
+        }
+        HaFaultPlan::StorageDiskReplacement => {
+            push_node_fault(
+                scenario,
+                base.saturating_add(90),
+                victim,
+                NodeFault::Crash,
+                "ha-replace-disk-stop",
+                operation,
+            );
+            schedule_storage_fault_window(
+                scenario,
+                base,
+                victim,
+                StorageFault::ReplaceDisk,
+                operation,
+            );
+            push_node_fault(
+                scenario,
+                base.saturating_add(150),
+                victim,
+                NodeFault::Restart,
+                "ha-replace-disk-redeploy",
+                operation,
+            );
         }
     }
+}
+
+fn push_node_fault(
+    scenario: &mut Scenario,
+    at: u64,
+    node: usize,
+    fault: NodeFault,
+    domain: &'static str,
+    operation: &mut u64,
+) {
+    scenario.push(ScenarioAction {
+        at: SimTime(at),
+        key: EventKey::new(
+            domain,
+            u32::try_from(node).unwrap_or(u32::MAX),
+            *operation,
+            0,
+        ),
+        action: ScenarioActionKind::NodeFault { node, fault },
+    });
+    *operation = operation.saturating_add(1);
+}
+
+fn push_storage_fault(
+    scenario: &mut Scenario,
+    at: u64,
+    node: usize,
+    fault: StorageFault,
+    domain: &'static str,
+    operation: &mut u64,
+) {
+    scenario.push(ScenarioAction {
+        at: SimTime(at),
+        key: EventKey::new(
+            domain,
+            u32::try_from(node).unwrap_or(u32::MAX),
+            *operation,
+            0,
+        ),
+        action: ScenarioActionKind::StorageFault { node, fault },
+    });
+    *operation = operation.saturating_add(1);
+}
+
+fn schedule_storage_fault_window(
+    scenario: &mut Scenario,
+    base: u64,
+    node: usize,
+    fault: StorageFault,
+    operation: &mut u64,
+) {
+    push_storage_fault(
+        scenario,
+        base.saturating_add(100),
+        node,
+        fault,
+        "ha-storage-fault",
+        operation,
+    );
+    push_storage_fault(
+        scenario,
+        base.saturating_add(550),
+        node,
+        StorageFault::Healthy,
+        "ha-storage-heal",
+        operation,
+    );
 }
 
 fn push_command(
@@ -1062,31 +1780,77 @@ fn push_link_fault(
     *operation = operation.saturating_add(1);
 }
 
-fn define_ha_properties(properties: &mut PropertyRegistry, fault_plan: HaFaultPlan) {
+fn define_ha_properties(
+    properties: &mut PropertyRegistry,
+    fault_plan: HaFaultPlan,
+    expect_amendment: bool,
+    expect_reordered_sequences: bool,
+) {
     properties.define("ha_unique_finality", PropertyKind::Always);
+    properties.define("ha_historical_finality_is_stable", PropertyKind::Always);
     properties.define("ha_local_chain_is_contiguous", PropertyKind::Always);
     properties.define("ha_confirmation_has_majority", PropertyKind::Always);
+    properties.define("ha_sealed_prefix_is_immutable", PropertyKind::Always);
+    properties.define("ha_consensus_parameters_agree", PropertyKind::Always);
+    properties.define(
+        "ha_revision_hashes_agree_at_equal_heads",
+        PropertyKind::Always,
+    );
+    properties.define("ha_application_is_exact_once", PropertyKind::Always);
+    properties.define(
+        "ha_application_hashes_agree_at_equal_heads",
+        PropertyKind::Always,
+    );
     properties.define("ha_service_mode_is_leaderless", PropertyKind::Always);
     properties.define("ha_service_status_is_actionable", PropertyKind::Always);
+    if fault_plan == HaFaultPlan::None {
+        properties.define("ha_strict_seal_barrier_passed", PropertyKind::Reachable);
+    }
     properties.define("ha_progress_observed", PropertyKind::Reachable);
+    properties.define(
+        "ha_unknown_client_outcomes_resolved",
+        PropertyKind::EventuallyAfterQuiescence,
+    );
     properties.define(
         "ha_converged_after_quiescence",
         PropertyKind::EventuallyAfterQuiescence,
     );
+    if expect_amendment {
+        properties.define("ha_mutable_amendment_applied", PropertyKind::Reachable);
+    }
+    if expect_reordered_sequences {
+        properties.define(
+            "ha_reordered_client_sequences_applied",
+            PropertyKind::Reachable,
+        );
+    }
     if fault_plan != HaFaultPlan::None {
         properties.define("ha_fault_effect_observed", PropertyKind::Sometimes);
+        properties.define("ha_recovery_path_exercised", PropertyKind::Reachable);
     }
 }
 
-fn define_ha_properties_if_missing(properties: &mut PropertyRegistry, fault_plan: HaFaultPlan) {
+fn define_ha_properties_if_missing(
+    properties: &mut PropertyRegistry,
+    fault_plan: HaFaultPlan,
+    expect_amendment: bool,
+    expect_reordered_sequences: bool,
+) {
     if properties.report().statuses.is_empty() {
-        define_ha_properties(properties, fault_plan);
+        define_ha_properties(
+            properties,
+            fault_plan,
+            expect_amendment,
+            expect_reordered_sequences,
+        );
     }
 }
 
 struct HaObserver {
     quiescence_time: SimTime,
     fault_plan: HaFaultPlan,
+    expect_amendment: bool,
+    expect_reordered_sequences: bool,
 }
 
 impl GlobalObserver<HaDeterministicNode> for HaObserver {
@@ -1095,7 +1859,12 @@ impl GlobalObserver<HaDeterministicNode> for HaObserver {
         view: ClusterView<'_, HaDeterministicNode>,
         properties: &mut PropertyRegistry,
     ) {
-        define_ha_properties_if_missing(properties, self.fault_plan);
+        define_ha_properties_if_missing(
+            properties,
+            self.fault_plan,
+            self.expect_amendment,
+            self.expect_reordered_sequences,
+        );
         observe_ha(view, properties, self.quiescence_time);
     }
 }
@@ -1113,8 +1882,37 @@ fn observe_ha(
     let mut max_nonce = 0u64;
     let mut failure_effect = false;
     let mut service_status_valid = true;
+    let mut historical_finality_valid = true;
+    let mut sealed_prefix_valid = true;
+    let mut parameter_hashes = BTreeSet::new();
+    let mut revisions_by_head = BTreeMap::<(u64, HashType), BTreeSet<HashType>>::new();
+    let mut application_hashes_by_head = BTreeMap::<(u64, HashType), BTreeSet<HashType>>::new();
+    let mut application_valid = true;
+    let mut reordered_sequences_applied = false;
+    let mut amendment_successes = 0u64;
+    let mut recovery_successes = 0u64;
+    let mut strict_seal_barrier_passed = false;
     for node in view.nodes {
-        failure_effect |= node.rejected_messages > 0 || node.command_failures > 0;
+        failure_effect |= node.rejected_messages > 0
+            || node.command_failures > 0
+            || node.injected_fault_observations > 0;
+        historical_finality_valid &= !node.historical_conflict;
+        sealed_prefix_valid &= !node.sealed_conflict;
+        amendment_successes = amendment_successes.saturating_add(node.amendment_successes);
+        recovery_successes = recovery_successes.saturating_add(node.recovery_successes);
+        strict_seal_barrier_passed |=
+            node.sealed_check_attempts > 0 && node.sealed_check_failures == 0;
+        application_valid &= node.application_apply_failures == 0;
+        reordered_sequences_applied |=
+            node.application_results
+                .keys()
+                .any(|identity| identity.client_id == ClientId([0; 16]) && identity.sequence == 10)
+                && node.application_results.keys().any(|identity| {
+                    identity.client_id == ClientId([0; 16]) && identity.sequence == 11
+                });
+        for (nonce, hash) in &node.finalized {
+            by_nonce.entry(*nonce).or_default().insert(*hash);
+        }
         let Some(runtime) = node.runtime() else {
             continue;
         };
@@ -1135,11 +1933,18 @@ fn observe_ha(
         });
         heads.insert((runtime.head().nonce.value(), runtime.head().hash));
         max_nonce = max_nonce.max(runtime.head().nonce.value());
-        for epoch in runtime.epochs() {
-            by_nonce
-                .entry(epoch.nonce.value())
+        parameter_hashes.insert(runtime.parameters_hash());
+        if let Ok(revision) = runtime.revision() {
+            revisions_by_head
+                .entry((runtime.head().nonce.value(), runtime.head().hash))
                 .or_default()
-                .insert(epoch.hash);
+                .insert(revision.revision_hash);
+        }
+        application_hashes_by_head
+            .entry((runtime.head().nonce.value(), runtime.head().hash))
+            .or_default()
+            .insert(node.application_hash);
+        for epoch in runtime.epochs() {
             if epoch.nonce != Nonce::default() {
                 confirmation_valid &= epoch.confirmation_mask.count_ones() as usize
                     >= high_availability_majority(epoch.active_mask.count_ones() as usize);
@@ -1158,6 +1963,12 @@ fn observe_ha(
         "no two healthy nodes may finalize different hashes at one nonce",
     );
     properties.observe(
+        "ha_historical_finality_is_stable",
+        view.now,
+        historical_finality_valid,
+        "a finalized nonce must never change, including while its node is crashed",
+    );
+    properties.observe(
         "ha_local_chain_is_contiguous",
         view.now,
         local_chain_valid,
@@ -1168,6 +1979,40 @@ fn observe_ha(
         view.now,
         confirmation_valid,
         "every non-genesis HA epoch carries a strict-majority confirmation mask",
+    );
+    properties.observe(
+        "ha_sealed_prefix_is_immutable",
+        view.now,
+        sealed_prefix_valid,
+        "a sealed epoch hash must remain immutable across amendments and restart",
+    );
+    properties.observe(
+        "ha_consensus_parameters_agree",
+        view.now,
+        parameter_hashes.len() <= 1,
+        "all running members must use the same committed HA parameter hash",
+    );
+    properties.observe(
+        "ha_revision_hashes_agree_at_equal_heads",
+        view.now,
+        revisions_by_head
+            .values()
+            .all(|revisions| revisions.len() <= 1),
+        "nodes at the same immutable head must expose the same application revision",
+    );
+    properties.observe(
+        "ha_application_is_exact_once",
+        view.now,
+        application_valid,
+        "certified application commands, duplicate retries, and reordered sequences must apply exactly once",
+    );
+    properties.observe(
+        "ha_application_hashes_agree_at_equal_heads",
+        view.now,
+        application_hashes_by_head
+            .values()
+            .all(|hashes| hashes.len() <= 1),
+        "nodes at one certified head must rebuild the same application state hash",
     );
     properties.observe(
         "ha_service_mode_is_leaderless",
@@ -1181,12 +2026,60 @@ fn observe_ha(
         service_status_valid,
         "HA status must expose a correct threshold, sealed watermark, and safe service directives",
     );
+    if properties
+        .report()
+        .statuses
+        .contains_key("ha_strict_seal_barrier_passed")
+    {
+        properties.observe(
+            "ha_strict_seal_barrier_passed",
+            view.now,
+            strict_seal_barrier_passed,
+            "a strict operation must pass after its required watermark is sealed",
+        );
+    }
     properties.observe(
         "ha_progress_observed",
         view.now,
         max_nonce > 0,
         "at least one HA epoch finalized",
     );
+    if properties
+        .report()
+        .statuses
+        .contains_key("ha_mutable_amendment_applied")
+    {
+        properties.observe(
+            "ha_mutable_amendment_applied",
+            view.now,
+            amendment_successes > 0,
+            "a mutable logical epoch amendment must be accepted and incorporated",
+        );
+    }
+    if properties
+        .report()
+        .statuses
+        .contains_key("ha_reordered_client_sequences_applied")
+    {
+        properties.observe(
+            "ha_reordered_client_sequences_applied",
+            view.now,
+            reordered_sequences_applied,
+            "client sequence eleven followed by ten must both execute exactly once",
+        );
+    }
+    if properties
+        .report()
+        .statuses
+        .contains_key("ha_recovery_path_exercised")
+    {
+        properties.observe(
+            "ha_recovery_path_exercised",
+            view.now,
+            recovery_successes > 0,
+            "a faulted member must install a peer recovery snapshot",
+        );
+    }
     if view.now >= quiescence_time {
         let running = view
             .lifecycle
@@ -1198,6 +2091,12 @@ fn observe_ha(
             view.now,
             running > 0 && heads.len() <= 1,
             "all running nodes converge after faults are removed",
+        );
+        properties.observe(
+            "ha_unknown_client_outcomes_resolved",
+            view.now,
+            unknown_ha_outcomes_resolved(view.client_history, view.nodes),
+            "unknown responses must be resolved from finalized/sealed state or an idempotent recovery action",
         );
     }
     if properties
@@ -1216,6 +2115,67 @@ fn observe_ha(
             "the injected fault must affect delivery, persistence, or lifecycle",
         );
     }
+}
+
+fn unknown_ha_outcomes_resolved(
+    history: &[deterministic_test_env::ClientHistoryEvent],
+    nodes: &[HaDeterministicNode],
+) -> bool {
+    let invocations = history
+        .iter()
+        .filter_map(|event| match event {
+            deterministic_test_env::ClientHistoryEvent::Invoke {
+                source,
+                operation_id,
+                payload,
+                ..
+            } => serde_json::from_slice::<HaCommand>(payload)
+                .ok()
+                .map(|command| (*operation_id, (*source, command))),
+            deterministic_test_env::ClientHistoryEvent::Complete { .. } => None,
+        })
+        .collect::<BTreeMap<_, _>>();
+    let minimum_head = nodes
+        .iter()
+        .filter_map(HaDeterministicNode::runtime)
+        .map(|runtime| runtime.head().nonce.value())
+        .min()
+        .unwrap_or_default();
+    let minimum_sealed = nodes
+        .iter()
+        .filter_map(HaDeterministicNode::runtime)
+        .map(|runtime| runtime.sealed_watermark().position)
+        .min()
+        .unwrap_or_default();
+    history.iter().all(|event| {
+        let deterministic_test_env::ClientHistoryEvent::Complete {
+            operation_id,
+            outcome: ClientOutcome::Unknown,
+            ..
+        } = event
+        else {
+            return true;
+        };
+        let Some((source, command)) = invocations.get(operation_id) else {
+            return false;
+        };
+        match command {
+            HaCommand::Dispatch { expected_nonce, .. }
+            | HaCommand::Acknowledge { expected_nonce }
+            | HaCommand::Confirm { expected_nonce } => minimum_head >= *expected_nonce,
+            HaCommand::Amend { expected_nonce, .. } => {
+                minimum_head >= *expected_nonce
+                    && nodes
+                        .get(*source)
+                        .is_some_and(|node| node.amendment_successes > 0)
+            }
+            HaCommand::RequireSealed { required_nonce } => minimum_sealed >= *required_nonce,
+            HaCommand::RecoverFrom { .. } => nodes
+                .get(*source)
+                .is_some_and(|node| node.recovery_successes > 0),
+            HaCommand::Status => true,
+        }
+    })
 }
 
 pub fn run_deterministic_campaign(
@@ -1275,7 +2235,36 @@ pub fn run_deterministic_campaign_with_observer(
             &[
                 HaFaultPlan::None,
                 HaFaultPlan::AsymmetricPartition,
+                HaFaultPlan::RegionalPartition,
+                HaFaultPlan::GracefulRedeploy,
+                HaFaultPlan::StorageFull,
                 HaFaultPlan::StorageFailure,
+                HaFaultPlan::StorageDiskReplacement,
+            ],
+        ),
+        DeterministicCampaignProfile::Novelty => (
+            11,
+            8,
+            true,
+            2,
+            &[
+                HaFaultPlan::None,
+                HaFaultPlan::AsymmetricPartition,
+                HaFaultPlan::MinorityPartition,
+                HaFaultPlan::RegionalPartition,
+                HaFaultPlan::RegionalOutage,
+                HaFaultPlan::DelayAndDuplicate,
+                HaFaultPlan::Corruption,
+                HaFaultPlan::ProcessPauseAndThrottle,
+                HaFaultPlan::GracefulRedeploy,
+                HaFaultPlan::CrashAfterConfirmation,
+                HaFaultPlan::StorageDelay,
+                HaFaultPlan::StorageFull,
+                HaFaultPlan::StorageIo,
+                HaFaultPlan::StorageFailure,
+                HaFaultPlan::StorageTornWrite,
+                HaFaultPlan::StorageCorruption,
+                HaFaultPlan::StorageDiskReplacement,
             ],
         ),
         DeterministicCampaignProfile::Nightly => (
@@ -1287,12 +2276,20 @@ pub fn run_deterministic_campaign_with_observer(
                 HaFaultPlan::None,
                 HaFaultPlan::AsymmetricPartition,
                 HaFaultPlan::MinorityPartition,
+                HaFaultPlan::RegionalPartition,
+                HaFaultPlan::RegionalOutage,
                 HaFaultPlan::DelayAndDuplicate,
                 HaFaultPlan::Corruption,
                 HaFaultPlan::ProcessPauseAndThrottle,
+                HaFaultPlan::GracefulRedeploy,
                 HaFaultPlan::CrashAfterConfirmation,
+                HaFaultPlan::StorageDelay,
+                HaFaultPlan::StorageFull,
+                HaFaultPlan::StorageIo,
                 HaFaultPlan::StorageFailure,
                 HaFaultPlan::StorageTornWrite,
+                HaFaultPlan::StorageCorruption,
+                HaFaultPlan::StorageDiskReplacement,
             ],
         ),
         DeterministicCampaignProfile::Release => (
@@ -1304,18 +2301,28 @@ pub fn run_deterministic_campaign_with_observer(
                 HaFaultPlan::None,
                 HaFaultPlan::AsymmetricPartition,
                 HaFaultPlan::MinorityPartition,
+                HaFaultPlan::RegionalPartition,
+                HaFaultPlan::RegionalOutage,
                 HaFaultPlan::DelayAndDuplicate,
                 HaFaultPlan::Corruption,
                 HaFaultPlan::ProcessPauseAndThrottle,
+                HaFaultPlan::GracefulRedeploy,
                 HaFaultPlan::CrashAfterConfirmation,
+                HaFaultPlan::StorageDelay,
+                HaFaultPlan::StorageFull,
+                HaFaultPlan::StorageIo,
                 HaFaultPlan::StorageFailure,
                 HaFaultPlan::StorageTornWrite,
+                HaFaultPlan::StorageCorruption,
+                HaFaultPlan::StorageDiskReplacement,
             ],
         ),
     };
     let mut cells = Vec::new();
     let node_counts: Vec<usize> = match profile {
-        DeterministicCampaignProfile::Pr => vec![2, 3, 5, 7],
+        DeterministicCampaignProfile::Pr | DeterministicCampaignProfile::Novelty => {
+            vec![2, 3, 5, 7]
+        }
         DeterministicCampaignProfile::Nightly | DeterministicCampaignProfile::Release => {
             (2..=7).collect()
         }
@@ -1326,38 +2333,75 @@ pub fn run_deterministic_campaign_with_observer(
                 continue;
             }
             for fault_plan in faults {
-                if !durable && *fault_plan == HaFaultPlan::CrashAfterConfirmation {
+                if !durable
+                    && (*fault_plan == HaFaultPlan::CrashAfterConfirmation
+                        || is_storage_fault(*fault_plan))
+                {
                     continue;
                 }
-                let systematic =
-                    schedules > 1 && !durable && *fault_plan == HaFaultPlan::AsymmetricPartition;
                 let cell = run_ha_deterministic(HaDeterministicConfig {
                     nodes,
-                    epochs: if systematic { 2 } else { epochs },
+                    epochs,
                     seed: seed ^ nodes as u64 ^ ((*fault_plan as u64) << 32),
                     durable,
                     fault_plan: *fault_plan,
                     fault_depth,
-                    systematic_schedules: if systematic { schedules } else { 1 },
-                    max_events: if systematic {
-                        500
-                    } else {
-                        epochs.saturating_mul(nodes).saturating_mul(64).max(10_000)
-                    },
+                    systematic_schedules: 1,
+                    max_events: epochs.saturating_mul(nodes).saturating_mul(64).max(10_000),
                 })?;
                 observer(&cell);
                 cells.push(cell);
+                let systematic = match profile {
+                    DeterministicCampaignProfile::Pr => {
+                        !durable && *fault_plan == HaFaultPlan::AsymmetricPartition
+                    }
+                    DeterministicCampaignProfile::Novelty => *fault_plan != HaFaultPlan::None,
+                    DeterministicCampaignProfile::Nightly
+                    | DeterministicCampaignProfile::Release => *fault_plan != HaFaultPlan::None,
+                };
+                if systematic {
+                    let companion_schedules = match (profile, durable) {
+                        (DeterministicCampaignProfile::Pr, _) => schedules,
+                        (DeterministicCampaignProfile::Novelty, false) => schedules,
+                        (DeterministicCampaignProfile::Novelty, true) => 2,
+                        (DeterministicCampaignProfile::Nightly, false) => 16,
+                        (DeterministicCampaignProfile::Nightly, true) => 4,
+                        (DeterministicCampaignProfile::Release, false) => 64,
+                        (DeterministicCampaignProfile::Release, true) => 16,
+                    };
+                    let companion_epochs = match profile {
+                        DeterministicCampaignProfile::Pr => 2,
+                        DeterministicCampaignProfile::Novelty => 11,
+                        DeterministicCampaignProfile::Nightly
+                        | DeterministicCampaignProfile::Release => 11,
+                    };
+                    let companion = run_ha_deterministic(HaDeterministicConfig {
+                        nodes,
+                        epochs: companion_epochs,
+                        seed: seed
+                            ^ nodes as u64
+                            ^ ((*fault_plan as u64) << 32)
+                            ^ 0x7379_7374_656d_6174,
+                        durable,
+                        fault_plan: *fault_plan,
+                        fault_depth,
+                        systematic_schedules: companion_schedules,
+                        max_events: 10_000,
+                    })?;
+                    observer(&companion);
+                    cells.push(companion);
+                }
             }
         }
     }
 
     let trusted_epochs = match profile {
-        DeterministicCampaignProfile::Pr => 50,
+        DeterministicCampaignProfile::Pr | DeterministicCampaignProfile::Novelty => 50,
         DeterministicCampaignProfile::Nightly => 1_200,
         DeterministicCampaignProfile::Release => 10_000,
     };
     for nodes in match profile {
-        DeterministicCampaignProfile::Pr => vec![6, 9],
+        DeterministicCampaignProfile::Pr | DeterministicCampaignProfile::Novelty => vec![6, 9],
         DeterministicCampaignProfile::Nightly | DeterministicCampaignProfile::Release => {
             vec![6, 9, 12, 24, 72]
         }
@@ -1419,12 +2463,14 @@ pub fn run_deterministic_campaign_with_observer(
     #[cfg(feature = "trusted-checkpoint-dag")]
     {
         let dag_epochs = match profile {
-            DeterministicCampaignProfile::Pr => 50,
+            DeterministicCampaignProfile::Pr | DeterministicCampaignProfile::Novelty => 50,
             DeterministicCampaignProfile::Nightly => 1_200,
             DeterministicCampaignProfile::Release => 10_000,
         };
         let dag_cells: &[(usize, usize)] = match profile {
-            DeterministicCampaignProfile::Pr => &[(6, 3), (6, 6), (9, 3), (9, 6), (9, 9)],
+            DeterministicCampaignProfile::Pr | DeterministicCampaignProfile::Novelty => {
+                &[(6, 3), (6, 6), (9, 3), (9, 6), (9, 9)]
+            }
             DeterministicCampaignProfile::Nightly | DeterministicCampaignProfile::Release => &[
                 (6, 3),
                 (6, 6),
@@ -1484,19 +2530,21 @@ pub fn run_deterministic_campaign_with_observer(
     #[cfg(feature = "parallel-networks")]
     {
         let ha_sizes: Vec<usize> = match profile {
-            DeterministicCampaignProfile::Pr => vec![2, 3, 5, 7],
+            DeterministicCampaignProfile::Pr | DeterministicCampaignProfile::Novelty => {
+                vec![2, 3, 5, 7]
+            }
             DeterministicCampaignProfile::Nightly | DeterministicCampaignProfile::Release => {
                 (2..=7).collect()
             }
         };
         let global_sizes: &[usize] = match profile {
-            DeterministicCampaignProfile::Pr => &[6],
+            DeterministicCampaignProfile::Pr | DeterministicCampaignProfile::Novelty => &[6],
             DeterministicCampaignProfile::Nightly | DeterministicCampaignProfile::Release => {
                 &[6, 12]
             }
         };
         let parallel_epochs = match profile {
-            DeterministicCampaignProfile::Pr => 10,
+            DeterministicCampaignProfile::Pr | DeterministicCampaignProfile::Novelty => 10,
             DeterministicCampaignProfile::Nightly => 1_200,
             DeterministicCampaignProfile::Release => 10_000,
         };
@@ -1545,6 +2593,19 @@ pub fn run_deterministic_campaign_with_observer(
         total_schedules,
         safety_passed,
     })
+}
+
+fn is_storage_fault(fault: HaFaultPlan) -> bool {
+    matches!(
+        fault,
+        HaFaultPlan::StorageDelay
+            | HaFaultPlan::StorageFull
+            | HaFaultPlan::StorageIo
+            | HaFaultPlan::StorageFailure
+            | HaFaultPlan::StorageTornWrite
+            | HaFaultPlan::StorageCorruption
+            | HaFaultPlan::StorageDiskReplacement
+    )
 }
 
 fn protocol_cell_telemetry(cell: &ProtocolCellReport) -> TelemetryEvent {
@@ -2004,6 +3065,79 @@ mod tests {
         })
         .unwrap();
         assert!(report.safety_passed, "{:?}", report.property_failures);
+    }
+
+    #[test]
+    fn every_deterministic_fault_class_recovers_without_safety_loss() {
+        let faults = [
+            HaFaultPlan::MinorityPartition,
+            HaFaultPlan::RegionalPartition,
+            HaFaultPlan::RegionalOutage,
+            HaFaultPlan::DelayAndDuplicate,
+            HaFaultPlan::Corruption,
+            HaFaultPlan::ProcessPauseAndThrottle,
+            HaFaultPlan::GracefulRedeploy,
+            HaFaultPlan::CrashAfterConfirmation,
+            HaFaultPlan::StorageDelay,
+            HaFaultPlan::StorageFull,
+            HaFaultPlan::StorageIo,
+            HaFaultPlan::StorageFailure,
+            HaFaultPlan::StorageTornWrite,
+            HaFaultPlan::StorageCorruption,
+            HaFaultPlan::StorageDiskReplacement,
+        ];
+        for fault_plan in faults {
+            let report = run_ha_deterministic(HaDeterministicConfig {
+                nodes: 3,
+                epochs: 12,
+                seed: 0x6661_756c_745f_0000 ^ ((fault_plan as u64) << 16),
+                durable: fault_plan == HaFaultPlan::CrashAfterConfirmation
+                    || is_storage_fault(fault_plan),
+                fault_plan,
+                fault_depth: 2,
+                systematic_schedules: 1,
+                max_events: 40_000,
+            })
+            .unwrap_or_else(|error| panic!("{fault_plan:?} failed to execute: {error}"));
+            assert!(
+                report.safety_passed,
+                "{fault_plan:?}: {:?}",
+                report.property_failures
+            );
+        }
+    }
+
+    #[test]
+    fn deterministic_disk_replacement_model_redeploys_and_recovers() {
+        let report = run_ha_deterministic(HaDeterministicConfig {
+            nodes: 3,
+            epochs: 12,
+            seed: 0x6469_736b_5f72_6570,
+            durable: true,
+            fault_plan: HaFaultPlan::StorageDiskReplacement,
+            fault_depth: 2,
+            systematic_schedules: 1,
+            max_events: 40_000,
+        })
+        .unwrap();
+        assert!(report.safety_passed, "{:?}", report.property_failures);
+    }
+
+    #[test]
+    fn two_node_disk_replacement_resolves_ambiguous_pending_round() {
+        let report = run_ha_deterministic(HaDeterministicConfig {
+            nodes: 2,
+            epochs: 10,
+            seed: 7_238_256_910_417_031_025,
+            durable: true,
+            fault_plan: HaFaultPlan::StorageDiskReplacement,
+            fault_depth: 1,
+            systematic_schedules: 1,
+            max_events: 40_000,
+        })
+        .unwrap();
+        assert!(report.safety_passed, "{:?}", report.property_failures);
+        assert!(report.replay_passed);
     }
 
     #[test]

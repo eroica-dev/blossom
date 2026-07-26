@@ -1,0 +1,142 @@
+{
+  "schema_version": 1,
+  "name": "blossom-protocol-nightly",
+  "adapter": "blossom/protocol-v1",
+  "seed": 7238271256290328435,
+  "profile": {
+    "topology": {
+      "node_count": 6,
+      "regions": [
+        {
+          "name": "site-a",
+          "nodes": 2
+        },
+        {
+          "name": "site-b",
+          "nodes": 2
+        },
+        {
+          "name": "site-c",
+          "nodes": 2
+        }
+      ],
+      "interchangeable_node_groups": [
+        [
+          0,
+          1
+        ],
+        [
+          2,
+          3
+        ],
+        [
+          4,
+          5
+        ]
+      ]
+    },
+    "workload": {
+      "clients": 24,
+      "minimum_interactions": 100000,
+      "maximum_interactions": 120000,
+      "operation_weights": {
+        "append": 25,
+        "compare_and_swap": 20,
+        "membership": 10,
+        "read": 15,
+        "write": 30
+      },
+      "phases": [
+        "Setup",
+        "Execute",
+        "Check",
+        "Metrics"
+      ]
+    },
+    "faults": {
+      "maximum_concurrent_faults": 2,
+      "fault_rates_ppm": {
+        "network/corrupt": 1000,
+        "network/drop": 10000,
+        "network/reorder": 50000,
+        "process/crash": 10000,
+        "region/outage": 1000,
+        "region/partition": 2500,
+        "storage/corrupt": 500,
+        "storage/fsync": 1000,
+        "storage/full": 500,
+        "storage/io": 1000,
+        "storage/torn-write": 500
+      },
+      "allow_regional_faults": true,
+      "allow_disk_replacement": false,
+      "quiet_recovery_micros": 30000000
+    },
+    "exploration": {
+      "mode": "novelty_guided",
+      "maximum_events": 1000000,
+      "maximum_schedules": 5000,
+      "maximum_branch_width": 32,
+      "maximum_virtual_time_micros": 7200000000
+    },
+    "expensive_check_probability_ppm": 1000000
+  },
+  "properties": [
+    {
+      "id": "blossom/unique-finality",
+      "description": "No two members finalize different hashes at one HA nonce.",
+      "kind": "Always",
+      "evaluator": "ha_unique_finality",
+      "sample_probability_ppm": 1000000
+    },
+    {
+      "id": "blossom/historical-finality",
+      "description": "Finality remains stable across crashes and restarts.",
+      "kind": "Always",
+      "evaluator": "ha_historical_finality_is_stable",
+      "sample_probability_ppm": 1000000
+    },
+    {
+      "id": "blossom/sealed-prefix",
+      "description": "A sealed logical epoch never changes.",
+      "kind": "Always",
+      "evaluator": "ha_sealed_prefix_is_immutable",
+      "sample_probability_ppm": 1000000
+    },
+    {
+      "id": "blossom/exact-once",
+      "description": "Certified commands, retries, and reordered client sequences apply exactly once.",
+      "kind": "Always",
+      "evaluator": "ha_application_is_exact_once",
+      "sample_probability_ppm": 1000000
+    },
+    {
+      "id": "blossom/application-convergence",
+      "description": "Members at an equal certified head expose an equal application hash.",
+      "kind": "Always",
+      "evaluator": "ha_application_hashes_agree_at_equal_heads",
+      "sample_probability_ppm": 1000000
+    },
+    {
+      "id": "blossom/actionable-status",
+      "description": "Service health exposes safe write, recovery, and redeploy directives.",
+      "kind": "Always",
+      "evaluator": "ha_service_status_is_actionable",
+      "sample_probability_ppm": 1000000
+    },
+    {
+      "id": "blossom/unknown-resolution",
+      "description": "Ambiguous responses resolve from certified state or an idempotent recovery action.",
+      "kind": "EventuallyAfterQuiescence",
+      "evaluator": "ha_unknown_client_outcomes_resolved",
+      "sample_probability_ppm": 1000000
+    },
+    {
+      "id": "blossom/recovery-convergence",
+      "description": "All running members converge after faults stop.",
+      "kind": "EventuallyAfterQuiescence",
+      "evaluator": "ha_converged_after_quiescence",
+      "sample_probability_ppm": 1000000
+    }
+  ]
+}

@@ -1,0 +1,41 @@
+{
+  "id": "blossom-ha-kvm",
+  "acceleration": "kvm",
+  "base_image": "/var/lib/deterministic-sim/images/blossom-ubuntu.qcow2",
+  "base_image_format": "qcow2",
+  "kernel": null,
+  "initrd": null,
+  "kernel_append": [],
+  "command": {
+    "argv": [
+      "/opt/blossom/bin/blossom-deterministic-campaign",
+      "--profile",
+      "novelty",
+      "--budget-seconds",
+      "3600",
+      "--output",
+      "/var/lib/blossom-sim/report.json",
+      "--metrics-output",
+      "/var/lib/blossom-sim/metrics.prom"
+    ],
+    "environment": {
+      "BLOSSOM_SKIP_TRACE_REDUCTION": "0",
+      "RUST_BACKTRACE": "1"
+    },
+    "working_directory": "/var/lib/blossom-sim"
+  },
+  "network": {
+    "kind": "user",
+    "host_forwards": []
+  },
+  "memory_mib": 4096,
+  "vcpus": 1,
+  "deterministic_seed": 7238271256290328435,
+  "replay": {
+    "log": null,
+    "initial_snapshot": null,
+    "icount_shift": 0
+  },
+  "boot_timeout_millis": 120000,
+  "cpu_model": null
+}

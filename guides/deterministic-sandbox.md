@@ -1,9 +1,12 @@
 # Deterministic Verification Sandbox
 
-`deterministic-test-env` is a protocol-independent, deterministic
-discrete-event framework for databases, replication protocols, and production
-service components. Blossom's adapters live in `blossom-sim`; the framework
-itself does not depend on Blossom or on an external simulation service.
+Blossom uses the independent
+[`deterministic-simulation`](https://github.com/eden-dev-inc/deterministic-simulation)
+framework through a revision-pinned dependency. `deterministic-test-env` is a
+compatibility facade that re-exports the shared core API; Blossom-specific
+adapters and properties live in `blossom-sim`. This keeps the scheduler, fault
+model, trace format, and replay machinery reusable by databases and production
+services without making the framework depend on Blossom.
 
 The design applies controlled-nondeterminism and replay techniques described by
 [Antithesis deterministic simulation
@@ -16,8 +19,11 @@ These are design influences, not runtime dependencies.
 
 ## Adapter Contract
 
-An adapter implements `DeterministicNode` and converts each `NodeEvent` into
-explicit effects:
+The product-owned `blossom/protocol-v1` adapter implements the framework's
+versioned JSON-lines adapter protocol. It describes its capabilities before a
+run and rejects profiles that request unsupported execution or fault modes.
+Internally, the HA simulation implements `DeterministicNode` and converts each
+`NodeEvent` into explicit effects:
 
 - protocol and repair messages;
 - client responses;
@@ -28,6 +34,13 @@ The engine schedules one enabled event at a time. `NodeContext` supplies virtual
 microsecond time and stable, seeded choices. Protocol code used in an adapter
 must not read wall-clock time or operating-system entropy for replay-relevant
 decisions.
+
+Framework preflight audits
+`crates/blossom-sim/src/deterministic.rs`, the protocol scheduling surface.
+Durable campaigns intentionally use production redb files; the host disk
+replacement boundary is isolated in `deterministic_durable.rs` and is not
+claimed as logical exact replay. The adapter instead replays each logical trace
+internally and rejects divergent protocol state, history, or property outcomes.
 
 `ChoiceId` uses `{domain, actor, operation, occurrence}` identity. This prevents
 an unrelated earlier event from renumbering every later random choice.
@@ -58,7 +71,8 @@ idempotent retry or a later read.
 Directed links can independently drop, delay, duplicate, jam, or corrupt
 traffic, while the scheduler can reorder independently enabled deliveries.
 Nodes can pause, throttle, stop, crash, and restart. Storage operations can be
-delayed or fail with full-disk, I/O, fsync, torn-write, and corruption faults.
+delayed or fail with full-disk, I/O, fsync, torn-write, corruption, and modeled
+disk-replacement faults.
 
 A crash removes volatile adapter state. Durable protocol adapters must reopen
 their real per-node store on restart. A quiet recovery phase heals links,
@@ -95,6 +109,21 @@ OpenRaft is a harness-only active-passive control. It is not linked into
 Blossom core. Verified/trustless Blossom remains outside the new fault adapter
 and runs as an unchanged regression baseline.
 
+The framework exposes distinct execution modes and does not overstate their
+guarantees:
+
+| Mode | Use | Replay guarantee |
+| --- | --- | --- |
+| Protocol | In-process Blossom adapter with virtual time and explicit effects | Exact internal replay |
+| Native process | Linux process lifecycle and host fault validation | Seeded campaign replay |
+| KVM | Guest isolation, snapshots, process crash, network outage, and disk stall | Snapshot/restore, not instruction replay |
+| TCG record/replay | CPU and device event recording for a fixed guest run | QEMU record/replay |
+
+Disk replacement is modeled inside the protocol campaign. A destructive,
+real-root-disk replacement is intentionally not advertised by the protocol
+adapter; VM profiles use isolated guest images and explicit KVM/TCG capability
+admission.
+
 ## Running Campaigns
 
 Run the merge-sized deterministic gate:
@@ -114,6 +143,49 @@ Run the manual release soak:
 ```sh
 ./scripts/deterministic-campaign.sh --profile release --budget 12h
 ```
+
+Validate the shared framework, product adapter, Linux host, and selected
+profile before an external run:
+
+```sh
+DETERMINISTIC_SIM_ROOT=/opt/deterministic-simulation \
+  ./scripts/deterministic-framework-preflight.sh \
+  simulation/profiles/blossom-protocol-pr.json
+```
+
+Run a profile through the shared framework:
+
+```sh
+DETERMINISTIC_SIM_ROOT=/opt/deterministic-simulation \
+  ./scripts/deterministic-framework-campaign.sh pr
+```
+
+Build and exercise the isolated Blossom guest on a Linux KVM host:
+
+```sh
+./simulation/vm/build-blossom-guest.sh /opt/deterministic-simulation
+./scripts/deterministic-vm-campaign.sh \
+  /opt/deterministic-simulation kvm
+./simulation/vm/exercise-blossom-kvm.sh \
+  /opt/deterministic-simulation
+```
+
+Formal and dynamic-analysis gates are separate from schedule exploration:
+
+```sh
+BLOSSOM_FORMAL_REQUIRED_TOOLS=kani,quint ./verification/run-formal.sh
+./scripts/rust-dynamic-analysis.sh miri
+./scripts/rust-dynamic-analysis.sh asan
+./scripts/rust-dynamic-analysis.sh tsan
+```
+
+The Miri and sanitizer commands are Linux/nightly gates. Required formal tools
+fail closed instead of silently skipping; tools not named in
+`BLOSSOM_FORMAL_REQUIRED_TOOLS` remain optional for local development.
+When the framework dependency is not available through the configured Git
+credentials, set `DETERMINISTIC_SIM_ROOT=/opt/deterministic-simulation` for
+these commands as well. The launcher then patches Cargo to the exact local
+`deterministic-sim-core` and `deterministic-sim-engine` sources.
 
 Each campaign writes beneath `target/deterministic-sandbox/`. A run contains
 its report, scenarios, replay manifests, state-digest and event streams, client

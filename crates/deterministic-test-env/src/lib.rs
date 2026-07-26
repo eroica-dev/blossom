@@ -13,26 +13,14 @@
 //! no dependency on Blossom.
 
 mod chaos;
-mod deterministic;
-mod error;
 mod hermetic;
 mod profile;
 mod resources;
-mod rng;
 
 pub use chaos::{
     CHAOS_RATE_DENOMINATOR, ChaosSample, NetworkChaos, NetworkChaosConfig, NetworkChaosReport,
 };
-pub use deterministic::{
-    ChoiceId, ChoiceRecord, ClientHistoryEvent, ClientOutcome, ClusterView, DeterministicCluster,
-    DeterministicNode, Effect, EventDisposition, EventKey, ExecutionTrace, ExplorationBounds,
-    ExplorationReport, FaultCoverage, GlobalObserver, LinkFault, LinkState, NodeContext, NodeEvent,
-    NodeFault, NodeLifecycle, PropertyKind, PropertyObservation, PropertyRegistry, PropertyReport,
-    PropertyStatus, ReducedTrace, ReplayManifest, RunMode, Scenario, ScenarioAction,
-    ScenarioActionKind, SimChannel, SimEvent, SimEventKind, SimTime, StorageFault,
-    SystematicExplorer, TraceEvent, TraceReducer, event_keys_dependent,
-};
-pub use error::{Result, SimEnvError};
+pub use deterministic_sim_core::*;
 pub use hermetic::{
     HermeticActionRecord, HermeticCluster, HermeticEventLog, HermeticEventRecord, HermeticNode,
     HermeticNodeFuture, HermeticOutcome, HermeticPerfReport, HermeticPlan, HermeticRunReport,
@@ -41,4 +29,3 @@ pub use hermetic::{
 };
 pub use profile::{ClusterProfile, NodeProfile};
 pub use resources::{CpuProfile, HardwareFaultConfig, HardwareFaultKind};
-pub use rng::splitmix64;

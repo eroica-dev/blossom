@@ -1,0 +1,73 @@
+name: Formal Protocol Verification
+
+on:
+  pull_request:
+    paths:
+      - "src/algorithm.rs"
+      - "src/high_availability.rs"
+      - "verification/**"
+      - ".github/workflows/formal-linux.yml"
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+concurrency:
+  group: formal-protocol-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  kani:
+    name: Kani protocol proofs
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure deterministic-simulation access
+        uses: ./.github/actions/setup-deterministic-simulation
+        with:
+          deploy-key: ${{ secrets.DETERMINISTIC_SIM_DEPLOY_KEY }}
+
+      - uses: dtolnay/rust-toolchain@nightly
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: formal-kani
+
+      - name: Install Kani
+        run: |
+          cargo install --locked kani-verifier --version 0.67.0
+          cargo kani setup
+
+      - name: Run required Kani proofs
+        env:
+          BLOSSOM_FORMAL_REQUIRED_TOOLS: kani
+        run: ./verification/run-formal.sh
+
+  quint:
+    name: Quint threshold models
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure deterministic-simulation access
+        uses: ./.github/actions/setup-deterministic-simulation
+        with:
+          deploy-key: ${{ secrets.DETERMINISTIC_SIM_DEPLOY_KEY }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Install Quint
+        run: npm install --global @informalsystems/quint@0.32.0
+
+      - name: Run required Quint models
+        env:
+          BLOSSOM_FORMAL_REQUIRED_TOOLS: quint
+        run: ./verification/run-formal.sh

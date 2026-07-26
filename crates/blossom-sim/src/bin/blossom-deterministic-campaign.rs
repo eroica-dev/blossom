@@ -49,10 +49,11 @@ impl FromStr for ProfileArgument {
     fn from_str(value: &str) -> Result<Self, Self::Err> {
         match value {
             "pr" => Ok(Self(DeterministicCampaignProfile::Pr)),
+            "novelty" => Ok(Self(DeterministicCampaignProfile::Novelty)),
             "nightly" => Ok(Self(DeterministicCampaignProfile::Nightly)),
             "release" => Ok(Self(DeterministicCampaignProfile::Release)),
             _ => Err(format!(
-                "unsupported deterministic profile {value:?}; expected pr, nightly, or release"
+                "unsupported deterministic profile {value:?}; expected pr, novelty, nightly, or release"
             )),
         }
     }
@@ -65,6 +66,7 @@ fn main() -> Result<(), BoxError> {
         eden_logger::init(eden_logger::WriterConfig::default());
         eden_logger::init_from_env();
     }
+    #[allow(unused_mut)]
     let mut sinks = Vec::<Arc<dyn TelemetrySink>>::new();
     #[cfg(feature = "telemetry")]
     let telemetry_runtime = fast_telemetry::Runtime::new(fast_telemetry::RuntimeConfig::default());
@@ -87,7 +89,7 @@ fn main() -> Result<(), BoxError> {
     let mut iteration = 1u64;
     while !budget.is_zero() && started.elapsed() < budget {
         let novelty = run_deterministic_campaign_with_telemetry(
-            DeterministicCampaignProfile::Pr,
+            DeterministicCampaignProfile::Novelty,
             args.seed ^ iteration.wrapping_mul(0x9e37_79b9_7f4a_7c15),
             &telemetry,
         )?;

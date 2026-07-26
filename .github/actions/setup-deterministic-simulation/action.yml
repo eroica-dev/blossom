@@ -1,0 +1,22 @@
+name: Configure deterministic-simulation access
+description: Load the read-only deploy key used for the private simulation dependency.
+
+inputs:
+  deploy-key:
+    description: Read-only deterministic-simulation deploy private key.
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - name: Load deterministic-simulation deploy key
+      uses: webfactory/ssh-agent@v0.9.1
+      with:
+        ssh-private-key: ${{ inputs.deploy-key }}
+
+    - name: Route deterministic-simulation dependency over SSH
+      shell: bash
+      run: >-
+        git config --global
+        url."git@github.com:eden-dev-inc/deterministic-simulation.git".insteadOf
+        "https://github.com/eden-dev-inc/deterministic-simulation.git"

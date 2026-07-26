@@ -2,6 +2,8 @@ pub mod chaos;
 pub mod data;
 #[cfg(feature = "high-availability")]
 pub mod deterministic;
+#[cfg(feature = "high-availability")]
+mod deterministic_durable;
 pub mod epoch;
 pub mod fuzz;
 #[cfg(feature = "high-availability")]

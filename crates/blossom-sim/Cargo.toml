@@ -28,6 +28,7 @@ trusted-checkpoint-dag = ["blossom/trusted-checkpoint-dag"]
 [dependencies]
 blossom = { version = "2.0.0-pre-release", path = "../..", default-features = false }
 deterministic-test-env = { version = "2.0.0-pre-release", path = "../deterministic-test-env" }
+deterministic-sim-engine = { git = "https://github.com/eden-dev-inc/deterministic-simulation.git", rev = "bd1c4ba7eff99a5f324a5434b1a9d23444e32582" }
 clap = { version = "4.5", features = ["derive", "env"] }
 eden_logger = { version = "0.1.2", default-features = false, features = ["log-info", "log-warn", "log-error", "log-internal", "fast-telemetry-context", "sink"], optional = true }
 fast-telemetry = { version = "0.9.0", default-features = false, features = ["runtime"], optional = true }
@@ -45,3 +46,8 @@ required-features = ["high-availability"]
 name = "blossom-deterministic-campaign"
 path = "src/bin/blossom-deterministic-campaign.rs"
 required-features = ["high-availability", "trusted-checkpoint-dag"]
+
+[[bin]]
+name = "blossom-deterministic-adapter"
+path = "src/bin/blossom-deterministic-adapter.rs"
+required-features = ["parallel-networks"]

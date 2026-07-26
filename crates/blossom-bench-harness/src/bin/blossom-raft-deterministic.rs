@@ -38,13 +38,24 @@ async fn main() -> Result<(), BoxError> {
         RaftDeterministicFault::FollowerPause,
         RaftDeterministicFault::LeaderPause,
         RaftDeterministicFault::AsymmetricFollowerPartition,
+        RaftDeterministicFault::QuorumLossPartition,
+        RaftDeterministicFault::NetworkDelay,
+        RaftDeterministicFault::ResponseLossAfterCommit,
+        RaftDeterministicFault::RepeatedLeaderChurn,
         RaftDeterministicFault::DurableFollowerRestart,
+        RaftDeterministicFault::DurableLeaderRestart,
     ];
     let mut reports = Vec::new();
     for physical_nodes in 2..=7 {
         for durable in [false, true] {
             for fault in faults {
-                if !durable && fault == RaftDeterministicFault::DurableFollowerRestart {
+                if !durable
+                    && matches!(
+                        fault,
+                        RaftDeterministicFault::DurableFollowerRestart
+                            | RaftDeterministicFault::DurableLeaderRestart
+                    )
+                {
                     continue;
                 }
                 reports.push(
@@ -61,7 +72,10 @@ async fn main() -> Result<(), BoxError> {
         }
     }
     let safety_passed = reports.iter().all(|report| {
-        report.all_nodes_converged && report.linearizable_read_passed && report.history_linearizable
+        report.all_nodes_converged
+            && report.linearizable_read_passed
+            && report.history_linearizable
+            && report.ambiguous_outcomes_resolved
     });
     let artifact = Artifact {
         schema_version: 1,

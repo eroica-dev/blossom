@@ -23,8 +23,9 @@ Whitepaper: [Blossom Consensus Protocol v2](Blossom-Consensus-Protocol-v2-Whitep
   replication across 2–7 nodes.
 - Global trusted checkpoint-DAG and parallel-network APIs for coordinating
   state across independent HA groups without merging their memberships.
-- A reusable deterministic discrete-event sandbox, protocol fault adapters,
-  OpenRaft comparison harness, profiling, and telemetry observer crates.
+- A revision-pinned integration with the reusable deterministic-simulation
+  framework, product-owned protocol fault adapters, OpenRaft comparison
+  harness, profiling, and telemetry observer crates.
 
 Blossom is not a turnkey blockchain, database, wallet, public discovery network,
 or validator marketplace. Applications own their transaction bytes and domain
@@ -53,7 +54,7 @@ semantics.
 | `blossom-propagation` | Feature-gated push, inventory, and adaptive propagation policy primitives. |
 | `blossom-sim` | Deterministic Blossom simulation environment for epochs, faults, churn, reconnects, and profiling. |
 | `blossom-observer` | Telemetry collector and analyzer for multi-node stage/span health. |
-| `deterministic-test-env` | Protocol-independent deterministic scheduling, virtual time, fault injection, replay, properties, exploration, and trace reduction. |
+| `deterministic-test-env` | Compatibility facade over the pinned shared deterministic-simulation core API. |
 
 ## Release Status
 

@@ -20,6 +20,13 @@ run_step fmt cargo fmt --all -- --check
 run_step deterministic-kernel cargo test -p deterministic-test-env
 run_step deterministic-adapters \
   cargo test -p blossom-sim --features high-availability deterministic::tests
+run_step product-owned-adapter \
+  cargo test -p blossom-sim --features parallel-networks \
+  --bin blossom-deterministic-adapter
+run_step ha-application-correctness \
+  cargo test -p blossom-bench-harness ha_adapter::tests
+run_step independent-history-checker \
+  cargo test -p blossom-bench-harness correctness::tests
 run_step observability-adapters \
   cargo test -p blossom --no-default-features \
   --features observability,high-availability \
