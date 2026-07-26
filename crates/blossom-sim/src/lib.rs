@@ -16,6 +16,7 @@ pub use data::{DataPattern, DeterministicData};
 pub use deterministic::{
     DeterministicCampaignArtifact, DeterministicCampaignProfile, DeterministicCampaignReport,
     HaDeterministicConfig, HaFaultPlan, ProtocolCellReport, run_deterministic_campaign,
+    run_deterministic_campaign_with_observer, run_deterministic_campaign_with_telemetry,
     run_ha_deterministic,
 };
 pub use epoch::{

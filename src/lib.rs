@@ -194,9 +194,17 @@ pub use tcp::{
     TcpConnection, TcpMultiGroupNode, TcpNode, TcpNodeMetrics, TcpNodeMetricsSnapshot,
     send_wire_frame, send_wire_request, send_wire_request_raw_response,
 };
+#[cfg(feature = "eden-logger")]
+pub use telemetry::EdenLoggerTelemetrySink;
+#[cfg(feature = "telemetry")]
 pub use telemetry::{
-    InMemoryTelemetrySink, JsonlTcpTelemetrySink, JsonlTcpTelemetrySinkConfig, NoopTelemetrySink,
-    TELEMETRY_SCHEMA_VERSION, TelemetryEvent, TelemetryEventKind, TelemetryHandle, TelemetrySink,
+    BlossomTelemetryMetrics, BlossomTelemetryMetricsSnapshot, FastTelemetryRegistration,
+    FastTelemetrySink,
+};
+pub use telemetry::{
+    FanoutTelemetrySink, InMemoryTelemetrySink, JsonlTcpTelemetrySink, JsonlTcpTelemetrySinkConfig,
+    NoopTelemetrySink, TELEMETRY_SCHEMA_VERSION, TelemetryEvent, TelemetryEventKind,
+    TelemetryHandle, TelemetrySeverity, TelemetrySink,
 };
 #[cfg(feature = "trusted-checkpoint-dag")]
 pub use trusted_dag::{

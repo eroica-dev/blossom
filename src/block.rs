@@ -116,40 +116,46 @@ const FILTERED_TRANSACTION_SLOT_DOMAIN: &[u8] = b"blossom-filtered-transaction-s
 /// future availability-gossip machinery decide how payload bytes move.
 #[cfg(feature = "filtered-transactions")]
 #[derive(
-    Serialize, Deserialize, BorshSerialize, BorshDeserialize, Debug, Clone, Copy, PartialEq, Eq,
+    Serialize,
+    Deserialize,
+    BorshSerialize,
+    BorshDeserialize,
+    Debug,
+    Clone,
+    Copy,
+    Default,
+    PartialEq,
+    Eq,
 )]
 #[borsh(use_discriminant = true)]
 #[repr(u8)]
 pub enum FilteredDeliveryPolicy {
     Direct = 1,
+    #[default]
     Gossip = 2,
-}
-
-#[cfg(feature = "filtered-transactions")]
-impl Default for FilteredDeliveryPolicy {
-    fn default() -> Self {
-        Self::Gossip
-    }
 }
 
 /// Local materialization state for a filtered transaction.
 #[cfg(feature = "filtered-transactions")]
 #[derive(
-    Serialize, Deserialize, BorshSerialize, BorshDeserialize, Debug, Clone, Copy, PartialEq, Eq,
+    Serialize,
+    Deserialize,
+    BorshSerialize,
+    BorshDeserialize,
+    Debug,
+    Clone,
+    Copy,
+    Default,
+    PartialEq,
+    Eq,
 )]
 #[borsh(use_discriminant = true)]
 #[repr(u8)]
 pub enum FilteredPayloadView {
+    #[default]
     Transparent = 0,
     Full = 1,
     Tombstone = 2,
-}
-
-#[cfg(feature = "filtered-transactions")]
-impl Default for FilteredPayloadView {
-    fn default() -> Self {
-        Self::Transparent
-    }
 }
 
 /// Canonical metadata for a filtered transaction slot.

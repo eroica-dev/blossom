@@ -852,6 +852,35 @@ impl NodeRuntime {
         self.inner.telemetry.record(telemetry);
     }
 
+    /// Returns the configured event pipeline so embedding services can attach
+    /// application events to the same metrics, spans, and structured logs.
+    pub fn telemetry(&self) -> TelemetryHandle {
+        self.inner.telemetry.clone()
+    }
+
+    /// Emits a structured failure without changing protocol behavior or
+    /// applying a trusted-network recovery policy.
+    pub fn emit_telemetry_failure(
+        &self,
+        stage: impl Into<String>,
+        event: impl Into<String>,
+        error: &BlossomError,
+        target: Option<&EpochTarget>,
+    ) {
+        let mut telemetry =
+            TelemetryEvent::new(crate::telemetry::TelemetryEventKind::Event, stage, event)
+                .with_node(self.self_node().public_key())
+                .with_group_id(self.inner.group_id)
+                .with_outcome("error")
+                .with_error(error.to_string());
+        if let Some(target) = target {
+            telemetry = telemetry.with_target(target.last_epoch, target.nonce);
+        }
+        self.inner
+            .telemetry
+            .record(self.with_quorum_telemetry(telemetry));
+    }
+
     pub fn status(&self) -> Result<NodeStatus> {
         let state = self.inner.state.read().expect("state lock poisoned");
         let epoch = state
@@ -978,7 +1007,7 @@ impl NodeRuntime {
                 vec![TrustedServiceDirective::Continue],
             )
         };
-        Ok(TrustedOperationalStatus {
+        let status = TrustedOperationalStatus {
             health,
             durable,
             head_nonce,
@@ -993,7 +1022,13 @@ impl NodeRuntime {
             observed_matching_confirmations,
             accepts_writes: durable_matches_memory && health != TrustedServiceHealth::Unavailable,
             directives,
-        })
+        };
+        self.inner.telemetry.record_trusted_operational_status(
+            self.self_node().public_key(),
+            self.inner.group_id,
+            &status,
+        );
+        Ok(status)
     }
 
     pub fn assess_trusted_failure(&self, error: &BlossomError) -> Result<TrustedFailureAssessment> {
@@ -1002,7 +1037,14 @@ impl NodeRuntime {
                 "trusted failure assessment is only available in trusted mode".to_string(),
             ));
         }
-        Ok(assess_trusted_durability_failure(error))
+        let assessment = assess_trusted_durability_failure(error);
+        self.inner.telemetry.record_trusted_failure(
+            self.self_node().public_key(),
+            self.inner.group_id,
+            error,
+            &assessment,
+        );
+        Ok(assessment)
     }
 
     pub fn consensus_round_status(&self, round: u8) -> Result<ConsensusRoundStatus> {

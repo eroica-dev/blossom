@@ -30,6 +30,7 @@ semantics.
 - [Protocol Overview](guides/protocol-overview.md)
 - [Feature Flags](guides/feature-flags.md)
 - [Operations](guides/operations.md)
+- [Observability](guides/observability.md)
 - [Testing And Validation](guides/testing-and-validation.md)
 - [Direct Active-Active Integration](guides/active-active-integration.md)
 - [Trusted Network Durability and Recovery](guides/trusted-network-durability.md)

@@ -34,6 +34,12 @@ Important requests include `Health`, `Ping`, `State`, `EpochChain`,
 reconnect events, block-flow metrics, and errors. `blossom-observer` collects
 JSONL telemetry and analyzes distributed health across nodes.
 
+Production services can enable the `observability` feature to fan the same
+events into bounded `fast-telemetry` metrics/spans and structured
+`eden-logger` records. The service owns exporter and global logger
+initialization. See [Observability](observability.md) for setup and signal
+coverage.
+
 ## Production Notes
 
 Before public trustless deployment, operators should add deployment-specific key

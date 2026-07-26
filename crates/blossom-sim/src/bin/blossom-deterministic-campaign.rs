@@ -1,10 +1,17 @@
 use std::fs;
 use std::path::PathBuf;
 use std::str::FromStr;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+#[cfg(feature = "eden-logger")]
+use blossom::EdenLoggerTelemetrySink;
+#[cfg(feature = "telemetry")]
+use blossom::FastTelemetryRegistration;
+use blossom::{FanoutTelemetrySink, TelemetryHandle, TelemetrySink};
 use blossom_sim::{
-    DeterministicCampaignArtifact, DeterministicCampaignProfile, run_deterministic_campaign,
+    DeterministicCampaignArtifact, DeterministicCampaignProfile,
+    run_deterministic_campaign_with_telemetry,
 };
 use clap::Parser;
 
@@ -28,6 +35,9 @@ struct Args {
         default_value = "target/deterministic-sandbox/latest/report.json"
     )]
     output: PathBuf,
+    /// Optional Prometheus artifact for the feature-gated Fast Telemetry sink.
+    #[arg(long)]
+    metrics_output: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -50,14 +60,36 @@ impl FromStr for ProfileArgument {
 
 fn main() -> Result<(), BoxError> {
     let args = Args::parse();
+    #[cfg(feature = "eden-logger")]
+    {
+        eden_logger::init(eden_logger::WriterConfig::default());
+        eden_logger::init_from_env();
+    }
+    let mut sinks = Vec::<Arc<dyn TelemetrySink>>::new();
+    #[cfg(feature = "telemetry")]
+    let telemetry_runtime = fast_telemetry::Runtime::new(fast_telemetry::RuntimeConfig::default());
+    #[cfg(feature = "telemetry")]
+    let telemetry_registration = FastTelemetryRegistration::register(&telemetry_runtime);
+    #[cfg(feature = "telemetry")]
+    sinks.push(telemetry_registration.sink());
+    #[cfg(feature = "eden-logger")]
+    sinks.push(Arc::new(EdenLoggerTelemetrySink::new()));
+    let telemetry = if sinks.is_empty() {
+        TelemetryHandle::default()
+    } else {
+        TelemetryHandle::new(Arc::new(FanoutTelemetrySink::new(sinks)))
+    };
+
     let started = Instant::now();
-    let mut report = run_deterministic_campaign(args.profile.0, args.seed)?;
+    let mut report =
+        run_deterministic_campaign_with_telemetry(args.profile.0, args.seed, &telemetry)?;
     let budget = Duration::from_secs(args.budget_seconds);
     let mut iteration = 1u64;
     while !budget.is_zero() && started.elapsed() < budget {
-        let novelty = run_deterministic_campaign(
+        let novelty = run_deterministic_campaign_with_telemetry(
             DeterministicCampaignProfile::Pr,
             args.seed ^ iteration.wrapping_mul(0x9e37_79b9_7f4a_7c15),
+            &telemetry,
         )?;
         report.total_events = report.total_events.saturating_add(novelty.total_events);
         report.total_schedules = report
@@ -92,6 +124,17 @@ fn main() -> Result<(), BoxError> {
         cell.trace = None;
     }
     fs::write(&args.output, serde_json::to_vec_pretty(&summary)?)?;
+    #[cfg(feature = "telemetry")]
+    {
+        telemetry_runtime.flush_local_spans();
+        let metrics_output = args
+            .metrics_output
+            .unwrap_or_else(|| output_dir.join("metrics.prom"));
+        if let Some(parent) = metrics_output.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::write(metrics_output, telemetry_registration.prometheus())?;
+    }
     println!("{}", args.output.display());
     if !artifact.report.safety_passed {
         return Err("deterministic campaign failed one or more safety cells".into());

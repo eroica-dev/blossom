@@ -103,6 +103,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "arc-swap"
+version = "1.9.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c049c0be4daef0b145cb3555416b3b8ef5b7888a38aea1a3a155801fe7b0810b"
+dependencies = [
+ "rustversion",
+]
+
+[[package]]
 name = "arrayvec"
 version = "0.7.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -163,6 +172,7 @@ dependencies = [
  "clap",
  "criterion",
  "ed25519-dalek",
+ "eden_logger",
  "env_logger",
  "fast-telemetry",
  "hegeltest",
@@ -218,6 +228,8 @@ dependencies = [
  "blossom",
  "clap",
  "deterministic-test-env",
+ "eden_logger",
+ "fast-telemetry",
  "serde",
  "serde_json",
  "tempfile",
@@ -367,6 +379,7 @@ dependencies = [
  "iana-time-zone",
  "js-sys",
  "num-traits",
+ "serde",
  "wasm-bindgen",
  "windows-link",
 ]
@@ -719,6 +732,33 @@ dependencies = [
 ]
 
 [[package]]
+name = "eden_logger"
+version = "0.1.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ef091067d9ee37303bb8b55e96dab3e69dc78694057cb643981c2f7c76d028bc"
+dependencies = [
+ "arc-swap",
+ "chrono",
+ "eden_logger_macros",
+ "fast-telemetry",
+ "itoa",
+ "log",
+ "smol_str",
+ "ufmt",
+]
+
+[[package]]
+name = "eden_logger_macros"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ad9095cd0354d98fa6d6ac1496db4fffbddbed231834b951a29433e0e4d766d4"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
+]
+
+[[package]]
 name = "either"
 version = "1.17.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -765,15 +805,27 @@ dependencies = [
 
 [[package]]
 name = "fast-telemetry"
-version = "0.5.1"
+version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7b2f5a88d02b561c27f4cb1ad2087c26c3afd88b35b751bd99dfd792a6868daa"
+checksum = "1a7e9cf7b3faad0a699cce0c23456bc3257f1630be02357057fca68be56d0719"
 dependencies = [
  "crossbeam-utils",
+ "fast-telemetry-macros",
  "itoa",
  "parking_lot",
  "ryu",
  "uuid",
+]
+
+[[package]]
+name = "fast-telemetry-macros"
+version = "0.9.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7aeacbd5a6da5ab7f7b716fe4297e2b577747ecf0d9a9c24e160050b2d8f5629"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
 ]
 
 [[package]]
@@ -1836,6 +1888,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8ed6a63f02c8539c91a8685a86f4099661ba3da017932f6ebbea6de3f0fa7c90"
 
 [[package]]
+name = "smol_str"
+version = "0.3.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4aaa7368fcf4852a4c2dd92df0cace6a71f2091ca0a23391ce7f3a31833f1523"
+dependencies = [
+ "borsh",
+ "serde_core",
+]
+
+[[package]]
 name = "socket2"
 version = "0.6.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2123,6 +2185,33 @@ name = "typenum"
 version = "1.20.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b6f5e870be6c3b371b77fe0ee0bafb859fa4964b4404c27de1d380043c4dda20"
+
+[[package]]
+name = "ufmt"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1a64846ec02b57e9108d6469d98d1648782ad6bb150a95a9baac26900bbeab9d"
+dependencies = [
+ "ufmt-macros",
+ "ufmt-write",
+]
+
+[[package]]
+name = "ufmt-macros"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d337d3be617449165cb4633c8dece429afd83f84051024079f97ad32a9663716"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 1.0.109",
+]
+
+[[package]]
+name = "ufmt-write"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e87a2ed6b42ec5e28cc3b94c09982969e9227600b2e3dcbc1db927a84c06bd69"
 
 [[package]]
 name = "unicode-ident"

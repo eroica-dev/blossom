@@ -65,6 +65,11 @@ struct Args {
 #[tokio::main]
 async fn main() -> MainResult<()> {
     let args = Args::parse();
+    #[cfg(feature = "eden-logger")]
+    {
+        eden_logger::init(eden_logger::WriterConfig::default());
+        eden_logger::init_from_env();
+    }
     let self_node = identity_from_args(&args)?;
     let loaded_snapshot = match args.state_snapshot.as_ref() {
         Some(path) if path.exists() => Some(RuntimeSnapshotV1::read_json(path)?),
@@ -106,11 +111,26 @@ async fn main() -> MainResult<()> {
             }
         }
     }
+    let mut telemetry_sinks = Vec::<Arc<dyn blossom::TelemetrySink>>::new();
+    #[cfg(feature = "telemetry")]
+    let fast_telemetry_runtime =
+        fast_telemetry::Runtime::new(fast_telemetry::RuntimeConfig::default());
+    #[cfg(feature = "telemetry")]
+    let fast_telemetry_registration =
+        blossom::FastTelemetryRegistration::register(&fast_telemetry_runtime);
+    #[cfg(feature = "telemetry")]
+    telemetry_sinks.push(fast_telemetry_registration.sink());
+    #[cfg(feature = "eden-logger")]
+    telemetry_sinks.push(Arc::new(blossom::EdenLoggerTelemetrySink::new()));
     if let Some(addr) = args.observer_addr.as_ref() {
+        telemetry_sinks.push(Arc::new(blossom::JsonlTcpTelemetrySink::connect(addr)?));
+    }
+    if !telemetry_sinks.is_empty() {
         config.telemetry =
-            TelemetryHandle::new(Arc::new(blossom::JsonlTcpTelemetrySink::connect(addr)?));
+            TelemetryHandle::new(Arc::new(blossom::FanoutTelemetrySink::new(telemetry_sinks)));
     }
     let runtime = NodeRuntime::try_new(config)?;
+    runtime.emit_telemetry_event("service", "node_started", None);
 
     for spec in &args.service {
         let service = parse_service_spec(spec, &args.protocol)

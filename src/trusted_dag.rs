@@ -1231,7 +1231,7 @@ pub fn run_sequential_quorum_dag_experiment(
     let reduce_started = Instant::now();
     let mut candidate_vertex_occurrences = 0u128;
     let mut max_candidate_vertices = 0usize;
-    for round in 0..sequential_rounds {
+    for (round, _) in topologies[0].iter().enumerate() {
         let mut next = vec![vec![0u64; words]; node_count];
         for node in 0..node_count {
             for peer in &topologies[node][round] {

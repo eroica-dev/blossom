@@ -6,8 +6,9 @@ use std::sync::Arc;
 
 use blossom::{
     ConsensusGroupId, HaMessage, HaReplicationMode, HashType, HighAvailabilityParameters,
-    HighAvailabilityRuntime, Keypair, NodeIdentity, Nonce, SecKey, Transaction, TrustMode,
-    high_availability_majority, supermajority_count,
+    HighAvailabilityRuntime, Keypair, NodeIdentity, Nonce, SecKey, TelemetryEvent,
+    TelemetryEventKind, TelemetryHandle, Transaction, TrustMode, high_availability_majority,
+    supermajority_count,
 };
 #[cfg(feature = "parallel-networks")]
 use blossom::{
@@ -1221,6 +1222,44 @@ pub fn run_deterministic_campaign(
     profile: DeterministicCampaignProfile,
     seed: u64,
 ) -> Result<DeterministicCampaignReport, BoxError> {
+    run_deterministic_campaign_with_observer(profile, seed, |_| {})
+}
+
+pub fn run_deterministic_campaign_with_telemetry(
+    profile: DeterministicCampaignProfile,
+    seed: u64,
+    telemetry: &TelemetryHandle,
+) -> Result<DeterministicCampaignReport, BoxError> {
+    telemetry.record(
+        TelemetryEvent::new(TelemetryEventKind::Event, "simulation", "campaign_started")
+            .with_outcome("ok")
+            .with_field("profile", profile.as_str())
+            .with_field("seed", seed.to_string()),
+    );
+    let report = run_deterministic_campaign_with_observer(profile, seed, |cell| {
+        telemetry.record(protocol_cell_telemetry(cell));
+    })?;
+    telemetry.record(
+        TelemetryEvent::new(
+            TelemetryEventKind::Event,
+            "simulation",
+            "campaign_completed",
+        )
+        .with_outcome(if report.safety_passed { "ok" } else { "failed" })
+        .with_field("profile", profile.as_str())
+        .with_field("seed", seed.to_string())
+        .with_field("cells", report.cells.len().to_string())
+        .with_field("events", report.total_events.to_string())
+        .with_field("schedules", report.total_schedules.to_string()),
+    );
+    Ok(report)
+}
+
+pub fn run_deterministic_campaign_with_observer(
+    profile: DeterministicCampaignProfile,
+    seed: u64,
+    mut observer: impl FnMut(&ProtocolCellReport),
+) -> Result<DeterministicCampaignReport, BoxError> {
     let (epochs, schedules, include_durable, fault_depth, faults): (
         usize,
         usize,
@@ -1292,7 +1331,7 @@ pub fn run_deterministic_campaign(
                 }
                 let systematic =
                     schedules > 1 && !durable && *fault_plan == HaFaultPlan::AsymmetricPartition;
-                cells.push(run_ha_deterministic(HaDeterministicConfig {
+                let cell = run_ha_deterministic(HaDeterministicConfig {
                     nodes,
                     epochs: if systematic { 2 } else { epochs },
                     seed: seed ^ nodes as u64 ^ ((*fault_plan as u64) << 32),
@@ -1305,7 +1344,9 @@ pub fn run_deterministic_campaign(
                     } else {
                         epochs.saturating_mul(nodes).saturating_mul(64).max(10_000)
                     },
-                })?);
+                })?;
+                observer(&cell);
+                cells.push(cell);
             }
         }
     }
@@ -1347,7 +1388,7 @@ pub fn run_deterministic_campaign(
             && report.final_incorrect_nodes == 0
             && report.incorrectly_lost_local_blocks == 0
             && replay_passed;
-        cells.push(ProtocolCellReport {
+        let cell = ProtocolCellReport {
             protocol: "blossom-trusted-global".to_string(),
             topology: format!("{nodes}-node-q6-model"),
             epochs: trusted_epochs,
@@ -1371,7 +1412,9 @@ pub fn run_deterministic_campaign(
             replay_manifest: None,
             minimized: None,
             trace: None,
-        });
+        };
+        observer(&cell);
+        cells.push(cell);
     }
     #[cfg(feature = "trusted-checkpoint-dag")]
     {
@@ -1410,7 +1453,7 @@ pub fn run_deterministic_campaign(
                 && first.finalized_vertex_count == *nodes
                 && first_chain.checkpoints == dag_epochs
                 && replay_passed;
-            cells.push(ProtocolCellReport {
+            let cell = ProtocolCellReport {
                 protocol: "blossom-trusted-checkpoint-dag".to_string(),
                 topology: format!("{nodes}-node-q{quorum}-model-core"),
                 epochs: dag_epochs,
@@ -1433,7 +1476,9 @@ pub fn run_deterministic_campaign(
                 replay_manifest: None,
                 minimized: None,
                 trace: None,
-            });
+            };
+            observer(&cell);
+            cells.push(cell);
         }
     }
     #[cfg(feature = "parallel-networks")]
@@ -1463,7 +1508,7 @@ pub fn run_deterministic_campaign(
                     run_parallel_network_cell(ha_nodes, *global_nodes, parallel_epochs, seed)?;
                 let replay_passed = first == replay;
                 let safety_passed = first.safety_passed && replay_passed;
-                cells.push(ProtocolCellReport {
+                let cell = ProtocolCellReport {
                     protocol: "blossom-parallel-ha-global".to_string(),
                     topology: format!("ha-{ha_nodes}-global-{global_nodes}-q6"),
                     epochs: first.ha_epochs,
@@ -1482,7 +1527,9 @@ pub fn run_deterministic_campaign(
                     replay_manifest: None,
                     minimized: None,
                     trace: None,
-                });
+                };
+                observer(&cell);
+                cells.push(cell);
             }
         }
     }
@@ -1498,6 +1545,32 @@ pub fn run_deterministic_campaign(
         total_schedules,
         safety_passed,
     })
+}
+
+fn protocol_cell_telemetry(cell: &ProtocolCellReport) -> TelemetryEvent {
+    let mut event = TelemetryEvent::new(
+        TelemetryEventKind::Event,
+        "simulation",
+        "protocol_cell_completed",
+    )
+    .with_outcome(if cell.safety_passed && cell.replay_passed {
+        "ok"
+    } else {
+        "failed"
+    })
+    .with_field("protocol", cell.protocol.clone())
+    .with_field("topology", cell.topology.clone())
+    .with_field("epochs", cell.epochs.to_string())
+    .with_field("schedules", cell.schedules.to_string())
+    .with_field("unique_states", cell.unique_states.to_string())
+    .with_field("events", cell.events.to_string())
+    .with_field("safety_passed", cell.safety_passed.to_string())
+    .with_field("replay_passed", cell.replay_passed.to_string())
+    .with_field("final_state_digest", cell.final_state_digest.clone());
+    if !cell.property_failures.is_empty() {
+        event = event.with_field("property_failures", cell.property_failures.join(" | "));
+    }
+    event
 }
 
 #[cfg(feature = "trusted-checkpoint-dag")]

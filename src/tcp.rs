@@ -164,6 +164,12 @@ impl TcpNode {
             }
             tokio::spawn(async move {
                 if let Err(err) = node.handle_connection(stream).await {
+                    node.runtime.emit_telemetry_failure(
+                        "transport",
+                        "connection_failed",
+                        &err,
+                        None,
+                    );
                     log::error!("connection failed: {err}");
                 }
             });
@@ -213,6 +219,12 @@ impl TcpNode {
             }
             if let Err(error) = self.drive_consensus_once(&config).await {
                 if config.continue_after_error {
+                    self.runtime.emit_telemetry_failure(
+                        "service",
+                        "consensus_driver_retry",
+                        &error,
+                        None,
+                    );
                     log::warn!("consensus driver tick failed and will be retried: {error}");
                 } else {
                     return Err(error);
@@ -630,6 +642,12 @@ impl TcpMultiGroupNode {
             let node = self.clone();
             tokio::spawn(async move {
                 if let Err(err) = node.handle_connection(stream).await {
+                    node.runtime.root_runtime().emit_telemetry_failure(
+                        "transport",
+                        "multi_group_connection_failed",
+                        &err,
+                        None,
+                    );
                     log::error!("connection failed: {err}");
                 }
             });

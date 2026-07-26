@@ -128,20 +128,21 @@ pub enum LinkFault {
     Corrupt { xor: u8 },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum LinkState {
+    #[default]
     Up,
     Drop,
-    Delay { micros: u64 },
-    Duplicate { copies: u8 },
+    Delay {
+        micros: u64,
+    },
+    Duplicate {
+        copies: u8,
+    },
     Jam,
-    Corrupt { xor: u8 },
-}
-
-impl Default for LinkState {
-    fn default() -> Self {
-        Self::Up
-    }
+    Corrupt {
+        xor: u8,
+    },
 }
 
 impl From<LinkFault> for LinkState {
@@ -166,21 +167,22 @@ pub enum NodeFault {
     Restart,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum StorageFault {
+    #[default]
     Healthy,
-    Delay { micros: u64 },
+    Delay {
+        micros: u64,
+    },
     Full,
     Io,
     Fsync,
-    TornWrite { keep_bytes: usize },
-    Corrupt { xor: u8 },
-}
-
-impl Default for StorageFault {
-    fn default() -> Self {
-        Self::Healthy
-    }
+    TornWrite {
+        keep_bytes: usize,
+    },
+    Corrupt {
+        xor: u8,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

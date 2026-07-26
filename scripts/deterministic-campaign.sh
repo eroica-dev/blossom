@@ -64,12 +64,13 @@ run_step all-hegel \
   --test hegel_trusted_network
 
 run_step deterministic-campaign \
-  cargo run --release -p blossom-sim --features parallel-networks \
+  cargo run --release -p blossom-sim --features parallel-networks,observability \
   --bin blossom-deterministic-campaign -- \
   --profile "$PROFILE" \
   --seed "$SEED" \
   --budget-seconds "$BUDGET_SECONDS" \
-  --output "$RUN_DIR/report.json"
+  --output "$RUN_DIR/report.json" \
+  --metrics-output "$RUN_DIR/metrics.prom"
 
 case "$PROFILE" in
   pr) OPENRAFT_COMMANDS=50 ;;

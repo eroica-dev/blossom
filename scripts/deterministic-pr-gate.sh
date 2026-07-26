@@ -20,6 +20,11 @@ run_step fmt cargo fmt --all -- --check
 run_step deterministic-kernel cargo test -p deterministic-test-env
 run_step deterministic-adapters \
   cargo test -p blossom-sim --features high-availability deterministic::tests
+run_step observability-adapters \
+  cargo test -p blossom --no-default-features \
+  --features observability,high-availability \
+  telemetry::tests -- \
+  --skip telemetry::tests::jsonl_tcp_sink_batches_and_flushes_on_drop
 run_step all-hegel \
   cargo test -p blossom --all-features \
   --test hegel_active_active \
@@ -40,9 +45,10 @@ run_step openraft-deterministic-control \
   --commands 50 \
   --output "$OUT_DIR/openraft-report.json"
 run_step deterministic-pr-campaign \
-  cargo run --release -p blossom-sim --features parallel-networks \
+  cargo run --release -p blossom-sim --features parallel-networks,observability \
   --bin blossom-deterministic-campaign -- \
   --profile pr \
-  --output "$OUT_DIR/report.json"
+  --output "$OUT_DIR/report.json" \
+  --metrics-output "$OUT_DIR/metrics.prom"
 
 printf 'deterministic PR artifacts: %s\n' "$OUT_DIR"

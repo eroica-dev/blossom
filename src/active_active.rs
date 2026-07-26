@@ -19,6 +19,7 @@ use crate::hash::HashType;
 use crate::runtime::TrustMode;
 use crate::safety::SiteId;
 use crate::state::Epoch;
+use crate::telemetry::{TelemetryEvent, TelemetryEventKind, TelemetryHandle};
 
 const COMMAND_HASH_DOMAIN: &[u8] = b"blossom/active-active/command/v1";
 const REFERENCE_HASH_DOMAIN: &[u8] = b"blossom/active-active/batch-reference/v1";
@@ -1738,6 +1739,7 @@ pub struct GlobalOrderedEngine {
     last_order_certificate_hash: HashType,
     applied_watermark: Watermark,
     state_machine: SharedStateMachine,
+    telemetry: TelemetryHandle,
 }
 
 impl GlobalOrderedEngine {
@@ -1805,6 +1807,7 @@ impl GlobalOrderedEngine {
             last_order_certificate_hash: HashType::default(),
             applied_watermark,
             state_machine,
+            telemetry: TelemetryHandle::default(),
         };
         if let Some(state) = loaded_ordered {
             engine.validate_durable_state(&state)?;
@@ -1822,6 +1825,19 @@ impl GlobalOrderedEngine {
         Ok(engine)
     }
 
+    pub fn with_telemetry(mut self, telemetry: TelemetryHandle) -> Self {
+        self.telemetry = telemetry;
+        self
+    }
+
+    pub fn set_telemetry(&mut self, telemetry: TelemetryHandle) {
+        self.telemetry = telemetry;
+    }
+
+    pub fn telemetry(&self) -> &TelemetryHandle {
+        &self.telemetry
+    }
+
     pub fn accept_local(&self, certificate: &LocalAdmissionCertificate) -> Result<MilestoneEvent> {
         certificate.verify()?;
         let event = milestone_event(
@@ -1831,6 +1847,7 @@ impl GlobalOrderedEngine {
             None,
         );
         self.store.record_milestone(&event)?;
+        self.telemetry.record_milestone(&event);
         Ok(event)
     }
 
@@ -1846,24 +1863,18 @@ impl GlobalOrderedEngine {
         }
         let reference_hash = certificate.reference.hash()?;
         if self.available.contains_key(&reference_hash) {
-            return Ok(milestone_event(
-                self.mode,
-                reference_hash,
-                Milestone::Available,
-                None,
-            ));
+            let event = milestone_event(self.mode, reference_hash, Milestone::Available, None);
+            self.telemetry.record_milestone(&event);
+            return Ok(event);
         }
         if self
             .final_reference_by_position
             .values()
             .any(|existing| *existing == reference_hash)
         {
-            return Ok(milestone_event(
-                self.mode,
-                reference_hash,
-                Milestone::Available,
-                None,
-            ));
+            let event = milestone_event(self.mode, reference_hash, Milestone::Available, None);
+            self.telemetry.record_milestone(&event);
+            return Ok(event);
         }
         let max_pending_references = MAX_PIPELINED_AVAILABILITY_WINDOWS
             .checked_mul(self.validators.len())
@@ -1912,6 +1923,7 @@ impl GlobalOrderedEngine {
         self.store
             .persist_ordered_state(&self.state_machine, &durable, Some(&event))?;
         self.install_durable_state(durable);
+        self.telemetry.record_milestone(&event);
         Ok(event)
     }
 
@@ -2044,6 +2056,9 @@ impl GlobalOrderedEngine {
                     Some(certificate.statement.position),
                 ));
             }
+            for event in &events {
+                self.telemetry.record_milestone(event);
+            }
             return Ok(events);
         }
 
@@ -2087,6 +2102,9 @@ impl GlobalOrderedEngine {
         self.store
             .persist_ordered_state_with_milestones(&self.state_machine, &durable, &events)?;
         self.install_durable_state(durable);
+        for event in &events {
+            self.telemetry.record_milestone(event);
+        }
         Ok(events)
     }
 
@@ -2184,12 +2202,14 @@ impl GlobalOrderedEngine {
         let statement = &certificate.statement;
         if let Some(existing) = self.finalized.get(&statement.position.position) {
             if existing.statement == certificate.statement {
-                return Ok(milestone_event(
+                let event = milestone_event(
                     self.mode,
                     statement.reference_hash,
                     Milestone::Finalized,
                     Some(statement.position),
-                ));
+                );
+                self.telemetry.record_milestone(&event);
+                return Ok(event);
             }
             return Err(BlossomError::InvalidConfiguration(
                 "two certificates assign different contents to one order position".to_string(),
@@ -2251,6 +2271,7 @@ impl GlobalOrderedEngine {
         self.store
             .persist_ordered_state(&self.state_machine, &durable, Some(&event))?;
         self.install_durable_state(durable);
+        self.telemetry.record_milestone(&event);
         Ok(event)
     }
 
@@ -2275,6 +2296,16 @@ impl GlobalOrderedEngine {
             .get(&reference_hash)
             .expect("finality requires availability certificate");
         let Some(batch) = self.store.load_batch(&availability.reference)? else {
+            self.telemetry.record(
+                TelemetryEvent::new(
+                    TelemetryEventKind::Event,
+                    "apply",
+                    "head_of_line_unavailable",
+                )
+                .with_outcome("blocked")
+                .with_field("watermark", self.applied_watermark.position.to_string())
+                .with_field("blocked_reference", reference_hash.to_string()),
+            );
             return Ok(ApplyProgress::HeadOfLineUnavailable {
                 watermark: self.applied_watermark,
                 blocked_reference: reference_hash,
@@ -2311,6 +2342,7 @@ impl GlobalOrderedEngine {
             .persist_ordered_state(&staged_machine, &durable, Some(&event))?;
         self.state_machine = staged_machine;
         self.install_durable_state(durable);
+        self.telemetry.record_milestone(&event);
         Ok(ApplyProgress::Applied {
             watermark: self.applied_watermark,
             results,

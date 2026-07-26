@@ -31,6 +31,7 @@ use crate::group::ConsensusGroupId;
 use crate::hash::{HashType, ProtocolHasher};
 use crate::node::NodeIdentity;
 use crate::nonce::Nonce;
+use crate::telemetry::{TelemetryEvent, TelemetryEventKind, TelemetryHandle};
 use crate::wire::{read_frame, read_frame_optional, write_frame};
 
 const HA_RUNTIME_STATE_TABLE: TableDefinition<u8, &[u8]> =
@@ -3181,6 +3182,11 @@ impl HighAvailabilityTcpNode {
             let node = self.clone();
             tokio::spawn(async move {
                 if let Err(error) = node.handle_connection(stream).await {
+                    node.runtime.lock().await.emit_telemetry_failure(
+                        "transport",
+                        "ha_connection_failed",
+                        &error,
+                    );
                     log::error!("HA connection failed: {error}");
                 }
             });
@@ -3416,6 +3422,7 @@ fn ha_message_sender(message: &HaMessage, members: &HaMemberSlots) -> Result<Pub
 pub struct HighAvailabilityRuntime {
     store: Option<HaDurableStore>,
     state: HighAvailabilityRuntimeState,
+    telemetry: TelemetryHandle,
 }
 
 impl HighAvailabilityRuntime {
@@ -3464,6 +3471,7 @@ impl HighAvailabilityRuntime {
             return Ok(Self {
                 store: Some(store),
                 state,
+                telemetry: TelemetryHandle::default(),
             });
         }
         Self::create(Some(store), group_id, self_key, members, parameters)
@@ -3508,9 +3516,96 @@ impl HighAvailabilityRuntime {
             amendments: Vec::new(),
         };
         state.validate()?;
-        let runtime = Self { store, state };
+        let runtime = Self {
+            store,
+            state,
+            telemetry: TelemetryHandle::default(),
+        };
         runtime.persist()?;
         Ok(runtime)
+    }
+
+    pub fn with_telemetry(mut self, telemetry: TelemetryHandle) -> Self {
+        self.telemetry = telemetry;
+        self.record_operational_status();
+        self
+    }
+
+    pub fn set_telemetry(&mut self, telemetry: TelemetryHandle) {
+        self.telemetry = telemetry;
+        self.record_operational_status();
+    }
+
+    pub fn telemetry(&self) -> &TelemetryHandle {
+        &self.telemetry
+    }
+
+    /// Emits an HA-scoped structured failure without applying a recovery
+    /// policy. Services may use this for transport and dependency failures.
+    pub fn emit_telemetry_failure(
+        &self,
+        stage: impl Into<String>,
+        event: impl Into<String>,
+        error: &BlossomError,
+    ) {
+        self.telemetry.record(
+            self.telemetry_event(stage, event)
+                .with_outcome("error")
+                .with_error(error.to_string()),
+        );
+    }
+
+    fn self_public_key(&self) -> PubKey {
+        self.state
+            .members
+            .member(self.state.self_slot)
+            .expect("validated HA self slot")
+            .public_key()
+    }
+
+    fn telemetry_event(
+        &self,
+        stage: impl Into<String>,
+        event: impl Into<String>,
+    ) -> TelemetryEvent {
+        TelemetryEvent::new(TelemetryEventKind::Event, stage, event)
+            .with_node(self.self_public_key())
+            .with_group_id(self.state.group_id)
+            .with_target(self.head().hash, self.head().nonce)
+            .with_round(self.state.round.round_id.round)
+            .with_field("self_slot", self.state.self_slot.0.to_string())
+            .with_field(
+                "membership_generation",
+                self.state.membership_generation.to_string(),
+            )
+            .with_field("active_mask", self.state.members.active_mask().to_string())
+            .with_field("parameters_hash", self.state.parameters.hash().to_string())
+    }
+
+    fn record_operational_status(&self) {
+        let Ok(status) = self.status() else {
+            return;
+        };
+        self.telemetry.record_ha_operational_status(
+            self.self_public_key(),
+            self.state.group_id,
+            status.head_hash,
+            status.head_nonce,
+            &status.operational_status(),
+        );
+    }
+
+    pub fn assess_failure(&self, error: &BlossomError) -> HaFailureAssessment {
+        let assessment = assess_high_availability_failure(error);
+        self.telemetry.record(
+            self.telemetry_event("service", "ha_failure")
+                .with_outcome("error")
+                .with_error(error.to_string())
+                .with_field("class", format!("{:?}", assessment.class))
+                .with_field("retry_in_process", assessment.retry_in_process.to_string())
+                .with_field("directives", format!("{:?}", assessment.directives)),
+        );
+        assessment
     }
 
     pub fn parameters(&self) -> HighAvailabilityParameters {
@@ -3638,7 +3733,15 @@ impl HighAvailabilityRuntime {
     }
 
     pub fn operational_status(&self) -> Result<HaOperationalStatus> {
-        Ok(self.status()?.operational_status())
+        let status = self.status()?.operational_status();
+        self.telemetry.record_ha_operational_status(
+            self.self_public_key(),
+            self.state.group_id,
+            self.head().hash,
+            self.head().nonce,
+            &status,
+        );
+        Ok(status)
     }
 
     pub const fn replication_mode(&self) -> HaReplicationMode {
@@ -3760,7 +3863,15 @@ impl HighAvailabilityRuntime {
             store.persist(&replacement)?;
         }
         self.state = replacement;
-        self.revision()
+        let revision = self.revision()?;
+        self.telemetry.record(
+            self.telemetry_event("recovery", "snapshot_installed")
+                .with_outcome("ok")
+                .with_field("revision_hash", revision.revision_hash.to_string())
+                .with_field("sealed_watermark", revision.sealed.position.to_string()),
+        );
+        self.record_operational_status();
+        Ok(revision)
     }
 
     pub fn build_dispatch(
@@ -3811,6 +3922,19 @@ impl HighAvailabilityRuntime {
         self.state
             .round
             .receive_dispatch(&self.state.members, dispatch.clone())?;
+        self.telemetry.record(
+            self.telemetry_event("dispatch", "dispatch_built")
+                .with_outcome("ok")
+                .with_field("slot", dispatch.sender.0.to_string())
+                .with_field("block_hash", dispatch.block_hash.to_string())
+                .with_field("transactions", dispatch.block.body.txs.len().to_string())
+                .with_field(
+                    "bytes",
+                    borsh::object_length(&dispatch.block)
+                        .unwrap_or_default()
+                        .to_string(),
+                ),
+        );
         // The local block becomes externally durable evidence when
         // `acknowledge()` persists the complete receipt state. A crash before
         // that point emitted no acknowledgement and may safely replay.
@@ -3838,6 +3962,11 @@ impl HighAvailabilityRuntime {
             .receive_dispatch(&self.state.members, dispatch)?;
         // Do not fsync each arrival. The receiver persists all accepted block
         // bytes before broadcasting its monotonic acknowledgement.
+        self.telemetry.record(
+            self.telemetry_event("dispatch", "dispatch_received")
+                .with_outcome("ok")
+                .with_field("outcome", format!("{outcome:?}")),
+        );
         Ok(HaRuntimeEvent::Dispatch(outcome))
     }
 
@@ -3852,6 +3981,12 @@ impl HighAvailabilityRuntime {
             self.state.round.acknowledgements[sender_index] = previous_acknowledgement;
             return Err(error);
         }
+        self.telemetry.record(
+            self.telemetry_event("acknowledge", "acknowledgement_persisted")
+                .with_outcome("ok")
+                .with_field("sender_slot", acknowledgement.sender.0.to_string())
+                .with_field("received_mask", acknowledgement.received_mask.to_string()),
+        );
         Ok(acknowledgement)
     }
 
@@ -3872,9 +4007,17 @@ impl HighAvailabilityRuntime {
                 "HA acknowledgement targets an unknown stale epoch".to_string(),
             ));
         }
+        let sender = acknowledgement.sender;
+        let received_mask = acknowledgement.received_mask;
         self.state
             .round
             .receive_acknowledgement(&self.state.members, acknowledgement)?;
+        self.telemetry.record(
+            self.telemetry_event("acknowledge", "acknowledgement_received")
+                .with_outcome("ok")
+                .with_field("sender_slot", sender.0.to_string())
+                .with_field("received_mask", received_mask.to_string()),
+        );
         // Acknowledgement observations are replayable until this node creates
         // its own durable confirmation lock.
         Ok(HaRuntimeEvent::Acknowledged)
@@ -3901,6 +4044,15 @@ impl HighAvailabilityRuntime {
             return Err(error);
         }
         let epoch = self.commit_finalized_round()?;
+        self.telemetry.record(
+            self.telemetry_event("confirm", "confirmation_persisted")
+                .with_outcome("ok")
+                .with_field("sender_slot", confirmation.sender.0.to_string())
+                .with_field(
+                    "candidate_digest",
+                    confirmation.candidate.digest.to_string(),
+                ),
+        );
         Ok((confirmation, epoch))
     }
 
@@ -3923,9 +4075,17 @@ impl HighAvailabilityRuntime {
             }
             return Ok(HaRuntimeEvent::Confirmed);
         }
+        let sender = confirmation.sender;
+        let candidate_digest = confirmation.candidate.digest;
         self.state
             .round
             .receive_confirmation(&self.state.members, confirmation)?;
+        self.telemetry.record(
+            self.telemetry_event("confirm", "confirmation_received")
+                .with_outcome("ok")
+                .with_field("sender_slot", sender.0.to_string())
+                .with_field("candidate_digest", candidate_digest.to_string()),
+        );
         match self.commit_finalized_round()? {
             Some(epoch) => Ok(HaRuntimeEvent::Finalized(Box::new(epoch))),
             // Peer confirmations can be retransmitted. Persisting each partial
@@ -4024,12 +4184,31 @@ impl HighAvailabilityRuntime {
             self.state.amendments.truncate(previous_amendment_count);
             return Err(error);
         }
+        self.telemetry.record(
+            self.telemetry_event("finality", "epoch_finalized")
+                .with_outcome("ok")
+                .with_target(epoch.hash, epoch.nonce)
+                .with_field("candidate_digest", epoch.candidate.digest.to_string())
+                .with_field("included_slots", epoch.candidate.included_mask.to_string())
+                .with_field("presence_mask", epoch.presence_mask.to_string())
+                .with_field("confirmation_mask", epoch.confirmation_mask.to_string()),
+        );
+        let sealed = self.sealed_watermark();
+        if sealed.position > 0 {
+            self.telemetry.record(
+                self.telemetry_event("seal", "sealed_watermark_observed")
+                    .with_outcome("ok")
+                    .with_field("watermark", sealed.position.to_string()),
+            );
+        }
+        self.record_operational_status();
         Ok(Some(epoch))
     }
 
     pub fn append_amendment(&mut self, amendment: AmendmentRecord) -> Result<StateRevision> {
         self.state.validate_new_amendment(&amendment)?;
         let incoming_hash = amendment.hash()?;
+        let target_epoch_nonce = amendment.target_epoch_nonce;
         let containing_epoch = self
             .state
             .epochs
@@ -4071,7 +4250,15 @@ impl HighAvailabilityRuntime {
             self.state.amendments.pop();
             return Err(error);
         }
-        self.revision()
+        let revision = self.revision()?;
+        self.telemetry.record(
+            self.telemetry_event("apply", "amendment_applied")
+                .with_outcome("ok")
+                .with_field("target_nonce", target_epoch_nonce.to_string())
+                .with_field("amendment_hash", incoming_hash.to_string())
+                .with_field("revision_hash", revision.revision_hash.to_string()),
+        );
+        Ok(revision)
     }
 
     pub fn amendment_transaction(
@@ -4448,6 +4635,18 @@ impl HighAvailabilityRuntime {
             self.state.round = previous_round;
             return Err(error);
         }
+        self.telemetry.record(
+            self.telemetry_event("membership", "membership_changed")
+                .with_outcome("ok")
+                .with_field("slot", proposal.slot.0.to_string())
+                .with_field("action", format!("{:?}", proposal.action))
+                .with_field(
+                    "membership_generation",
+                    self.state.membership_generation.to_string(),
+                )
+                .with_field("active_mask", self.state.members.active_mask().to_string()),
+        );
+        self.record_operational_status();
         Ok(())
     }
 
@@ -4831,6 +5030,43 @@ mod tests {
                 .iter()
                 .all(|index| runtimes[*index].head().hash == head_hash)
         );
+    }
+
+    #[test]
+    fn runtime_emits_protocol_and_service_telemetry() {
+        let sink = Arc::new(crate::telemetry::InMemoryTelemetrySink::default());
+        let telemetry =
+            TelemetryHandle::new(sink.clone() as Arc<dyn crate::telemetry::TelemetrySink>);
+        let mut nodes = runtimes(3);
+        nodes[0].set_telemetry(telemetry);
+
+        finalize_runtime_epoch(&mut nodes, &[0, 1], "telemetry");
+        nodes[0].operational_status().unwrap();
+        nodes[0].emit_telemetry_failure(
+            "transport",
+            "ha_connection_failed",
+            &BlossomError::Io("injected".to_string()),
+        );
+
+        let events = sink.events();
+        assert!(events.iter().any(|event| event.event == "dispatch_built"));
+        assert!(
+            events
+                .iter()
+                .any(|event| event.event == "acknowledgement_persisted")
+        );
+        assert!(
+            events
+                .iter()
+                .any(|event| event.event == "confirmation_persisted")
+        );
+        assert!(events.iter().any(|event| event.event == "epoch_finalized"));
+        assert!(events.iter().any(|event| event.event == "ha_status"));
+        assert!(events.iter().any(|event| {
+            event.event == "ha_connection_failed"
+                && event.outcome.as_deref() == Some("error")
+                && event.error.as_deref() == Some("io error: injected")
+        }));
     }
 
     fn exchange_acknowledgements(states: &mut [HaRoundState], members: &HaMemberSlots) {

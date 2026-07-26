@@ -27,6 +27,13 @@ run_step cargo-test-workspace cargo test --workspace
 run_step cargo-test-all-features cargo test --workspace --all-features
 run_step cargo-test-no-default cargo test -p blossom --no-default-features
 run_step cargo-test-insecure-fast-hash cargo test -p blossom --features insecure-fast-hash
+run_step cargo-check-fast-telemetry \
+  cargo check -p blossom --no-default-features --features telemetry
+run_step cargo-check-eden-logger \
+  cargo check -p blossom --no-default-features --features eden-logger
+run_step cargo-check-observability-ha-trusted \
+  cargo check -p blossom --no-default-features \
+  --features observability,high-availability,trusted-checkpoint-dag
 run_step cargo-clippy cargo clippy --workspace --all-features --all-targets -- -D warnings
 run_step trusted-production-validation ./scripts/trusted-production-validation.sh
 run_step ha-production-validation ./scripts/ha-production-validation.sh

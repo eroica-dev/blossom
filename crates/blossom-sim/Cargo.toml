@@ -16,6 +16,9 @@ fair-block-ordering = ["blossom/fair-block-ordering"]
 filtered-transactions = ["blossom/filtered-transactions"]
 high-availability = ["blossom/high-availability"]
 insecure-fast-hash = ["blossom/insecure-fast-hash"]
+telemetry = ["blossom/telemetry", "dep:fast-telemetry"]
+eden-logger = ["blossom/eden-logger", "dep:eden_logger"]
+observability = ["telemetry", "eden-logger"]
 parallel-networks = ["blossom/parallel-networks", "high-availability", "trusted-checkpoint-dag"]
 propagation-adaptive = ["blossom/propagation-adaptive"]
 propagation-inventory = ["blossom/propagation-inventory"]
@@ -26,6 +29,8 @@ trusted-checkpoint-dag = ["blossom/trusted-checkpoint-dag"]
 blossom = { version = "2.0.0-pre-release", path = "../..", default-features = false }
 deterministic-test-env = { version = "2.0.0-pre-release", path = "../deterministic-test-env" }
 clap = { version = "4.5", features = ["derive", "env"] }
+eden_logger = { version = "0.1.2", default-features = false, features = ["log-info", "log-warn", "log-error", "log-internal", "fast-telemetry-context", "sink"], optional = true }
+fast-telemetry = { version = "0.9.0", default-features = false, features = ["runtime"], optional = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tempfile = "3.23"

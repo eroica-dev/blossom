@@ -2,6 +2,7 @@
 name = "blossom"
 version = "2.0.0-pre-release"
 edition = "2024"
+rust-version = "1.93"
 description = "Blossom consensus protocol core, node runtime, simulator, and observer."
 license = "MIT"
 repository = "https://github.com/eden-dev-inc/blossom"
@@ -16,6 +17,9 @@ fair-block-ordering = []
 filtered-transactions = []
 high-availability = ["dep:hmac"]
 insecure-fast-hash = ["dep:xxhash-rust"]
+telemetry = ["fast-telemetry/macros", "fast-telemetry/runtime"]
+eden-logger = ["dep:eden_logger"]
+observability = ["telemetry", "eden-logger"]
 trusted-checkpoint-dag = []
 parallel-networks = ["high-availability", "trusted-checkpoint-dag"]
 propagation-adaptive = [
@@ -35,7 +39,8 @@ borsh = { version = "1.5.7", features = ["derive"] }
 bytes = "1.11.1"
 clap = { version = "4.5", features = ["derive", "env"] }
 ed25519-dalek = { version = "2.2.0", features = ["batch", "hazmat", "rand_core"] }
-fast-telemetry = { version = "0.5.1", default-features = false }
+eden_logger = { version = "0.1.2", default-features = false, features = ["log-info", "log-warn", "log-error", "log-internal", "fast-telemetry-context", "sink"], optional = true }
+fast-telemetry = { version = "0.9.0", default-features = false }
 hex = { version = "0.4.3", features = ["serde"] }
 hmac = { version = "=0.12.1", optional = true }
 indextreemap = "0.2.0"
