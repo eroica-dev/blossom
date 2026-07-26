@@ -7,6 +7,8 @@ faults, and Byzantine pressure.
 
 Current release: `2.0.0-pre-release`.
 
+Minimum supported Rust version: `1.90`.
+
 Whitepaper: [Blossom Consensus Protocol v2](Blossom-Consensus-Protocol-v2-Whitepaper.pdf).
 
 ## What Is Included

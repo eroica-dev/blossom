@@ -69,8 +69,19 @@ payload can opt into the stronger asynchronous durable-reference flow:
 
 The application owns transport. It sends command bytes and availability data
 using its existing authenticated connections, then supplies the decoded
-objects to these APIs. Trusted ordering uses connection identity and unsigned
-receipts; portable signed order certificates are a verified-mode concern.
+objects to these APIs. A production adapter must authenticate the remote node
+identity, bind it to the expected cluster/group and membership generation, and
+reject replayed session sequence numbers before passing a message to Blossom.
+Mutual TLS or another service-owned authenticated channel may provide this
+contract. An unauthenticated generic application connection is not a trusted
+Blossom transport. Trusted ordering uses that verified connection identity and
+unsigned receipts; portable signed order certificates are a verified-mode
+concern.
+
+`DurableAdmissionStore` persists its holder key, site, store generation, and
+schema identity on first open. The first stored batch also binds the database
+to its cluster and consensus group. Reopening with different identity or scope
+fails closed, and pre-identity stores require fresh initialization.
 
 ## Apply contract
 
@@ -103,12 +114,29 @@ for one adapter that handles both KV writes and stream appends.
 - `ReadConsistency::Local` reads the local application state immediately.
 - `ReadConsistency::AtLeast(watermark)` first calls
   `satisfy_read_consistency_to`.
-- `ReadConsistency::Linearizable` supplies a fresh Blossom order/read barrier
-  to `satisfy_read_consistency_to`, then reads from the application state.
+- `ReadConsistency::Linearizable` first obtains the current verified watermark
+  with `GlobalOrderedEngine::acquire_read_barrier`, supplies that value to
+  `satisfy_read_consistency_to`, then reads from the application state. Stale,
+  future, and non-head raw watermarks are rejected.
 
 The embedding service is responsible for acquiring the barrier through its
 Blossom consensus driver. The barrier API never treats local admission or data
 availability as global finality.
+
+## Bounds and persistence
+
+Command batches are limited to 4,096 commands and 64 MiB of canonical encoded
+bytes. Client deduplication retains at most 65,536 active
+`{client_id, client_epoch}` sessions by default; saturation returns
+`BlockQueueFull` instead of growing without bound.
+
+Ordered state uses normalized redb tables for availability certificates,
+finalized positions, position-to-reference mappings, origin-chain tails, and a
+small metadata record. Each transition updates only changed records in one
+immediate-durability transaction with its milestone event. The application
+state-machine snapshot is rewritten only when the applied watermark advances.
+`DurableAdmissionStore::durability_metrics` reports process-local immediate
+commit and fsync counts.
 
 ## Configuration
 
@@ -132,3 +160,7 @@ and persistence behavior remain unchanged.
 
 See [Trusted Network Durability and Recovery](trusted-network-durability.md)
 for the crash contract and service operations API.
+
+`HolderMembership` currently requires exactly three non-empty sites. The
+causal and conflict-only consistency modes remain existing baselines;
+`GlobalOrderedEngine` supports only `active-sync-global-ordered`.

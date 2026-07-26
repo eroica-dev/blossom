@@ -30,6 +30,16 @@ run_step trusted-reference-atomicity \
   active_active::tests::trusted_epoch_finalizes_all_writer_references_in_btree_block_order \
   -- --nocapture
 
+run_step active-active-store-identity-and-normalized-restart \
+  cargo test -p blossom --lib \
+  active_active::tests::durable_store_ \
+  -- --nocapture
+
+run_step active-active-q3-q6-q9 \
+  cargo test -p blossom-bench-harness --lib \
+  blossom_adapter::tests::active_active_q3_q6_q9_paths_finalize_and_apply \
+  -- --nocapture
+
 run_step trusted-hegel-properties \
   cargo test -p blossom --test hegel_trusted_network -- --nocapture
 

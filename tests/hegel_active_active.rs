@@ -1,8 +1,8 @@
 use blossom::{
-    ActiveActiveCommand, ClientEpoch, ClientId, CommandIdentity, CommandOperation, CommandResult,
-    ConsensusGroupId, DurableAdmissionStore, HashType, Keypair, MembershipCutoverDisposition,
-    OrderStatement, SharedStateMachine, SiteId, StoreGeneration, ValidatorGeneration, Watermark,
-    required_cutover_disposition,
+    ActiveActiveCommand, AdmittedCommand, ClientEpoch, ClientId, CommandIdentity, CommandOperation,
+    CommandResult, ConsensusGroupId, DurableAdmissionStore, HashType, Keypair,
+    MembershipCutoverDisposition, OrderStatement, ReplicaMembershipEpoch, SharedStateMachine,
+    SiteId, StoreGeneration, ValidatorGeneration, Watermark, required_cutover_disposition,
 };
 use hegel::TestCase;
 use hegel::generators as gs;
@@ -130,4 +130,58 @@ fn membership_cutover_always_resolves_accepted_work(tc: TestCase) {
     } else {
         assert_eq!(disposition, MembershipCutoverDisposition::ExplicitAbort);
     }
+}
+
+#[hegel::test(test_cases = 40)]
+fn durable_store_identity_is_stable_across_restart(tc: TestCase) {
+    let site_number = tc.draw(gs::integers::<u8>().min_value(1).max_value(32));
+    let generation = tc.draw(gs::integers::<u8>().min_value(1).max_value(32)) as u64;
+    let keypair = Keypair::generate();
+    let path = std::env::temp_dir().join(format!(
+        "blossom-hegel-store-identity-{}-{site_number}-{}",
+        std::process::id(),
+        keypair.public
+    ));
+    let site = SiteId(format!("site-{site_number}"));
+    let store = DurableAdmissionStore::open(
+        &path,
+        site.clone(),
+        StoreGeneration(generation),
+        keypair.signer(),
+    )
+    .unwrap();
+    store
+        .admit(
+            &AdmittedCommand {
+                origin_sequence: 1,
+                command: command(site_number, 1, site_number),
+            },
+            ReplicaMembershipEpoch(1),
+        )
+        .unwrap();
+    drop(store);
+
+    assert!(
+        DurableAdmissionStore::open(
+            &path,
+            SiteId(format!("other-{site_number}")),
+            StoreGeneration(generation),
+            keypair.signer(),
+        )
+        .is_err()
+    );
+    assert!(
+        DurableAdmissionStore::open(
+            &path,
+            site.clone(),
+            StoreGeneration(generation + 1),
+            keypair.signer(),
+        )
+        .is_err()
+    );
+    let reopened =
+        DurableAdmissionStore::open(&path, site, StoreGeneration(generation), keypair.signer())
+            .unwrap();
+    drop(reopened);
+    std::fs::remove_file(path).ok();
 }

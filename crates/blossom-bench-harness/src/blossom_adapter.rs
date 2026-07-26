@@ -1658,4 +1658,49 @@ mod tests {
         drop(cluster);
         std::fs::remove_dir_all(root).unwrap();
     }
+
+    #[tokio::test]
+    async fn active_active_q3_q6_q9_paths_finalize_and_apply() {
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        for quorum_size in [3usize, 6, 9] {
+            let participant_count = quorum_size.max(6);
+            let root = std::env::temp_dir().join(format!(
+                "blossom-active-q-matrix-{}-{suffix}-{quorum_size}",
+                std::process::id()
+            ));
+            let mut cluster = BlossomActiveActiveCluster::start_with_holders_per_site(
+                participant_count,
+                QuorumSize::new(quorum_size).unwrap(),
+                1,
+                &root,
+            )
+            .await
+            .unwrap();
+            let sample = cluster
+                .client_write(ActiveActiveCommand {
+                    identity: CommandIdentity {
+                        client_id: ClientId([quorum_size as u8; 16]),
+                        client_epoch: ClientEpoch(1),
+                        sequence: 1,
+                    },
+                    operation: CommandOperation::BlindWrite {
+                        key: b"q-matrix".to_vec(),
+                        value: vec![quorum_size as u8],
+                    },
+                })
+                .await
+                .unwrap();
+            assert_eq!(sample.result, CommandResult::Written);
+            assert_eq!(sample.watermark, Watermark { position: 1 });
+            assert_eq!(
+                cluster.read_local(b"q-matrix"),
+                Ok(Some(vec![quorum_size as u8]))
+            );
+            drop(cluster);
+            std::fs::remove_dir_all(root).unwrap();
+        }
+    }
 }

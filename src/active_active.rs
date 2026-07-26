@@ -3,10 +3,11 @@ use std::fs;
 use std::path::Path;
 use std::str::FromStr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use borsh::{BorshDeserialize, BorshSerialize};
-use redb::{Database, Durability, ReadableDatabase, ReadableTable, TableDefinition};
+use redb::{Database, Durability, ReadableDatabase, ReadableTable, TableDefinition, TableHandle};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -33,6 +34,9 @@ const ORDER_CERTIFICATE_DOMAIN: &[u8] = b"blossom/active-active/order-certificat
 const ORDER_VOTE_HASH_DOMAIN: &[u8] = b"blossom/active-active/order-vote/v1";
 const MAX_COMMAND_KEY_BYTES: usize = 1 << 20;
 const MAX_COMMAND_VALUE_BYTES: usize = 64 << 20;
+pub const DEFAULT_MAX_BATCH_COMMANDS: usize = 4_096;
+pub const DEFAULT_MAX_BATCH_BYTES: usize = 64 << 20;
+pub const DEFAULT_MAX_DEDUP_SESSIONS: usize = 65_536;
 pub const MAX_PIPELINED_AVAILABILITY_WINDOWS: usize = 8;
 /// One trusted ordering window may contain one reference from every validator.
 ///
@@ -54,9 +58,23 @@ const ACTIVE_STATE_TABLE: TableDefinition<&str, &[u8]> =
 const META_TABLE: TableDefinition<&str, u64> = TableDefinition::new("active_active_meta_v1");
 const ORDER_VOTES_TABLE: TableDefinition<&[u8], &[u8]> =
     TableDefinition::new("active_active_order_votes_v1");
+const STORE_IDENTITY_TABLE: TableDefinition<&str, &[u8]> =
+    TableDefinition::new("active_active_store_identity_v2");
+const AVAILABLE_REFERENCES_TABLE: TableDefinition<&[u8], &[u8]> =
+    TableDefinition::new("active_active_available_references_v2");
+const FINALIZED_POSITIONS_TABLE: TableDefinition<u64, &[u8]> =
+    TableDefinition::new("active_active_finalized_positions_v2");
+const POSITION_REFERENCES_TABLE: TableDefinition<u64, &[u8]> =
+    TableDefinition::new("active_active_position_references_v2");
+const ORIGIN_TAILS_TABLE: TableDefinition<&[u8], &[u8]> =
+    TableDefinition::new("active_active_origin_tails_v2");
+const ORDERED_METADATA_TABLE: TableDefinition<&str, &[u8]> =
+    TableDefinition::new("active_active_ordered_metadata_v2");
 const STATE_MACHINE_KEY: &str = "state_machine";
-const ORDERED_ENGINE_KEY: &str = "ordered_engine";
-const DURABLE_ORDERED_STATE_VERSION: u16 = 1;
+const STORE_IDENTITY_KEY: &str = "identity";
+const ORDERED_METADATA_KEY: &str = "metadata";
+const ACTIVE_ACTIVE_STORE_SCHEMA_VERSION: u16 = 2;
+const DURABLE_ORDERED_STATE_VERSION: u16 = 2;
 
 #[derive(
     Serialize,
@@ -199,6 +217,13 @@ impl CommandBatch {
                 "command batch cannot be empty".to_string(),
             ));
         };
+        if self.commands.len() > DEFAULT_MAX_BATCH_COMMANDS {
+            return Err(BlossomError::InvalidConfiguration(format!(
+                "batch command count {} exceeds maximum {}",
+                self.commands.len(),
+                DEFAULT_MAX_BATCH_COMMANDS
+            )));
+        }
         if first.origin_sequence == 0 {
             return Err(BlossomError::InvalidConfiguration(
                 "origin sequences start at one".to_string(),
@@ -215,6 +240,14 @@ impl CommandBatch {
             expected = expected.checked_add(1).ok_or_else(|| {
                 BlossomError::InvalidConfiguration("origin sequence overflow".to_string())
             })?;
+        }
+        let encoded = borsh::to_vec(self).map_err(encode_error)?;
+        if encoded.len() > DEFAULT_MAX_BATCH_BYTES {
+            return Err(BlossomError::InvalidConfiguration(format!(
+                "batch encoded size {} exceeds maximum {}",
+                encoded.len(),
+                DEFAULT_MAX_BATCH_BYTES
+            )));
         }
         Ok(())
     }
@@ -1057,6 +1090,7 @@ struct SessionDedupState {
 #[derive(Serialize, Deserialize, BorshSerialize, BorshDeserialize, Debug, Clone, PartialEq, Eq)]
 pub struct DeduplicationWindow {
     max_reorder: u64,
+    max_sessions: usize,
     sessions: BTreeMap<(ClientId, ClientEpoch), SessionDedupState>,
 }
 
@@ -1068,13 +1102,23 @@ pub enum DedupDecision {
 
 impl DeduplicationWindow {
     pub fn new(max_reorder: u64) -> Result<Self> {
+        Self::new_bounded(max_reorder, DEFAULT_MAX_DEDUP_SESSIONS)
+    }
+
+    pub fn new_bounded(max_reorder: u64, max_sessions: usize) -> Result<Self> {
         if max_reorder == 0 {
             return Err(BlossomError::InvalidConfiguration(
                 "deduplication reorder window must be positive".to_string(),
             ));
         }
+        if max_sessions == 0 {
+            return Err(BlossomError::InvalidConfiguration(
+                "deduplication session bound must be positive".to_string(),
+            ));
+        }
         Ok(Self {
             max_reorder,
+            max_sessions,
             sessions: BTreeMap::new(),
         })
     }
@@ -1088,6 +1132,9 @@ impl DeduplicationWindow {
             .sessions
             .get(&(identity.client_id, identity.client_epoch))
         else {
+            if self.sessions.len() >= self.max_sessions {
+                return Err(BlossomError::BlockQueueFull);
+            }
             if identity.sequence > self.max_reorder {
                 return Err(BlossomError::InvalidConfiguration(
                     "first client sequence is outside the reorder window".to_string(),
@@ -1253,6 +1300,79 @@ struct DurableOrderedState {
     applied_watermark: Watermark,
 }
 
+#[derive(BorshSerialize, BorshDeserialize, Debug, Clone, PartialEq, Eq)]
+struct DurableOrderedMetadata {
+    version: u16,
+    holder_membership_epoch: ReplicaMembershipEpoch,
+    validator_generation: ValidatorGeneration,
+    last_finalized_position: u64,
+    last_order_certificate_hash: HashType,
+    applied_watermark: Watermark,
+}
+
+impl From<&DurableOrderedState> for DurableOrderedMetadata {
+    fn from(state: &DurableOrderedState) -> Self {
+        Self {
+            version: state.version,
+            holder_membership_epoch: state.holder_membership_epoch,
+            validator_generation: state.validator_generation,
+            last_finalized_position: state.last_finalized_position,
+            last_order_certificate_hash: state.last_order_certificate_hash,
+            applied_watermark: state.applied_watermark,
+        }
+    }
+}
+
+#[derive(BorshSerialize, BorshDeserialize, Debug, Clone, PartialEq, Eq)]
+struct DurableStoreIdentity {
+    schema_version: u16,
+    holder: PubKey,
+    site: SiteId,
+    store_generation: StoreGeneration,
+    cluster_id: Option<HashType>,
+    consensus_group_id: Option<ConsensusGroupId>,
+}
+
+impl DurableStoreIdentity {
+    fn new(holder: PubKey, site: SiteId, store_generation: StoreGeneration) -> Self {
+        Self {
+            schema_version: ACTIVE_ACTIVE_STORE_SCHEMA_VERSION,
+            holder,
+            site,
+            store_generation,
+            cluster_id: None,
+            consensus_group_id: None,
+        }
+    }
+
+    fn validate_startup(
+        &self,
+        holder: PubKey,
+        site: &SiteId,
+        store_generation: StoreGeneration,
+    ) -> Result<()> {
+        if self.schema_version != ACTIVE_ACTIVE_STORE_SCHEMA_VERSION {
+            return Err(BlossomError::InvalidConfiguration(format!(
+                "unsupported active-active store schema {}; expected {}",
+                self.schema_version, ACTIVE_ACTIVE_STORE_SCHEMA_VERSION
+            )));
+        }
+        if self.holder != holder || &self.site != site || self.store_generation != store_generation
+        {
+            return Err(BlossomError::InvalidConfiguration(
+                "active-active store identity does not match holder, site, or generation"
+                    .to_string(),
+            ));
+        }
+        if self.cluster_id.is_some() != self.consensus_group_id.is_some() {
+            return Err(BlossomError::InvalidConfiguration(
+                "active-active store has a partially bound protocol scope".to_string(),
+            ));
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone)]
 pub struct DurableAdmissionStore {
     database: Arc<Database>,
@@ -1260,6 +1380,14 @@ pub struct DurableAdmissionStore {
     site: SiteId,
     store_generation: StoreGeneration,
     signer: SecretSigner,
+    commit_count: Arc<AtomicU64>,
+    fsync_count: Arc<AtomicU64>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ActiveActiveDurabilityMetrics {
+    pub commit_count: u64,
+    pub fsync_count: u64,
 }
 
 impl DurableAdmissionStore {
@@ -1273,18 +1401,42 @@ impl DurableAdmissionStore {
             fs::create_dir_all(parent).map_err(|err| BlossomError::Io(err.to_string()))?;
         }
         let database = Database::create(path).map_err(storage_error)?;
+        let holder = signer.public_key();
         let store = Self {
             database: Arc::new(database),
-            holder: signer.public_key(),
+            holder,
             site,
             store_generation,
             signer,
+            commit_count: Arc::new(AtomicU64::new(0)),
+            fsync_count: Arc::new(AtomicU64::new(0)),
         };
-        store.initialize_tables()?;
+        store.initialize_tables_and_identity()?;
         Ok(store)
     }
 
-    fn initialize_tables(&self) -> Result<()> {
+    fn initialize_tables_and_identity(&self) -> Result<()> {
+        let read = self.database.begin_read().map_err(storage_error)?;
+        let existing_tables = read
+            .list_tables()
+            .map_err(storage_error)?
+            .map(|table| table.name().to_string())
+            .collect::<Vec<_>>();
+        let has_identity = existing_tables
+            .iter()
+            .any(|name| name == STORE_IDENTITY_TABLE.name());
+        if !has_identity
+            && existing_tables
+                .iter()
+                .any(|name| name.starts_with("active_active_"))
+        {
+            return Err(BlossomError::InvalidConfiguration(
+                "legacy active-active store has no v2 identity; initialize a fresh store"
+                    .to_string(),
+            ));
+        }
+        drop(read);
+
         let mut transaction = self.database.begin_write().map_err(storage_error)?;
         transaction
             .set_durability(Durability::Immediate)
@@ -1309,8 +1461,127 @@ impl DurableAdmissionStore {
             transaction
                 .open_table(ORDER_VOTES_TABLE)
                 .map_err(storage_error)?;
+            transaction
+                .open_table(AVAILABLE_REFERENCES_TABLE)
+                .map_err(storage_error)?;
+            transaction
+                .open_table(FINALIZED_POSITIONS_TABLE)
+                .map_err(storage_error)?;
+            transaction
+                .open_table(POSITION_REFERENCES_TABLE)
+                .map_err(storage_error)?;
+            transaction
+                .open_table(ORIGIN_TAILS_TABLE)
+                .map_err(storage_error)?;
+            transaction
+                .open_table(ORDERED_METADATA_TABLE)
+                .map_err(storage_error)?;
+            let mut identities = transaction
+                .open_table(STORE_IDENTITY_TABLE)
+                .map_err(storage_error)?;
+            if let Some(encoded) = identities.get(STORE_IDENTITY_KEY).map_err(storage_error)? {
+                let identity = borsh::from_slice::<DurableStoreIdentity>(encoded.value()).map_err(
+                    |error| {
+                        BlossomError::WireProtocol(format!(
+                            "decode active-active store identity: {error}"
+                        ))
+                    },
+                )?;
+                identity.validate_startup(self.holder, &self.site, self.store_generation)?;
+            } else {
+                let identity = DurableStoreIdentity::new(
+                    self.holder,
+                    self.site.clone(),
+                    self.store_generation,
+                );
+                let encoded = borsh::to_vec(&identity).map_err(encode_error)?;
+                identities
+                    .insert(STORE_IDENTITY_KEY, encoded.as_slice())
+                    .map_err(storage_error)?;
+            }
         }
-        transaction.commit().map_err(storage_error)
+        self.commit(transaction)
+    }
+
+    pub fn durability_metrics(&self) -> ActiveActiveDurabilityMetrics {
+        ActiveActiveDurabilityMetrics {
+            commit_count: self.commit_count.load(Ordering::Relaxed),
+            fsync_count: self.fsync_count.load(Ordering::Relaxed),
+        }
+    }
+
+    fn commit(&self, transaction: redb::WriteTransaction) -> Result<()> {
+        transaction.commit().map_err(storage_error)?;
+        self.commit_count.fetch_add(1, Ordering::Relaxed);
+        self.fsync_count.fetch_add(1, Ordering::Relaxed);
+        Ok(())
+    }
+
+    fn bind_protocol_scope(
+        &self,
+        cluster_id: HashType,
+        consensus_group_id: ConsensusGroupId,
+    ) -> Result<()> {
+        let mut transaction = self.database.begin_write().map_err(storage_error)?;
+        transaction
+            .set_durability(Durability::Immediate)
+            .map_err(storage_error)?;
+        let changed =
+            self.bind_protocol_scope_in_transaction(&transaction, cluster_id, consensus_group_id)?;
+        if !changed {
+            return Ok(());
+        }
+        self.commit(transaction)
+    }
+
+    fn bind_protocol_scope_in_transaction(
+        &self,
+        transaction: &redb::WriteTransaction,
+        cluster_id: HashType,
+        consensus_group_id: ConsensusGroupId,
+    ) -> Result<bool> {
+        let mut changed = false;
+        {
+            let mut identities = transaction
+                .open_table(STORE_IDENTITY_TABLE)
+                .map_err(storage_error)?;
+            let encoded = identities
+                .get(STORE_IDENTITY_KEY)
+                .map_err(storage_error)?
+                .ok_or_else(|| {
+                    BlossomError::InvalidConfiguration(
+                        "active-active store identity is missing".to_string(),
+                    )
+                })?;
+            let mut identity =
+                borsh::from_slice::<DurableStoreIdentity>(encoded.value()).map_err(|error| {
+                    BlossomError::WireProtocol(format!(
+                        "decode active-active store identity: {error}"
+                    ))
+                })?;
+            drop(encoded);
+            identity.validate_startup(self.holder, &self.site, self.store_generation)?;
+            match (identity.cluster_id, identity.consensus_group_id) {
+                (None, None) => {
+                    identity.cluster_id = Some(cluster_id);
+                    identity.consensus_group_id = Some(consensus_group_id);
+                    let encoded = borsh::to_vec(&identity).map_err(encode_error)?;
+                    identities
+                        .insert(STORE_IDENTITY_KEY, encoded.as_slice())
+                        .map_err(storage_error)?;
+                    changed = true;
+                }
+                (Some(existing_cluster), Some(existing_group))
+                    if existing_cluster == cluster_id && existing_group == consensus_group_id => {}
+                _ => {
+                    return Err(BlossomError::InvalidConfiguration(
+                        "active-active store protocol scope does not match cluster or group"
+                            .to_string(),
+                    ));
+                }
+            }
+        }
+        Ok(changed)
     }
 
     pub fn admit(
@@ -1359,7 +1630,7 @@ impl DurableAdmissionStore {
                 .insert(command_key.as_slice(), command_bytes.as_slice())
                 .map_err(storage_error)?;
         }
-        transaction.commit().map_err(storage_error)?;
+        self.commit(transaction)?;
 
         AdmissionReceipt::signed(
             AdmissionReceiptBody {
@@ -1388,6 +1659,11 @@ impl DurableAdmissionStore {
             .set_durability(Durability::Immediate)
             .map_err(storage_error)?;
         {
+            self.bind_protocol_scope_in_transaction(
+                &transaction,
+                reference.cluster_id,
+                reference.consensus_group_id,
+            )?;
             let mut table = transaction
                 .open_table(BATCHES_TABLE)
                 .map_err(storage_error)?;
@@ -1395,7 +1671,7 @@ impl DurableAdmissionStore {
                 .insert(reference_hash.as_ref(), bytes.as_slice())
                 .map_err(storage_error)?;
         }
-        transaction.commit().map_err(storage_error)?;
+        self.commit(transaction)?;
 
         AuthenticatedAvailabilityReceipt::signed(
             AvailabilityReceiptBody {
@@ -1463,7 +1739,7 @@ impl DurableAdmissionStore {
                 .map_err(storage_error)?
                 .is_some()
         };
-        transaction.commit().map_err(storage_error)?;
+        self.commit(transaction)?;
         Ok(removed)
     }
 
@@ -1492,7 +1768,7 @@ impl DurableAdmissionStore {
                 .insert(sequence, bytes.as_slice())
                 .map_err(storage_error)?;
         }
-        transaction.commit().map_err(storage_error)?;
+        self.commit(transaction)?;
         Ok(sequence)
     }
 
@@ -1533,7 +1809,7 @@ impl DurableAdmissionStore {
                     .map_err(storage_error)?;
             }
         }
-        transaction.commit().map_err(storage_error)?;
+        self.commit(transaction)?;
         let signature = self
             .signer
             .sign(&OrderCertificate::signing_bytes(statement)?);
@@ -1579,7 +1855,7 @@ impl DurableAdmissionStore {
                 .insert(STATE_MACHINE_KEY, bytes.as_slice())
                 .map_err(storage_error)?;
         }
-        transaction.commit().map_err(storage_error)
+        self.commit(transaction)
     }
 
     pub fn load_state_machine(&self) -> Result<Option<(SharedStateMachine, Watermark)>> {
@@ -1597,12 +1873,14 @@ impl DurableAdmissionStore {
 
     fn persist_ordered_state(
         &self,
-        machine: &SharedStateMachine,
+        machine: Option<&SharedStateMachine>,
+        previous: &DurableOrderedState,
         state: &DurableOrderedState,
         milestone: Option<&MilestoneEvent>,
     ) -> Result<()> {
         self.persist_ordered_state_with_milestones(
             machine,
+            previous,
             state,
             milestone.map(std::slice::from_ref).unwrap_or_default(),
         )
@@ -1610,13 +1888,17 @@ impl DurableAdmissionStore {
 
     fn persist_ordered_state_with_milestones(
         &self,
-        machine: &SharedStateMachine,
+        machine: Option<&SharedStateMachine>,
+        previous: &DurableOrderedState,
         state: &DurableOrderedState,
         milestones: &[MilestoneEvent],
     ) -> Result<()> {
-        let machine_bytes =
-            borsh::to_vec(&(machine, state.applied_watermark)).map_err(encode_error)?;
-        let ordered_bytes = borsh::to_vec(state).map_err(encode_error)?;
+        let machine_bytes = machine
+            .map(|machine| borsh::to_vec(&(machine, state.applied_watermark)))
+            .transpose()
+            .map_err(encode_error)?;
+        let metadata_bytes =
+            borsh::to_vec(&DurableOrderedMetadata::from(state)).map_err(encode_error)?;
         let milestone_bytes = milestones
             .iter()
             .map(borsh::to_vec)
@@ -1627,15 +1909,80 @@ impl DurableAdmissionStore {
             .set_durability(Durability::Immediate)
             .map_err(storage_error)?;
         {
-            let mut table = transaction
-                .open_table(ACTIVE_STATE_TABLE)
-                .map_err(storage_error)?;
-            table
-                .insert(STATE_MACHINE_KEY, machine_bytes.as_slice())
-                .map_err(storage_error)?;
-            table
-                .insert(ORDERED_ENGINE_KEY, ordered_bytes.as_slice())
-                .map_err(storage_error)?;
+            if let Some(machine_bytes) = &machine_bytes {
+                let mut table = transaction
+                    .open_table(ACTIVE_STATE_TABLE)
+                    .map_err(storage_error)?;
+                table
+                    .insert(STATE_MACHINE_KEY, machine_bytes.as_slice())
+                    .map_err(storage_error)?;
+            }
+            {
+                let mut table = transaction
+                    .open_table(ORDERED_METADATA_TABLE)
+                    .map_err(storage_error)?;
+                table
+                    .insert(ORDERED_METADATA_KEY, metadata_bytes.as_slice())
+                    .map_err(storage_error)?;
+            }
+            {
+                let mut table = transaction
+                    .open_table(AVAILABLE_REFERENCES_TABLE)
+                    .map_err(storage_error)?;
+                for hash in previous.available.keys() {
+                    if !state.available.contains_key(hash) {
+                        table.remove(hash.as_ref()).map_err(storage_error)?;
+                    }
+                }
+                for (hash, certificate) in &state.available {
+                    if previous.available.get(hash) != Some(certificate) {
+                        let encoded = borsh::to_vec(certificate).map_err(encode_error)?;
+                        table
+                            .insert(hash.as_ref(), encoded.as_slice())
+                            .map_err(storage_error)?;
+                    }
+                }
+            }
+            {
+                let mut table = transaction
+                    .open_table(FINALIZED_POSITIONS_TABLE)
+                    .map_err(storage_error)?;
+                for (position, certificate) in &state.finalized {
+                    if previous.finalized.get(position) != Some(certificate) {
+                        let encoded = borsh::to_vec(certificate).map_err(encode_error)?;
+                        table
+                            .insert(*position, encoded.as_slice())
+                            .map_err(storage_error)?;
+                    }
+                }
+            }
+            {
+                let mut table = transaction
+                    .open_table(POSITION_REFERENCES_TABLE)
+                    .map_err(storage_error)?;
+                for (position, reference_hash) in &state.final_reference_by_position {
+                    if previous.final_reference_by_position.get(position) != Some(reference_hash) {
+                        let encoded = borsh::to_vec(reference_hash).map_err(encode_error)?;
+                        table
+                            .insert(*position, encoded.as_slice())
+                            .map_err(storage_error)?;
+                    }
+                }
+            }
+            {
+                let mut table = transaction
+                    .open_table(ORIGIN_TAILS_TABLE)
+                    .map_err(storage_error)?;
+                for (origin, tail) in &state.last_origin_reference {
+                    if previous.last_origin_reference.get(origin) != Some(tail) {
+                        let key = borsh::to_vec(origin).map_err(encode_error)?;
+                        let value = borsh::to_vec(tail).map_err(encode_error)?;
+                        table
+                            .insert(key.as_slice(), value.as_slice())
+                            .map_err(storage_error)?;
+                    }
+                }
+            }
             if !milestone_bytes.is_empty() {
                 let mut sequence = transaction
                     .open_table(META_TABLE)
@@ -1662,20 +2009,108 @@ impl DurableAdmissionStore {
                     .map_err(storage_error)?;
             }
         }
-        transaction.commit().map_err(storage_error)
+        self.commit(transaction)
     }
 
     fn load_ordered_state(&self) -> Result<Option<DurableOrderedState>> {
         let transaction = self.database.begin_read().map_err(storage_error)?;
-        let table = transaction
-            .open_table(ACTIVE_STATE_TABLE)
+        let metadata_table = transaction
+            .open_table(ORDERED_METADATA_TABLE)
             .map_err(storage_error)?;
-        let Some(bytes) = table.get(ORDERED_ENGINE_KEY).map_err(storage_error)? else {
+        let Some(metadata_bytes) = metadata_table
+            .get(ORDERED_METADATA_KEY)
+            .map_err(storage_error)?
+        else {
             return Ok(None);
         };
-        borsh::from_slice(bytes.value())
-            .map(Some)
-            .map_err(|err| BlossomError::WireProtocol(format!("decode ordered engine: {err}")))
+        let metadata = borsh::from_slice::<DurableOrderedMetadata>(metadata_bytes.value())
+            .map_err(|err| {
+                BlossomError::WireProtocol(format!("decode ordered-engine metadata: {err}"))
+            })?;
+        drop(metadata_bytes);
+        drop(metadata_table);
+
+        let available = transaction
+            .open_table(AVAILABLE_REFERENCES_TABLE)
+            .map_err(storage_error)?
+            .iter()
+            .map_err(storage_error)?
+            .map(|entry| {
+                let (key, value) = entry.map_err(storage_error)?;
+                let certificate = borsh::from_slice::<AvailabilityCertificate>(value.value())
+                    .map_err(|error| {
+                        BlossomError::WireProtocol(format!("decode available reference: {error}"))
+                    })?;
+                if certificate.reference.hash()?.as_ref() != key.value() {
+                    return Err(BlossomError::InvalidConfiguration(
+                        "available-reference table key does not match certificate".to_string(),
+                    ));
+                }
+                Ok((certificate.reference.hash()?, certificate))
+            })
+            .collect::<Result<BTreeMap<_, _>>>()?;
+        let finalized = transaction
+            .open_table(FINALIZED_POSITIONS_TABLE)
+            .map_err(storage_error)?
+            .iter()
+            .map_err(storage_error)?
+            .map(|entry| {
+                let (position, value) = entry.map_err(storage_error)?;
+                let certificate =
+                    borsh::from_slice::<OrderCertificate>(value.value()).map_err(|error| {
+                        BlossomError::WireProtocol(format!(
+                            "decode finalized order certificate: {error}"
+                        ))
+                    })?;
+                Ok((position.value(), certificate))
+            })
+            .collect::<Result<BTreeMap<_, _>>>()?;
+        let final_reference_by_position = transaction
+            .open_table(POSITION_REFERENCES_TABLE)
+            .map_err(storage_error)?
+            .iter()
+            .map_err(storage_error)?
+            .map(|entry| {
+                let (position, value) = entry.map_err(storage_error)?;
+                let reference_hash =
+                    borsh::from_slice::<HashType>(value.value()).map_err(|error| {
+                        BlossomError::WireProtocol(format!(
+                            "decode finalized reference hash: {error}"
+                        ))
+                    })?;
+                Ok((position.value(), reference_hash))
+            })
+            .collect::<Result<BTreeMap<_, _>>>()?;
+        let last_origin_reference = transaction
+            .open_table(ORIGIN_TAILS_TABLE)
+            .map_err(storage_error)?
+            .iter()
+            .map_err(storage_error)?
+            .map(|entry| {
+                let (key, value) = entry.map_err(storage_error)?;
+                let origin =
+                    borsh::from_slice::<(PubKey, u64, u64)>(key.value()).map_err(|error| {
+                        BlossomError::WireProtocol(format!("decode origin-tail key: {error}"))
+                    })?;
+                let tail =
+                    borsh::from_slice::<(HashType, u64)>(value.value()).map_err(|error| {
+                        BlossomError::WireProtocol(format!("decode origin-tail value: {error}"))
+                    })?;
+                Ok((origin, tail))
+            })
+            .collect::<Result<BTreeMap<_, _>>>()?;
+        Ok(Some(DurableOrderedState {
+            version: metadata.version,
+            holder_membership_epoch: metadata.holder_membership_epoch,
+            validator_generation: metadata.validator_generation,
+            available,
+            finalized,
+            final_reference_by_position,
+            last_origin_reference,
+            last_finalized_position: metadata.last_finalized_position,
+            last_order_certificate_hash: metadata.last_order_certificate_hash,
+            applied_watermark: metadata.applied_watermark,
+        }))
     }
 }
 
@@ -1777,6 +2212,18 @@ impl GlobalOrderedEngine {
             ));
         }
         holder_membership.validate()?;
+        if holder_membership
+            .members_by_site
+            .get(&store.site)
+            .is_none_or(|members| !members.contains(&store.holder))
+            || holder_membership.store_generations.get(&store.holder)
+                != Some(&store.store_generation)
+        {
+            return Err(BlossomError::InvalidConfiguration(
+                "ordered-engine store identity is not a holder in the committed membership"
+                    .to_string(),
+            ));
+        }
         if validators.is_empty() {
             return Err(BlossomError::InvalidConfiguration(
                 "global ordering requires at least one validator".to_string(),
@@ -1856,6 +2303,10 @@ impl GlobalOrderedEngine {
         certificate: AvailabilityCertificate,
     ) -> Result<MilestoneEvent> {
         certificate.verify(&self.holder_membership)?;
+        self.store.bind_protocol_scope(
+            certificate.reference.cluster_id,
+            certificate.reference.consensus_group_id,
+        )?;
         if certificate.reference.validator_generation != self.validator_generation {
             return Err(BlossomError::InvalidConfiguration(
                 "available reference validator generation mismatch".to_string(),
@@ -1913,7 +2364,8 @@ impl GlobalOrderedEngine {
                 ));
             }
         }
-        let mut durable = self.durable_state();
+        let previous = self.durable_state();
+        let mut durable = previous.clone();
         durable.last_origin_reference.insert(
             origin_key,
             (reference_hash, certificate.reference.last_origin_sequence),
@@ -1921,7 +2373,7 @@ impl GlobalOrderedEngine {
         durable.available.insert(reference_hash, certificate);
         let event = milestone_event(self.mode, reference_hash, Milestone::Available, None);
         self.store
-            .persist_ordered_state(&self.state_machine, &durable, Some(&event))?;
+            .persist_ordered_state(None, &previous, &durable, Some(&event))?;
         self.install_durable_state(durable);
         self.telemetry.record_milestone(&event);
         Ok(event)
@@ -2062,7 +2514,8 @@ impl GlobalOrderedEngine {
             return Ok(events);
         }
 
-        let mut durable = self.durable_state();
+        let previous = self.durable_state();
+        let mut durable = previous.clone();
         let mut events = Vec::with_capacity(references.len());
         let mut next_position = self.last_finalized_position;
         let mut previous_certificate_hash = self.last_order_certificate_hash;
@@ -2100,7 +2553,7 @@ impl GlobalOrderedEngine {
         durable.last_finalized_position = next_position;
         durable.last_order_certificate_hash = previous_certificate_hash;
         self.store
-            .persist_ordered_state_with_milestones(&self.state_machine, &durable, &events)?;
+            .persist_ordered_state_with_milestones(None, &previous, &durable, &events)?;
         self.install_durable_state(durable);
         for event in &events {
             self.telemetry.record_milestone(event);
@@ -2253,7 +2706,8 @@ impl GlobalOrderedEngine {
             ));
         }
         let certificate_hash = certificate.hash()?;
-        let mut durable = self.durable_state();
+        let previous = self.durable_state();
+        let mut durable = previous.clone();
         durable
             .finalized
             .insert(statement.position.position, certificate.clone());
@@ -2269,7 +2723,7 @@ impl GlobalOrderedEngine {
             Some(statement.position),
         );
         self.store
-            .persist_ordered_state(&self.state_machine, &durable, Some(&event))?;
+            .persist_ordered_state(None, &previous, &durable, Some(&event))?;
         self.install_durable_state(durable);
         self.telemetry.record_milestone(&event);
         Ok(event)
@@ -2331,7 +2785,8 @@ impl GlobalOrderedEngine {
                 "application results diverged from the shared command specification".to_string(),
             ));
         }
-        let mut durable = self.durable_state();
+        let previous = self.durable_state();
+        let mut durable = previous.clone();
         durable.applied_watermark = next_watermark;
         durable.available.remove(&reference_hash);
         let event = milestone_event(
@@ -2340,8 +2795,12 @@ impl GlobalOrderedEngine {
             Milestone::Applied,
             Some(next_watermark),
         );
-        self.store
-            .persist_ordered_state(&staged_machine, &durable, Some(&event))?;
+        self.store.persist_ordered_state(
+            Some(&staged_machine),
+            &previous,
+            &durable,
+            Some(&event),
+        )?;
         self.state_machine = staged_machine;
         self.install_durable_state(durable);
         self.telemetry.record_milestone(&event);
@@ -2406,11 +2865,21 @@ impl GlobalOrderedEngine {
         let required = match consistency {
             ReadConsistency::Local => None,
             ReadConsistency::AtLeast(watermark) => Some(watermark),
-            ReadConsistency::Linearizable => Some(linearizable_barrier.ok_or_else(|| {
-                BlossomError::InvalidConfiguration(
-                    "linearizable Blossom read requires an order/read barrier".to_string(),
-                )
-            })?),
+            ReadConsistency::Linearizable => {
+                let supplied = linearizable_barrier.ok_or_else(|| {
+                    BlossomError::InvalidConfiguration(
+                        "linearizable Blossom read requires an order/read barrier".to_string(),
+                    )
+                })?;
+                let certified = self.acquire_read_barrier()?;
+                if supplied != certified {
+                    return Err(BlossomError::InvalidConfiguration(
+                        "linearizable read barrier is stale or is not the current certified order head"
+                            .to_string(),
+                    ));
+                }
+                Some(certified)
+            }
         };
         if let Some(required) = required {
             match self.apply_through_to(required, application)? {
@@ -2430,6 +2899,41 @@ impl GlobalOrderedEngine {
 
     pub fn applied_watermark(&self) -> Watermark {
         self.applied_watermark
+    }
+
+    /// Returns the current locally verified global-order barrier.
+    ///
+    /// Callers still pass the returned watermark to the existing read API, but
+    /// `ReadConsistency::Linearizable` now rejects stale, future, or otherwise
+    /// unverified raw watermarks.
+    pub fn acquire_read_barrier(&self) -> Result<Watermark> {
+        if self.last_finalized_position == 0 {
+            if self.last_order_certificate_hash != HashType::default() {
+                return Err(BlossomError::InvalidConfiguration(
+                    "empty finality chain has a non-empty tail hash".to_string(),
+                ));
+            }
+            return Ok(Watermark::default());
+        }
+        let certificate = self
+            .finalized
+            .get(&self.last_finalized_position)
+            .ok_or_else(|| {
+                BlossomError::InvalidConfiguration(
+                    "current order head is missing its certificate".to_string(),
+                )
+            })?;
+        if certificate.hash()? != self.last_order_certificate_hash {
+            return Err(BlossomError::InvalidConfiguration(
+                "current order head certificate does not match the durable tail".to_string(),
+            ));
+        }
+        if self.order_trust_mode.is_trusted() {
+            certificate.verify_trusted(self.validator_generation)?;
+        } else {
+            certificate.verify(self.validator_generation, &self.validators)?;
+        }
+        Ok(certificate.statement.position)
     }
 
     fn ensure_origin_predecessor_finalized(&self, reference: &BatchReference) -> Result<()> {
@@ -2481,8 +2985,25 @@ impl GlobalOrderedEngine {
                 "durable ordered-engine parameters do not match startup configuration".to_string(),
             ));
         }
-        for availability in state.available.values() {
+        if state.finalized.len()
+            != usize::try_from(state.last_finalized_position).unwrap_or(usize::MAX)
+            || state.final_reference_by_position.len() != state.finalized.len()
+        {
+            return Err(BlossomError::InvalidConfiguration(
+                "durable finality tables contain missing or out-of-range positions".to_string(),
+            ));
+        }
+        for (reference_hash, availability) in &state.available {
             availability.verify(&self.holder_membership)?;
+            if availability.reference.hash()? != *reference_hash {
+                return Err(BlossomError::InvalidConfiguration(
+                    "durable availability key does not match its certificate".to_string(),
+                ));
+            }
+            self.store.bind_protocol_scope(
+                availability.reference.cluster_id,
+                availability.reference.consensus_group_id,
+            )?;
         }
         let mut previous_hash = HashType::default();
         for position in 1..=state.last_finalized_position {
@@ -2666,6 +3187,7 @@ mod tests {
     use crate::nonce::Nonce;
     use crate::state::EpochBody;
     use indextreemap::IndexTreeMap;
+    use redb::ReadableTableMetadata;
 
     #[derive(Default)]
     struct RecordingApplication {
@@ -2988,6 +3510,128 @@ mod tests {
     }
 
     #[test]
+    fn durable_store_reopen_fails_closed_on_identity_and_scope_mismatch() {
+        let keypair = Keypair::generate();
+        let other = Keypair::generate();
+        let path = std::env::temp_dir().join(format!(
+            "blossom-active-active-identity-{}-{}.redb",
+            std::process::id(),
+            keypair.public
+        ));
+        let store = DurableAdmissionStore::open(
+            &path,
+            SiteId("site-a".to_string()),
+            StoreGeneration(7),
+            keypair.signer(),
+        )
+        .unwrap();
+        let batch = batch();
+        let reference = reference(&batch, keypair.public);
+        let before_store = store.durability_metrics();
+        store.store_batch(&reference, &batch).unwrap();
+        let metrics = store.durability_metrics();
+        assert_eq!(metrics.commit_count, before_store.commit_count + 1);
+        assert_eq!(metrics.commit_count, metrics.fsync_count);
+        drop(store);
+
+        assert!(
+            DurableAdmissionStore::open(
+                &path,
+                SiteId("site-b".to_string()),
+                StoreGeneration(7),
+                keypair.signer(),
+            )
+            .is_err()
+        );
+        assert!(
+            DurableAdmissionStore::open(
+                &path,
+                SiteId("site-a".to_string()),
+                StoreGeneration(8),
+                keypair.signer(),
+            )
+            .is_err()
+        );
+        assert!(
+            DurableAdmissionStore::open(
+                &path,
+                SiteId("site-a".to_string()),
+                StoreGeneration(7),
+                other.signer(),
+            )
+            .is_err()
+        );
+
+        let reopened = DurableAdmissionStore::open(
+            &path,
+            SiteId("site-a".to_string()),
+            StoreGeneration(7),
+            keypair.signer(),
+        )
+        .unwrap();
+        let mut wrong_cluster = reference.clone();
+        wrong_cluster.cluster_id = HashType([9; 32]);
+        assert!(reopened.store_batch(&wrong_cluster, &batch).is_err());
+        let mut wrong_group = reference;
+        wrong_group.consensus_group_id = ConsensusGroupId::named("wrong-group");
+        assert!(reopened.store_batch(&wrong_group, &batch).is_err());
+        drop(reopened);
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn legacy_store_without_identity_requires_fresh_initialization() {
+        let keypair = Keypair::generate();
+        let path = std::env::temp_dir().join(format!(
+            "blossom-active-active-legacy-{}-{}.redb",
+            std::process::id(),
+            keypair.public
+        ));
+        let database = Database::create(&path).unwrap();
+        let transaction = database.begin_write().unwrap();
+        transaction.open_table(COMMANDS_TABLE).unwrap();
+        transaction.commit().unwrap();
+        drop(database);
+
+        assert!(
+            DurableAdmissionStore::open(
+                &path,
+                SiteId("site-a".to_string()),
+                StoreGeneration(1),
+                keypair.signer(),
+            )
+            .is_err()
+        );
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn command_batches_and_dedup_sessions_are_bounded() {
+        let commands = (1..=DEFAULT_MAX_BATCH_COMMANDS + 1)
+            .map(|sequence| AdmittedCommand {
+                origin_sequence: sequence as u64,
+                command: command(
+                    u8::try_from(sequence % 251).unwrap(),
+                    sequence as u64,
+                    b"value",
+                ),
+            })
+            .collect();
+        assert!(CommandBatch { commands }.validate().is_err());
+
+        let mut machine = SharedStateMachine {
+            values: BTreeMap::new(),
+            deduplication: DeduplicationWindow::new_bounded(8, 2).unwrap(),
+        };
+        machine.apply(&command(1, 1, b"one")).unwrap();
+        machine.apply(&command(2, 1, b"two")).unwrap();
+        assert_eq!(
+            machine.apply(&command(3, 1, b"three")),
+            Err(BlossomError::BlockQueueFull)
+        );
+    }
+
+    #[test]
     fn trusted_order_receipt_survives_restart_without_becoming_verified() {
         let keypairs = (0..3).map(|_| Keypair::generate()).collect::<Vec<_>>();
         let sites = ["site-a", "site-b", "site-c"];
@@ -3080,6 +3724,44 @@ mod tests {
                 .get(&1)
                 .is_some_and(|receipt| receipt.signatures.is_empty())
         );
+        {
+            let read = stores[0].database.begin_read().unwrap();
+            assert_eq!(
+                read.open_table(AVAILABLE_REFERENCES_TABLE)
+                    .unwrap()
+                    .len()
+                    .unwrap(),
+                1
+            );
+            assert_eq!(
+                read.open_table(FINALIZED_POSITIONS_TABLE)
+                    .unwrap()
+                    .len()
+                    .unwrap(),
+                1
+            );
+            assert_eq!(
+                read.open_table(POSITION_REFERENCES_TABLE)
+                    .unwrap()
+                    .len()
+                    .unwrap(),
+                1
+            );
+            assert!(
+                read.open_table(ORDERED_METADATA_TABLE)
+                    .unwrap()
+                    .get(ORDERED_METADATA_KEY)
+                    .unwrap()
+                    .is_some()
+            );
+            assert!(
+                read.open_table(ACTIVE_STATE_TABLE)
+                    .unwrap()
+                    .get("ordered_engine")
+                    .unwrap()
+                    .is_none()
+            );
+        }
         drop(engine);
 
         let restarted = GlobalOrderedEngine::new_with_trust_mode(
@@ -3099,6 +3781,10 @@ mod tests {
                 .map(|receipt| &receipt.statement),
             Some(&statement)
         );
+        assert_eq!(
+            restarted.acquire_read_barrier().unwrap(),
+            Watermark { position: 1 }
+        );
         drop(restarted);
 
         assert!(
@@ -3108,6 +3794,45 @@ mod tests {
                 holder_membership,
                 ValidatorGeneration(5),
                 validators,
+                64,
+            )
+            .is_err()
+        );
+        {
+            let mut transaction = stores[0].database.begin_write().unwrap();
+            transaction.set_durability(Durability::Immediate).unwrap();
+            transaction
+                .open_table(FINALIZED_POSITIONS_TABLE)
+                .unwrap()
+                .remove(1)
+                .unwrap();
+            transaction.commit().unwrap();
+        }
+        assert!(
+            GlobalOrderedEngine::new_with_trust_mode(
+                stores[0].clone(),
+                ActiveActiveConsistencyMode::ActiveSyncGlobalOrdered,
+                HolderMembership {
+                    epoch: ReplicaMembershipEpoch(3),
+                    members_by_site: keypairs
+                        .iter()
+                        .enumerate()
+                        .map(|(index, keypair)| {
+                            (
+                                SiteId(sites[index].to_string()),
+                                [keypair.public].into_iter().collect(),
+                            )
+                        })
+                        .collect(),
+                    store_generations: keypairs
+                        .iter()
+                        .map(|keypair| (keypair.public, StoreGeneration(1)))
+                        .collect(),
+                    holder_fault_bound: 0,
+                },
+                ValidatorGeneration(5),
+                keypairs.iter().map(|keypair| keypair.public).collect(),
+                TrustMode::Trusted,
                 64,
             )
             .is_err()
@@ -3563,6 +4288,15 @@ mod tests {
                 )
                 .unwrap(),
             Some(b"globally-ordered".to_vec())
+        );
+        assert!(
+            restarted
+                .read(
+                    b"key",
+                    ReadConsistency::Linearizable,
+                    Some(Watermark::default())
+                )
+                .is_err()
         );
         drop(restarted);
         drop(stores);
