@@ -2296,16 +2296,18 @@ impl GlobalOrderedEngine {
             .get(&reference_hash)
             .expect("finality requires availability certificate");
         let Some(batch) = self.store.load_batch(&availability.reference)? else {
-            self.telemetry.record(
-                TelemetryEvent::new(
-                    TelemetryEventKind::Event,
-                    "apply",
-                    "head_of_line_unavailable",
-                )
-                .with_outcome("blocked")
-                .with_field("watermark", self.applied_watermark.position.to_string())
-                .with_field("blocked_reference", reference_hash.to_string()),
-            );
+            if self.telemetry.is_enabled() {
+                self.telemetry.record(
+                    TelemetryEvent::new(
+                        TelemetryEventKind::Event,
+                        "apply",
+                        "head_of_line_unavailable",
+                    )
+                    .with_outcome("blocked")
+                    .with_field("watermark", self.applied_watermark.position.to_string())
+                    .with_field("blocked_reference", reference_hash.to_string()),
+                );
+            }
             return Ok(ApplyProgress::HeadOfLineUnavailable {
                 watermark: self.applied_watermark,
                 blocked_reference: reference_hash,

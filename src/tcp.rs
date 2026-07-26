@@ -797,10 +797,6 @@ async fn handle_runtime_request(
                 runtime.receive_message(message)?,
             )),
         },
-        #[cfg(feature = "high-availability")]
-        WireRequest::HighAvailability(_) | WireRequest::HighAvailabilityStatus => Err(
-            BlossomError::WireProtocol("HA messages require HighAvailabilityTcpNode".to_string()),
-        ),
         WireRequest::SendNonce(_) | WireRequest::BlockNonce(_) => Ok(WireResponse::Ok),
         WireRequest::GetBlock(nonce) => match runtime.durable_block_by_nonce(nonce)? {
             Some(block) => Ok(WireResponse::Block(block)),

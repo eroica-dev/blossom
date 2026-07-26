@@ -509,10 +509,6 @@ fn request_kind(request: &WireRequest) -> &'static str {
         WireRequest::Dispatch { .. } => "dispatch",
         WireRequest::PrefillDispatch(_) => "prefill_dispatch",
         WireRequest::Message(_) => "message",
-        #[cfg(feature = "high-availability")]
-        WireRequest::HighAvailability(_) => "high_availability",
-        #[cfg(feature = "high-availability")]
-        WireRequest::HighAvailabilityStatus => "high_availability_status",
         WireRequest::SendNonce(_) => "send_nonce",
         WireRequest::BlockNonce(_) => "block_nonce",
         WireRequest::GetBlock(_) => "get_block",

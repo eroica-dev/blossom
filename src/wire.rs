@@ -28,8 +28,6 @@ use crate::encounter::{
 use crate::error::{BlossomError, Result};
 use crate::group::ConsensusGroupId;
 use crate::hash::{DoHash, HashType, ProtocolHasher};
-#[cfg(feature = "high-availability")]
-use crate::high_availability::{HaMessage, HaNodeStatus, HaWireReceipt};
 use crate::messages::{MSGKey, Msg};
 use crate::nonce::Nonce;
 use crate::runtime::{AcceptedBlock, EpochTarget, MessageReceipt, NodeStatus};
@@ -103,10 +101,6 @@ pub enum WireRequest {
     },
     PrefillDispatch(Dispatch),
     Message(Msg),
-    #[cfg(feature = "high-availability")]
-    HighAvailability(HaMessage),
-    #[cfg(feature = "high-availability")]
-    HighAvailabilityStatus,
     SendNonce(Nonce),
     BlockNonce(Nonce),
     GetBlock(Nonce),
@@ -137,10 +131,6 @@ pub enum WireResponse {
     BlockAccepted(AcceptedBlock),
     Dispatch(Dispatch),
     MessageReceipt(MessageReceipt),
-    #[cfg(feature = "high-availability")]
-    HighAvailabilityReceipt(HaWireReceipt),
-    #[cfg(feature = "high-availability")]
-    HighAvailabilityStatus(HaNodeStatus),
     EchoReDispatch(Option<EchoReDispatch>),
     Block(Block),
     BlocksByHash(BTreeMap<HashType, Block>),
@@ -206,10 +196,6 @@ impl WireResponse {
             Self::BlockAccepted(_) => "block_accepted",
             Self::Dispatch(_) => "dispatch",
             Self::MessageReceipt(_) => "message_receipt",
-            #[cfg(feature = "high-availability")]
-            Self::HighAvailabilityReceipt(_) => "high_availability_receipt",
-            #[cfg(feature = "high-availability")]
-            Self::HighAvailabilityStatus(_) => "high_availability_status",
             Self::EchoReDispatch(_) => "echo_redispatch",
             Self::Block(_) => "block",
             Self::BlocksByHash(_) => "blocks_by_hash",

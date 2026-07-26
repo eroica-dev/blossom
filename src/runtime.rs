@@ -840,6 +840,9 @@ impl NodeRuntime {
         event: impl Into<String>,
         target: Option<&EpochTarget>,
     ) {
+        if !self.inner.telemetry.is_enabled() {
+            return;
+        }
         let mut telemetry =
             TelemetryEvent::new(crate::telemetry::TelemetryEventKind::Event, stage, event)
                 .with_node(self.self_node().public_key())
@@ -867,6 +870,9 @@ impl NodeRuntime {
         error: &BlossomError,
         target: Option<&EpochTarget>,
     ) {
+        if !self.inner.telemetry.is_enabled() {
+            return;
+        }
         let mut telemetry =
             TelemetryEvent::new(crate::telemetry::TelemetryEventKind::Event, stage, event)
                 .with_node(self.self_node().public_key())
@@ -4428,7 +4434,10 @@ impl NodeRuntime {
         Ok(MessageReceipt::accepted("epoch_started"))
     }
 
-    fn start_telemetry_span(&self, meta: RuntimeTelemetryMeta) -> RuntimeTelemetrySpan {
+    fn start_telemetry_span(&self, meta: RuntimeTelemetryMeta) -> Option<RuntimeTelemetrySpan> {
+        if !self.inner.telemetry.is_enabled() {
+            return None;
+        }
         let span_id = self
             .inner
             .next_telemetry_span_id
@@ -4439,10 +4448,13 @@ impl NodeRuntime {
         event = apply_telemetry_meta(event, &meta);
         event = self.with_quorum_telemetry(event);
         self.inner.telemetry.record(event);
-        RuntimeTelemetrySpan { span_id, meta }
+        Some(RuntimeTelemetrySpan { span_id, meta })
     }
 
-    fn finish_telemetry_span<T>(&self, span: RuntimeTelemetrySpan, result: &Result<T>) {
+    fn finish_telemetry_span<T>(&self, span: Option<RuntimeTelemetrySpan>, result: &Result<T>) {
+        let Some(span) = span else {
+            return;
+        };
         let mut event = TelemetryEvent::span_end(span.span_id, span.meta.stage, span.meta.event)
             .with_node(self.self_node().public_key())
             .with_group_id(self.inner.group_id)

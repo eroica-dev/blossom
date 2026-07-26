@@ -34,12 +34,15 @@ pub enum BlossomError {
     Io(String),
     InvalidFrameSize(usize),
     InvalidQuorumSize(usize),
+    #[cfg(feature = "high-availability")]
     InvalidHighAvailabilityNodeCount(usize),
+    #[cfg(feature = "high-availability")]
     EpochSealed {
         target: crate::nonce::Nonce,
         sealed: crate::nonce::Nonce,
         writable: crate::nonce::Nonce,
     },
+    #[cfg(feature = "high-availability")]
     WatermarkNotSealed {
         required: u64,
         sealed: u64,
@@ -89,10 +92,12 @@ impl fmt::Display for BlossomError {
                 f,
                 "invalid Blossom quorum size {size}: expected an integer >= 3 divisible by 3"
             ),
+            #[cfg(feature = "high-availability")]
             Self::InvalidHighAvailabilityNodeCount(size) => write!(
                 f,
                 "invalid Blossom HA node count {size}: expected 2..=7 fixed identities"
             ),
+            #[cfg(feature = "high-availability")]
             Self::EpochSealed {
                 target,
                 sealed,
@@ -101,6 +106,7 @@ impl fmt::Display for BlossomError {
                 f,
                 "target epoch {target} is sealed at {sealed}; resubmit explicitly at writable epoch {writable}"
             ),
+            #[cfg(feature = "high-availability")]
             Self::WatermarkNotSealed { required, sealed } => write!(
                 f,
                 "required watermark {required} is not sealed; current sealed watermark is {sealed}"

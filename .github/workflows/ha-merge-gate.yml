@@ -25,15 +25,15 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Install Rust 1.90
-        uses: dtolnay/rust-toolchain@1.90.0
+      - name: Install Rust 1.93
+        uses: dtolnay/rust-toolchain@1.93.0
         with:
           components: clippy,rustfmt
 
       - name: Cache Cargo build outputs
         uses: Swatinem/rust-cache@v2
 
-      - name: Verify HA-only source isolation
+      - name: Verify HA wire and feature isolation
         run: ./scripts/check-ha-isolation.sh "origin/${GITHUB_BASE_REF:-main}"
 
       - name: Run mandatory release and HA validation

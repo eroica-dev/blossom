@@ -17,14 +17,13 @@ use std::collections::{BTreeMap, BTreeSet};
 use borsh::{BorshDeserialize, BorshSerialize};
 use serde::{Deserialize, Serialize};
 
-use crate::active_active::Watermark;
 use crate::crypto::PubKey;
 use crate::error::{BlossomError, Result};
 use crate::group::ConsensusGroupId;
 use crate::hash::{HashType, ProtocolHasher};
 use crate::high_availability::{
     EpochLifecycle, HaEpoch, HaMemberSlot, HaMemberSlots, HighAvailabilityParameters,
-    HighAvailabilityRuntime, MIN_HA_NODES, StateRevision, high_availability_majority,
+    HighAvailabilityRuntime, MIN_HA_NODES, StateRevision, Watermark, high_availability_majority,
 };
 use crate::node::NodeIdentity;
 use crate::nonce::Nonce;

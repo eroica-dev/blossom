@@ -14,7 +14,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use fast_telemetry::Counter;
 #[cfg(feature = "telemetry")]
 use fast_telemetry::{
-    DeriveLabel, Gauge, Histogram, LabeledCounter, MetricScope, RegisteredMetrics, Span,
+    DeriveLabel, Gauge, Histogram, LabeledCounter, MaxGauge, MetricScope, RegisteredMetrics, Span,
     SpanAttribute, SpanCollector, SpanKind, SpanStatus,
 };
 use serde::{Deserialize, Serialize};
@@ -244,18 +244,33 @@ pub trait TelemetrySink: Send + Sync + 'static {
 #[derive(Clone)]
 pub struct TelemetryHandle {
     sink: Arc<dyn TelemetrySink>,
+    enabled: bool,
 }
 
 impl TelemetryHandle {
     pub fn new(sink: Arc<dyn TelemetrySink>) -> Self {
-        Self { sink }
+        Self {
+            sink,
+            enabled: true,
+        }
     }
 
+    #[inline]
+    pub fn is_enabled(&self) -> bool {
+        self.enabled
+    }
+
+    #[inline]
     pub fn record(&self, event: TelemetryEvent) {
-        self.sink.record(event);
+        if self.enabled {
+            self.sink.record(event);
+        }
     }
 
     pub fn record_milestone(&self, event: &crate::active_active::MilestoneEvent) {
+        if !self.enabled {
+            return;
+        }
         let milestone = match event.milestone {
             crate::active_active::Milestone::AcceptedLocal => "accepted_local",
             crate::active_active::Milestone::Available => "available",
@@ -284,6 +299,9 @@ impl TelemetryHandle {
         group_id: ConsensusGroupId,
         status: &crate::runtime::TrustedOperationalStatus,
     ) {
+        if !self.enabled {
+            return;
+        }
         self.record(
             TelemetryEvent::new(TelemetryEventKind::Event, "service", "trusted_status")
                 .with_node(node)
@@ -331,6 +349,9 @@ impl TelemetryHandle {
         error: &crate::BlossomError,
         assessment: &crate::trusted_log::TrustedFailureAssessment,
     ) {
+        if !self.enabled {
+            return;
+        }
         self.record(
             TelemetryEvent::new(TelemetryEventKind::Event, "service", "trusted_failure")
                 .with_node(node)
@@ -352,6 +373,9 @@ impl TelemetryHandle {
         head_nonce: Nonce,
         status: &crate::high_availability::HaOperationalStatus,
     ) {
+        if !self.enabled {
+            return;
+        }
         self.record(
             TelemetryEvent::new(TelemetryEventKind::Event, "service", "ha_status")
                 .with_node(node)
@@ -373,7 +397,10 @@ impl TelemetryHandle {
 
 impl Default for TelemetryHandle {
     fn default() -> Self {
-        Self::new(Arc::new(NoopTelemetrySink))
+        Self {
+            sink: Arc::new(NoopTelemetrySink),
+            enabled: false,
+        }
     }
 }
 
@@ -519,8 +546,8 @@ pub struct BlossomTelemetryMetrics {
     span_duration_micros: Histogram,
     #[help = "Current open Blossom protocol spans"]
     open_spans: Gauge,
-    #[help = "Latest observed Blossom nonce"]
-    last_nonce: Gauge,
+    #[help = "Highest observed Blossom nonce"]
+    last_nonce: MaxGauge,
     #[help = "Latest observed Blossom round"]
     last_round: Gauge,
 }
@@ -542,7 +569,7 @@ impl BlossomTelemetryMetrics {
             reported_bytes_total: Counter::new(shard_count),
             span_duration_micros: Histogram::with_latency_buckets(shard_count),
             open_spans: Gauge::new(),
-            last_nonce: Gauge::new(),
+            last_nonce: MaxGauge::new(shard_count),
             last_round: Gauge::new(),
         }
     }
@@ -696,7 +723,7 @@ impl FastTelemetrySink {
         if let Some(nonce) = event.nonce {
             self.metrics
                 .last_nonce
-                .set(i64::try_from(nonce.value()).unwrap_or(i64::MAX));
+                .observe(i64::try_from(nonce.value()).unwrap_or(i64::MAX));
         }
         if let Some(round) = event.round {
             self.metrics.last_round.set(i64::from(round));
@@ -1296,6 +1323,14 @@ mod tests {
     use super::*;
 
     #[test]
+    fn default_handle_disables_event_construction_paths() {
+        assert!(!TelemetryHandle::default().is_enabled());
+
+        let sink = Arc::new(InMemoryTelemetrySink::default());
+        assert!(TelemetryHandle::new(sink).is_enabled());
+    }
+
+    #[test]
     fn severity_classifies_actionable_failures_and_degradation() {
         assert_eq!(
             TelemetryEvent::new(TelemetryEventKind::Event, "transport", "connected").severity(),
@@ -1342,6 +1377,7 @@ mod tests {
         handle.record(
             TelemetryEvent::span_start_with_timestamp_micros(7, "dispatch", "ha_dispatch", 1_000)
                 .with_node(PubKey([1; 32]))
+                .with_target(HashType::default(), Nonce::new(9))
                 .with_round(2),
         );
         handle.record(
@@ -1354,6 +1390,7 @@ mod tests {
         handle.record(
             TelemetryEvent::span_start_with_timestamp_micros(7, "dispatch", "ha_dispatch", 2_000)
                 .with_node(PubKey([2; 32]))
+                .with_target(HashType::default(), Nonce::new(4))
                 .with_round(2),
         );
         handle.record(
@@ -1385,6 +1422,7 @@ mod tests {
         assert_eq!(snapshot.span_samples, 2);
         assert_eq!(snapshot.span_duration_micros_sum, 350);
         assert_eq!(snapshot.open_spans, 0);
+        assert_eq!(snapshot.last_nonce, 9);
         assert_eq!(snapshot.last_round, 2);
 
         let mut spans = Vec::new();

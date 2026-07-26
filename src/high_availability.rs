@@ -3548,11 +3548,11 @@ impl HighAvailabilityRuntime {
         event: impl Into<String>,
         error: &BlossomError,
     ) {
-        self.telemetry.record(
+        self.record_telemetry(|| {
             self.telemetry_event(stage, event)
                 .with_outcome("error")
-                .with_error(error.to_string()),
-        );
+                .with_error(error.to_string())
+        });
     }
 
     fn self_public_key(&self) -> PubKey {
@@ -3582,7 +3582,17 @@ impl HighAvailabilityRuntime {
             .with_field("parameters_hash", self.state.parameters.hash().to_string())
     }
 
+    #[inline]
+    fn record_telemetry(&self, build: impl FnOnce() -> TelemetryEvent) {
+        if self.telemetry.is_enabled() {
+            self.telemetry.record(build());
+        }
+    }
+
     fn record_operational_status(&self) {
+        if !self.telemetry.is_enabled() {
+            return;
+        }
         let Ok(status) = self.status() else {
             return;
         };
@@ -3597,14 +3607,14 @@ impl HighAvailabilityRuntime {
 
     pub fn assess_failure(&self, error: &BlossomError) -> HaFailureAssessment {
         let assessment = assess_high_availability_failure(error);
-        self.telemetry.record(
+        self.record_telemetry(|| {
             self.telemetry_event("service", "ha_failure")
                 .with_outcome("error")
                 .with_error(error.to_string())
                 .with_field("class", format!("{:?}", assessment.class))
                 .with_field("retry_in_process", assessment.retry_in_process.to_string())
-                .with_field("directives", format!("{:?}", assessment.directives)),
-        );
+                .with_field("directives", format!("{:?}", assessment.directives))
+        });
         assessment
     }
 
@@ -3864,12 +3874,12 @@ impl HighAvailabilityRuntime {
         }
         self.state = replacement;
         let revision = self.revision()?;
-        self.telemetry.record(
+        self.record_telemetry(|| {
             self.telemetry_event("recovery", "snapshot_installed")
                 .with_outcome("ok")
                 .with_field("revision_hash", revision.revision_hash.to_string())
-                .with_field("sealed_watermark", revision.sealed.position.to_string()),
-        );
+                .with_field("sealed_watermark", revision.sealed.position.to_string())
+        });
         self.record_operational_status();
         Ok(revision)
     }
@@ -3922,7 +3932,7 @@ impl HighAvailabilityRuntime {
         self.state
             .round
             .receive_dispatch(&self.state.members, dispatch.clone())?;
-        self.telemetry.record(
+        self.record_telemetry(|| {
             self.telemetry_event("dispatch", "dispatch_built")
                 .with_outcome("ok")
                 .with_field("slot", dispatch.sender.0.to_string())
@@ -3933,8 +3943,8 @@ impl HighAvailabilityRuntime {
                     borsh::object_length(&dispatch.block)
                         .unwrap_or_default()
                         .to_string(),
-                ),
-        );
+                )
+        });
         // The local block becomes externally durable evidence when
         // `acknowledge()` persists the complete receipt state. A crash before
         // that point emitted no acknowledgement and may safely replay.
@@ -3962,11 +3972,11 @@ impl HighAvailabilityRuntime {
             .receive_dispatch(&self.state.members, dispatch)?;
         // Do not fsync each arrival. The receiver persists all accepted block
         // bytes before broadcasting its monotonic acknowledgement.
-        self.telemetry.record(
+        self.record_telemetry(|| {
             self.telemetry_event("dispatch", "dispatch_received")
                 .with_outcome("ok")
-                .with_field("outcome", format!("{outcome:?}")),
-        );
+                .with_field("outcome", format!("{outcome:?}"))
+        });
         Ok(HaRuntimeEvent::Dispatch(outcome))
     }
 
@@ -3981,12 +3991,12 @@ impl HighAvailabilityRuntime {
             self.state.round.acknowledgements[sender_index] = previous_acknowledgement;
             return Err(error);
         }
-        self.telemetry.record(
+        self.record_telemetry(|| {
             self.telemetry_event("acknowledge", "acknowledgement_persisted")
                 .with_outcome("ok")
                 .with_field("sender_slot", acknowledgement.sender.0.to_string())
-                .with_field("received_mask", acknowledgement.received_mask.to_string()),
-        );
+                .with_field("received_mask", acknowledgement.received_mask.to_string())
+        });
         Ok(acknowledgement)
     }
 
@@ -4012,12 +4022,12 @@ impl HighAvailabilityRuntime {
         self.state
             .round
             .receive_acknowledgement(&self.state.members, acknowledgement)?;
-        self.telemetry.record(
+        self.record_telemetry(|| {
             self.telemetry_event("acknowledge", "acknowledgement_received")
                 .with_outcome("ok")
                 .with_field("sender_slot", sender.0.to_string())
-                .with_field("received_mask", received_mask.to_string()),
-        );
+                .with_field("received_mask", received_mask.to_string())
+        });
         // Acknowledgement observations are replayable until this node creates
         // its own durable confirmation lock.
         Ok(HaRuntimeEvent::Acknowledged)
@@ -4044,15 +4054,15 @@ impl HighAvailabilityRuntime {
             return Err(error);
         }
         let epoch = self.commit_finalized_round()?;
-        self.telemetry.record(
+        self.record_telemetry(|| {
             self.telemetry_event("confirm", "confirmation_persisted")
                 .with_outcome("ok")
                 .with_field("sender_slot", confirmation.sender.0.to_string())
                 .with_field(
                     "candidate_digest",
                     confirmation.candidate.digest.to_string(),
-                ),
-        );
+                )
+        });
         Ok((confirmation, epoch))
     }
 
@@ -4080,12 +4090,12 @@ impl HighAvailabilityRuntime {
         self.state
             .round
             .receive_confirmation(&self.state.members, confirmation)?;
-        self.telemetry.record(
+        self.record_telemetry(|| {
             self.telemetry_event("confirm", "confirmation_received")
                 .with_outcome("ok")
                 .with_field("sender_slot", sender.0.to_string())
-                .with_field("candidate_digest", candidate_digest.to_string()),
-        );
+                .with_field("candidate_digest", candidate_digest.to_string())
+        });
         match self.commit_finalized_round()? {
             Some(epoch) => Ok(HaRuntimeEvent::Finalized(Box::new(epoch))),
             // Peer confirmations can be retransmitted. Persisting each partial
@@ -4184,22 +4194,22 @@ impl HighAvailabilityRuntime {
             self.state.amendments.truncate(previous_amendment_count);
             return Err(error);
         }
-        self.telemetry.record(
+        self.record_telemetry(|| {
             self.telemetry_event("finality", "epoch_finalized")
                 .with_outcome("ok")
                 .with_target(epoch.hash, epoch.nonce)
                 .with_field("candidate_digest", epoch.candidate.digest.to_string())
                 .with_field("included_slots", epoch.candidate.included_mask.to_string())
                 .with_field("presence_mask", epoch.presence_mask.to_string())
-                .with_field("confirmation_mask", epoch.confirmation_mask.to_string()),
-        );
+                .with_field("confirmation_mask", epoch.confirmation_mask.to_string())
+        });
         let sealed = self.sealed_watermark();
         if sealed.position > 0 {
-            self.telemetry.record(
+            self.record_telemetry(|| {
                 self.telemetry_event("seal", "sealed_watermark_observed")
                     .with_outcome("ok")
-                    .with_field("watermark", sealed.position.to_string()),
-            );
+                    .with_field("watermark", sealed.position.to_string())
+            });
         }
         self.record_operational_status();
         Ok(Some(epoch))
@@ -4251,13 +4261,13 @@ impl HighAvailabilityRuntime {
             return Err(error);
         }
         let revision = self.revision()?;
-        self.telemetry.record(
+        self.record_telemetry(|| {
             self.telemetry_event("apply", "amendment_applied")
                 .with_outcome("ok")
                 .with_field("target_nonce", target_epoch_nonce.to_string())
                 .with_field("amendment_hash", incoming_hash.to_string())
-                .with_field("revision_hash", revision.revision_hash.to_string()),
-        );
+                .with_field("revision_hash", revision.revision_hash.to_string())
+        });
         Ok(revision)
     }
 
@@ -4635,7 +4645,7 @@ impl HighAvailabilityRuntime {
             self.state.round = previous_round;
             return Err(error);
         }
-        self.telemetry.record(
+        self.record_telemetry(|| {
             self.telemetry_event("membership", "membership_changed")
                 .with_outcome("ok")
                 .with_field("slot", proposal.slot.0.to_string())
@@ -4644,8 +4654,8 @@ impl HighAvailabilityRuntime {
                     "membership_generation",
                     self.state.membership_generation.to_string(),
                 )
-                .with_field("active_mask", self.state.members.active_mask().to_string()),
-        );
+                .with_field("active_mask", self.state.members.active_mask().to_string())
+        });
         self.record_operational_status();
         Ok(())
     }
