@@ -11,10 +11,42 @@ use blossom::{
     DispatchBody, EchoReDispatch, EchoRequest, EchoResponse, EchoResponseBody, EpochStarted,
     EpochStartedBody, EpochTarget, FanOutStrategy, HashType, Header, Keypair, MSGKey,
     MockBlockService, Msg, NodeAdmission, NodePing, Nonce, OverlayRuntime, Proposal, ProposalBody,
-    Service, ServiceKind, Signature, SimulatedCluster, TcpServiceClient, Transaction, TrustMode,
-    Verification, VerificationBody, WireRequest, WireResponse, select_prefill_recipients,
+    QuorumSize, Service, ServiceKind, Signature, SimulatedCluster, TcpNode, TcpServiceClient,
+    Transaction, TrustMode, Verification, VerificationBody, WireRequest, WireResponse,
+    select_prefill_recipients,
 };
 use blossom::{DoHash, EncodedFrame, NodeIdentity};
+
+struct ConsensusDriverTasks(Vec<tokio::task::JoinHandle<()>>);
+
+impl Drop for ConsensusDriverTasks {
+    fn drop(&mut self) {
+        for task in &self.0 {
+            task.abort();
+        }
+    }
+}
+
+fn start_consensus_drivers(
+    cluster: &SimulatedCluster,
+    config: ConsensusDriverConfig,
+) -> ConsensusDriverTasks {
+    ConsensusDriverTasks(
+        cluster
+            .nodes()
+            .iter()
+            .map(|node| {
+                let driver = TcpNode::with_metrics(node.runtime.clone(), node.metrics.clone());
+                let config = config.clone();
+                tokio::spawn(async move {
+                    if let Err(error) = driver.run_consensus_driver(config).await {
+                        panic!("staged consensus driver failed: {error}");
+                    }
+                })
+            })
+            .collect(),
+    )
+}
 
 #[tokio::test]
 async fn cluster_exposes_health_state_address_book_and_nonce() {
@@ -400,12 +432,10 @@ async fn all_validators_form_blocks_for_the_same_epoch_target() {
 
 #[tokio::test]
 async fn autonomous_tcp_driver_advances_all_nodes_through_epoch() {
-    let cluster = SimulatedCluster::spawn_autonomous_with_config(
+    let cluster = SimulatedCluster::spawn_manual_with_trust_mode_and_quorum(
         6,
-        ConsensusDriverConfig {
-            interval: std::time::Duration::from_millis(100),
-            ..ConsensusDriverConfig::default()
-        },
+        TrustMode::Verified,
+        QuorumSize::DEFAULT,
     )
     .await
     .unwrap();
@@ -432,6 +462,13 @@ async fn autonomous_tcp_driver_advances_all_nodes_through_epoch() {
         }
     }
 
+    let _drivers = start_consensus_drivers(
+        &cluster,
+        ConsensusDriverConfig {
+            interval: std::time::Duration::from_millis(100),
+            ..ConsensusDriverConfig::default()
+        },
+    );
     let (final_hash, block_count) = wait_for_same_finalized_epoch(&cluster, first_target.nonce, 3)
         .await
         .unwrap();
@@ -441,17 +478,10 @@ async fn autonomous_tcp_driver_advances_all_nodes_through_epoch() {
 
 #[tokio::test]
 async fn autonomous_tcp_driver_finalizes_36_node_v2_two_round_epoch() {
-    let cluster = SimulatedCluster::spawn_autonomous_with_config(
+    let cluster = SimulatedCluster::spawn_manual_with_trust_mode_and_quorum(
         36,
-        ConsensusDriverConfig {
-            interval: std::time::Duration::from_millis(50),
-            event_driven: false,
-            max_round: 1,
-            drive_prefill: true,
-            drive_dispatch: true,
-            require_local_pending_block: false,
-            continue_after_error: false,
-        },
+        TrustMode::Verified,
+        QuorumSize::DEFAULT,
     )
     .await
     .unwrap();
@@ -478,6 +508,18 @@ async fn autonomous_tcp_driver_finalizes_36_node_v2_two_round_epoch() {
         }
     }
 
+    let _drivers = start_consensus_drivers(
+        &cluster,
+        ConsensusDriverConfig {
+            interval: std::time::Duration::from_millis(50),
+            event_driven: false,
+            max_round: 1,
+            drive_prefill: true,
+            drive_dispatch: true,
+            require_local_pending_block: false,
+            continue_after_error: false,
+        },
+    );
     let (_final_hash, block_count) = wait_for_same_finalized_epoch(&cluster, first_target.nonce, 8)
         .await
         .unwrap();
@@ -486,17 +528,10 @@ async fn autonomous_tcp_driver_finalizes_36_node_v2_two_round_epoch() {
 
 #[tokio::test]
 async fn autonomous_tcp_driver_finalizes_24_node_non_power_topology_epoch() {
-    let cluster = SimulatedCluster::spawn_autonomous_with_config(
+    let cluster = SimulatedCluster::spawn_manual_with_trust_mode_and_quorum(
         24,
-        ConsensusDriverConfig {
-            interval: std::time::Duration::from_millis(20),
-            event_driven: false,
-            max_round: 1,
-            drive_prefill: false,
-            drive_dispatch: true,
-            require_local_pending_block: false,
-            continue_after_error: false,
-        },
+        TrustMode::Verified,
+        QuorumSize::DEFAULT,
     )
     .await
     .unwrap();
@@ -523,6 +558,18 @@ async fn autonomous_tcp_driver_finalizes_24_node_non_power_topology_epoch() {
         }
     }
 
+    let _drivers = start_consensus_drivers(
+        &cluster,
+        ConsensusDriverConfig {
+            interval: std::time::Duration::from_millis(20),
+            event_driven: false,
+            max_round: 1,
+            drive_prefill: false,
+            drive_dispatch: true,
+            require_local_pending_block: false,
+            continue_after_error: false,
+        },
+    );
     let (_final_hash, block_count) = wait_for_same_finalized_epoch(&cluster, first_target.nonce, 8)
         .await
         .unwrap();

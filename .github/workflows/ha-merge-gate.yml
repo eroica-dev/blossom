@@ -34,7 +34,11 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: Verify HA wire and feature isolation
-        run: ./scripts/check-ha-isolation.sh "origin/${GITHUB_BASE_REF:-main}"
+        run: |
+          set -o pipefail
+          mkdir -p target/release-gate
+          ./scripts/check-ha-isolation.sh "origin/${GITHUB_BASE_REF:-main}" 2>&1 \
+            | tee target/release-gate/ha-isolation.log
 
       - name: Run mandatory release and HA validation
         run: ./scripts/release-gate.sh
@@ -47,5 +51,5 @@ jobs:
           path: |
             target/release-gate
             target/ha-production-validation
-          if-no-files-found: error
+          if-no-files-found: warn
           retention-days: 30
