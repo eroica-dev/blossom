@@ -1,0 +1,18 @@
+[package]
+name = "blossom-bench-harness"
+version = "2.0.0"
+edition = "2024"
+rust-version = "1.93"
+publish = false
+
+[dependencies]
+blossom = { package = "blossom-consensus", path = "../..", features = ["active-passive"] }
+borsh = { version = "1.5.7", features = ["derive"] }
+clap = { version = "4.5", features = ["derive", "env"] }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.145"
+tokio = { version = "1.48", features = ["macros", "net", "rt-multi-thread", "sync", "time"] }
+
+[[bin]]
+name = "blossom-raft-deterministic"
+path = "src/bin/blossom-raft-deterministic.rs"

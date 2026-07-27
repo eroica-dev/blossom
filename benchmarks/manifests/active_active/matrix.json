@@ -1,0 +1,724 @@
+{
+  "schema_version": 1,
+  "blossom_quorum_size": 6,
+  "openraft_version": "0.9.24",
+  "shard_stream_revision": "03ef769a46d574622a838fca7b4884a93ba24177",
+  "hegeltest_version": "0.28.2",
+  "methodology": {
+    "paired_repetitions": 12,
+    "steady_state": {
+      "secs": 300,
+      "nanos": 0
+    },
+    "minimum_applied_samples_per_cell": 100000,
+    "bootstrap_resamples": 10000,
+    "block_duration": {
+      "secs": 1,
+      "nanos": 0
+    }
+  },
+  "normalized_workload": {
+    "logical_commands": 100000,
+    "payload_bytes_per_command": 256,
+    "producer_linger_micros": 1000,
+    "maximum_in_flight": 256,
+    "pending_byte_limit": 67108864,
+    "persistent_connections_per_node": 1,
+    "tls_enabled": false
+  },
+  "execution_profiles": [
+    "InMemoryProtocolCore",
+    "PersistentConnectionMultiProcess",
+    "DurableShardStream",
+    "SnapshotCompactionRestartCatchUp",
+    "Rustls"
+  ],
+  "deterministic_fault_scenarios": [
+    {
+      "RandomFollowerLoss": {
+        "milestone": "Applied",
+        "after_commands": 50000
+      }
+    },
+    {
+      "CurrentRaftLeaderLoss": {
+        "milestone": "Applied",
+        "after_commands": 50000
+      }
+    },
+    {
+      "OneSiteLoss": {
+        "milestone": "Applied",
+        "after_commands": 50000
+      }
+    },
+    {
+      "MinorityPartition": {
+        "milestone": "Applied",
+        "after_commands": 50000
+      }
+    },
+    {
+      "MajorityPartition": {
+        "milestone": "Applied",
+        "after_commands": 50000
+      }
+    },
+    {
+      "AsymmetricOneWayPartition": {
+        "milestone": "Applied",
+        "after_commands": 50000
+      }
+    },
+    {
+      "PacketReordering": {
+        "milestone": "Applied",
+        "after_commands": 50000
+      }
+    },
+    {
+      "SlowCpu": {
+        "milestone": "Applied",
+        "after_commands": 50000
+      }
+    },
+    {
+      "SlowDisk": {
+        "milestone": "Applied",
+        "after_commands": 50000
+      }
+    },
+    {
+      "MembershipChurn": {
+        "milestone": "Applied",
+        "after_commands": 50000
+      }
+    },
+    {
+      "StorageExhaustion": {
+        "milestone": "Applied",
+        "after_commands": 50000
+      }
+    },
+    {
+      "FsyncFailure": {
+        "milestone": "Applied",
+        "after_commands": 50000
+      }
+    },
+    {
+      "Corruption": {
+        "milestone": "Applied",
+        "after_commands": 50000
+      }
+    },
+    {
+      "PowerLoss": {
+        "milestone": "Applied",
+        "after_commands": 50000
+      }
+    },
+    {
+      "BlossomEquivocation": {
+        "milestone": "Applied",
+        "after_commands": 50000
+      }
+    },
+    {
+      "BlossomWithholding": {
+        "milestone": "Applied",
+        "after_commands": 50000
+      }
+    },
+    {
+      "BlossomReplay": {
+        "milestone": "Applied",
+        "after_commands": 50000
+      }
+    },
+    {
+      "ConflictingRangeClaim": {
+        "milestone": "Applied",
+        "after_commands": 50000
+      }
+    },
+    {
+      "FinalizedUnavailableHeadOfLine": {
+        "milestone": "Applied",
+        "after_commands": 50000
+      }
+    }
+  ],
+  "equal_fault_tolerance": [
+    {
+      "matrix": "EqualFaultTolerance",
+      "physical_machines": 3,
+      "blossom_quorum_size": 3,
+      "raft_voters": 3,
+      "raft_learners": 0,
+      "safety_equivalent": true,
+      "publishable_as_safety_equivalent": true,
+      "safety_manifest": {
+        "version": 1,
+        "consensus_parameters_hash": "006fdc7f29d8858e3c432adb1cb2ef5d219b74f609de30a715c7fbcb43f7e69d",
+        "configured_quorum_size": 3,
+        "effective_quorum_size": 3,
+        "validator_count": 3,
+        "committee_layout": {
+          "members": [
+            {
+              "node": "0000000000000000000000000000000000000000000000000000000000000000",
+              "site": "site-0"
+            },
+            {
+              "node": "0101010101010101010101010101010101010101010101010101010101010101",
+              "site": "site-1"
+            },
+            {
+              "node": "0202020202020202020202020202020202020202020202020202020202020202",
+              "site": "site-2"
+            }
+          ],
+          "members_by_site": {
+            "site-0": [
+              "0000000000000000000000000000000000000000000000000000000000000000"
+            ],
+            "site-1": [
+              "0101010101010101010101010101010101010101010101010101010101010101"
+            ],
+            "site-2": [
+              "0202020202020202020202020202020202020202020202020202020202020202"
+            ]
+          }
+        },
+        "local_finality_threshold": 2,
+        "global_finality_threshold": 2,
+        "local_minimum_intersection": 1,
+        "global_minimum_intersection": 1,
+        "validator_byzantine_fault_bound": 0,
+        "holder_fault_bound": 0,
+        "max_validator_liveness_omissions": 1,
+        "site_loss_tolerance": true,
+        "liveness_stop_conditions": [
+          "fewer than 2 validators can participate",
+          "fewer than 2 selected committee members can participate",
+          "a finalized reference at the stable-prefix head is unavailable"
+        ]
+      }
+    },
+    {
+      "matrix": "EqualFaultTolerance",
+      "physical_machines": 6,
+      "blossom_quorum_size": 6,
+      "raft_voters": 5,
+      "raft_learners": 0,
+      "safety_equivalent": true,
+      "publishable_as_safety_equivalent": true,
+      "safety_manifest": {
+        "version": 1,
+        "consensus_parameters_hash": "a60b34e983f052575daa2d698582ccf5369a8de8ead217617e0716c4e81df902",
+        "configured_quorum_size": 6,
+        "effective_quorum_size": 6,
+        "validator_count": 6,
+        "committee_layout": {
+          "members": [
+            {
+              "node": "0000000000000000000000000000000000000000000000000000000000000000",
+              "site": "site-0"
+            },
+            {
+              "node": "0101010101010101010101010101010101010101010101010101010101010101",
+              "site": "site-1"
+            },
+            {
+              "node": "0202020202020202020202020202020202020202020202020202020202020202",
+              "site": "site-2"
+            },
+            {
+              "node": "0303030303030303030303030303030303030303030303030303030303030303",
+              "site": "site-0"
+            },
+            {
+              "node": "0404040404040404040404040404040404040404040404040404040404040404",
+              "site": "site-1"
+            },
+            {
+              "node": "0505050505050505050505050505050505050505050505050505050505050505",
+              "site": "site-2"
+            }
+          ],
+          "members_by_site": {
+            "site-0": [
+              "0000000000000000000000000000000000000000000000000000000000000000",
+              "0303030303030303030303030303030303030303030303030303030303030303"
+            ],
+            "site-1": [
+              "0101010101010101010101010101010101010101010101010101010101010101",
+              "0404040404040404040404040404040404040404040404040404040404040404"
+            ],
+            "site-2": [
+              "0202020202020202020202020202020202020202020202020202020202020202",
+              "0505050505050505050505050505050505050505050505050505050505050505"
+            ]
+          }
+        },
+        "local_finality_threshold": 4,
+        "global_finality_threshold": 4,
+        "local_minimum_intersection": 2,
+        "global_minimum_intersection": 2,
+        "validator_byzantine_fault_bound": 1,
+        "holder_fault_bound": 0,
+        "max_validator_liveness_omissions": 2,
+        "site_loss_tolerance": true,
+        "liveness_stop_conditions": [
+          "fewer than 4 validators can participate",
+          "fewer than 4 selected committee members can participate",
+          "a finalized reference at the stable-prefix head is unavailable"
+        ]
+      }
+    },
+    {
+      "matrix": "EqualFaultTolerance",
+      "physical_machines": 9,
+      "blossom_quorum_size": 9,
+      "raft_voters": 7,
+      "raft_learners": 0,
+      "safety_equivalent": true,
+      "publishable_as_safety_equivalent": true,
+      "safety_manifest": {
+        "version": 1,
+        "consensus_parameters_hash": "78822ca3bd2a6a7098c1d95576c4dbc06227e917de03bb93554ee2e9527c2108",
+        "configured_quorum_size": 9,
+        "effective_quorum_size": 9,
+        "validator_count": 9,
+        "committee_layout": {
+          "members": [
+            {
+              "node": "0000000000000000000000000000000000000000000000000000000000000000",
+              "site": "site-0"
+            },
+            {
+              "node": "0101010101010101010101010101010101010101010101010101010101010101",
+              "site": "site-1"
+            },
+            {
+              "node": "0202020202020202020202020202020202020202020202020202020202020202",
+              "site": "site-2"
+            },
+            {
+              "node": "0303030303030303030303030303030303030303030303030303030303030303",
+              "site": "site-0"
+            },
+            {
+              "node": "0404040404040404040404040404040404040404040404040404040404040404",
+              "site": "site-1"
+            },
+            {
+              "node": "0505050505050505050505050505050505050505050505050505050505050505",
+              "site": "site-2"
+            },
+            {
+              "node": "0606060606060606060606060606060606060606060606060606060606060606",
+              "site": "site-0"
+            },
+            {
+              "node": "0707070707070707070707070707070707070707070707070707070707070707",
+              "site": "site-1"
+            },
+            {
+              "node": "0808080808080808080808080808080808080808080808080808080808080808",
+              "site": "site-2"
+            }
+          ],
+          "members_by_site": {
+            "site-0": [
+              "0000000000000000000000000000000000000000000000000000000000000000",
+              "0303030303030303030303030303030303030303030303030303030303030303",
+              "0606060606060606060606060606060606060606060606060606060606060606"
+            ],
+            "site-1": [
+              "0101010101010101010101010101010101010101010101010101010101010101",
+              "0404040404040404040404040404040404040404040404040404040404040404",
+              "0707070707070707070707070707070707070707070707070707070707070707"
+            ],
+            "site-2": [
+              "0202020202020202020202020202020202020202020202020202020202020202",
+              "0505050505050505050505050505050505050505050505050505050505050505",
+              "0808080808080808080808080808080808080808080808080808080808080808"
+            ]
+          }
+        },
+        "local_finality_threshold": 6,
+        "global_finality_threshold": 6,
+        "local_minimum_intersection": 3,
+        "global_minimum_intersection": 3,
+        "validator_byzantine_fault_bound": 2,
+        "holder_fault_bound": 0,
+        "max_validator_liveness_omissions": 3,
+        "site_loss_tolerance": true,
+        "liveness_stop_conditions": [
+          "fewer than 6 validators can participate",
+          "fewer than 6 selected committee members can participate",
+          "a finalized reference at the stable-prefix head is unavailable"
+        ]
+      }
+    }
+  ],
+  "equal_physical_footprint": [
+    {
+      "matrix": "EqualPhysicalFootprint",
+      "physical_machines": 6,
+      "blossom_quorum_size": 6,
+      "raft_voters": 3,
+      "raft_learners": 3,
+      "safety_equivalent": false,
+      "publishable_as_safety_equivalent": false,
+      "safety_manifest": {
+        "version": 1,
+        "consensus_parameters_hash": "a60b34e983f052575daa2d698582ccf5369a8de8ead217617e0716c4e81df902",
+        "configured_quorum_size": 6,
+        "effective_quorum_size": 6,
+        "validator_count": 6,
+        "committee_layout": {
+          "members": [
+            {
+              "node": "0000000000000000000000000000000000000000000000000000000000000000",
+              "site": "site-0"
+            },
+            {
+              "node": "0101010101010101010101010101010101010101010101010101010101010101",
+              "site": "site-1"
+            },
+            {
+              "node": "0202020202020202020202020202020202020202020202020202020202020202",
+              "site": "site-2"
+            },
+            {
+              "node": "0303030303030303030303030303030303030303030303030303030303030303",
+              "site": "site-0"
+            },
+            {
+              "node": "0404040404040404040404040404040404040404040404040404040404040404",
+              "site": "site-1"
+            },
+            {
+              "node": "0505050505050505050505050505050505050505050505050505050505050505",
+              "site": "site-2"
+            }
+          ],
+          "members_by_site": {
+            "site-0": [
+              "0000000000000000000000000000000000000000000000000000000000000000",
+              "0303030303030303030303030303030303030303030303030303030303030303"
+            ],
+            "site-1": [
+              "0101010101010101010101010101010101010101010101010101010101010101",
+              "0404040404040404040404040404040404040404040404040404040404040404"
+            ],
+            "site-2": [
+              "0202020202020202020202020202020202020202020202020202020202020202",
+              "0505050505050505050505050505050505050505050505050505050505050505"
+            ]
+          }
+        },
+        "local_finality_threshold": 4,
+        "global_finality_threshold": 4,
+        "local_minimum_intersection": 2,
+        "global_minimum_intersection": 2,
+        "validator_byzantine_fault_bound": 1,
+        "holder_fault_bound": 0,
+        "max_validator_liveness_omissions": 2,
+        "site_loss_tolerance": true,
+        "liveness_stop_conditions": [
+          "fewer than 4 validators can participate",
+          "fewer than 4 selected committee members can participate",
+          "a finalized reference at the stable-prefix head is unavailable"
+        ]
+      }
+    },
+    {
+      "matrix": "EqualPhysicalFootprint",
+      "physical_machines": 12,
+      "blossom_quorum_size": 6,
+      "raft_voters": 5,
+      "raft_learners": 7,
+      "safety_equivalent": false,
+      "publishable_as_safety_equivalent": false,
+      "safety_manifest": {
+        "version": 1,
+        "consensus_parameters_hash": "a60b34e983f052575daa2d698582ccf5369a8de8ead217617e0716c4e81df902",
+        "configured_quorum_size": 6,
+        "effective_quorum_size": 6,
+        "validator_count": 12,
+        "committee_layout": {
+          "members": [
+            {
+              "node": "0202020202020202020202020202020202020202020202020202020202020202",
+              "site": "site-2"
+            },
+            {
+              "node": "0303030303030303030303030303030303030303030303030303030303030303",
+              "site": "site-0"
+            },
+            {
+              "node": "0404040404040404040404040404040404040404040404040404040404040404",
+              "site": "site-1"
+            },
+            {
+              "node": "0707070707070707070707070707070707070707070707070707070707070707",
+              "site": "site-1"
+            },
+            {
+              "node": "0808080808080808080808080808080808080808080808080808080808080808",
+              "site": "site-2"
+            },
+            {
+              "node": "0909090909090909090909090909090909090909090909090909090909090909",
+              "site": "site-0"
+            }
+          ],
+          "members_by_site": {
+            "site-0": [
+              "0303030303030303030303030303030303030303030303030303030303030303",
+              "0909090909090909090909090909090909090909090909090909090909090909"
+            ],
+            "site-1": [
+              "0404040404040404040404040404040404040404040404040404040404040404",
+              "0707070707070707070707070707070707070707070707070707070707070707"
+            ],
+            "site-2": [
+              "0202020202020202020202020202020202020202020202020202020202020202",
+              "0808080808080808080808080808080808080808080808080808080808080808"
+            ]
+          }
+        },
+        "local_finality_threshold": 4,
+        "global_finality_threshold": 8,
+        "local_minimum_intersection": 2,
+        "global_minimum_intersection": 4,
+        "validator_byzantine_fault_bound": 3,
+        "holder_fault_bound": 0,
+        "max_validator_liveness_omissions": 4,
+        "site_loss_tolerance": true,
+        "liveness_stop_conditions": [
+          "fewer than 8 validators can participate",
+          "fewer than 4 selected committee members can participate",
+          "a finalized reference at the stable-prefix head is unavailable"
+        ]
+      }
+    },
+    {
+      "matrix": "EqualPhysicalFootprint",
+      "physical_machines": 24,
+      "blossom_quorum_size": 6,
+      "raft_voters": 5,
+      "raft_learners": 19,
+      "safety_equivalent": false,
+      "publishable_as_safety_equivalent": false,
+      "safety_manifest": {
+        "version": 1,
+        "consensus_parameters_hash": "a60b34e983f052575daa2d698582ccf5369a8de8ead217617e0716c4e81df902",
+        "configured_quorum_size": 6,
+        "effective_quorum_size": 6,
+        "validator_count": 24,
+        "committee_layout": {
+          "members": [
+            {
+              "node": "0101010101010101010101010101010101010101010101010101010101010101",
+              "site": "site-1"
+            },
+            {
+              "node": "0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b",
+              "site": "site-2"
+            },
+            {
+              "node": "0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f",
+              "site": "site-0"
+            },
+            {
+              "node": "1010101010101010101010101010101010101010101010101010101010101010",
+              "site": "site-1"
+            },
+            {
+              "node": "1212121212121212121212121212121212121212121212121212121212121212",
+              "site": "site-0"
+            },
+            {
+              "node": "1414141414141414141414141414141414141414141414141414141414141414",
+              "site": "site-2"
+            }
+          ],
+          "members_by_site": {
+            "site-0": [
+              "0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f",
+              "1212121212121212121212121212121212121212121212121212121212121212"
+            ],
+            "site-1": [
+              "0101010101010101010101010101010101010101010101010101010101010101",
+              "1010101010101010101010101010101010101010101010101010101010101010"
+            ],
+            "site-2": [
+              "0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b",
+              "1414141414141414141414141414141414141414141414141414141414141414"
+            ]
+          }
+        },
+        "local_finality_threshold": 4,
+        "global_finality_threshold": 16,
+        "local_minimum_intersection": 2,
+        "global_minimum_intersection": 8,
+        "validator_byzantine_fault_bound": 7,
+        "holder_fault_bound": 0,
+        "max_validator_liveness_omissions": 8,
+        "site_loss_tolerance": true,
+        "liveness_stop_conditions": [
+          "fewer than 16 validators can participate",
+          "fewer than 4 selected committee members can participate",
+          "a finalized reference at the stable-prefix head is unavailable"
+        ]
+      }
+    },
+    {
+      "matrix": "EqualPhysicalFootprint",
+      "physical_machines": 36,
+      "blossom_quorum_size": 6,
+      "raft_voters": 7,
+      "raft_learners": 29,
+      "safety_equivalent": false,
+      "publishable_as_safety_equivalent": false,
+      "safety_manifest": {
+        "version": 1,
+        "consensus_parameters_hash": "a60b34e983f052575daa2d698582ccf5369a8de8ead217617e0716c4e81df902",
+        "configured_quorum_size": 6,
+        "effective_quorum_size": 6,
+        "validator_count": 36,
+        "committee_layout": {
+          "members": [
+            {
+              "node": "0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c",
+              "site": "site-0"
+            },
+            {
+              "node": "0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f",
+              "site": "site-0"
+            },
+            {
+              "node": "1111111111111111111111111111111111111111111111111111111111111111",
+              "site": "site-2"
+            },
+            {
+              "node": "1616161616161616161616161616161616161616161616161616161616161616",
+              "site": "site-1"
+            },
+            {
+              "node": "1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a",
+              "site": "site-2"
+            },
+            {
+              "node": "1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f",
+              "site": "site-1"
+            }
+          ],
+          "members_by_site": {
+            "site-0": [
+              "0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c",
+              "0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f"
+            ],
+            "site-1": [
+              "1616161616161616161616161616161616161616161616161616161616161616",
+              "1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f"
+            ],
+            "site-2": [
+              "1111111111111111111111111111111111111111111111111111111111111111",
+              "1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a"
+            ]
+          }
+        },
+        "local_finality_threshold": 4,
+        "global_finality_threshold": 24,
+        "local_minimum_intersection": 2,
+        "global_minimum_intersection": 12,
+        "validator_byzantine_fault_bound": 11,
+        "holder_fault_bound": 0,
+        "max_validator_liveness_omissions": 12,
+        "site_loss_tolerance": true,
+        "liveness_stop_conditions": [
+          "fewer than 24 validators can participate",
+          "fewer than 4 selected committee members can participate",
+          "a finalized reference at the stable-prefix head is unavailable"
+        ]
+      }
+    },
+    {
+      "matrix": "EqualPhysicalFootprint",
+      "physical_machines": 72,
+      "blossom_quorum_size": 6,
+      "raft_voters": 7,
+      "raft_learners": 65,
+      "safety_equivalent": false,
+      "publishable_as_safety_equivalent": false,
+      "safety_manifest": {
+        "version": 1,
+        "consensus_parameters_hash": "a60b34e983f052575daa2d698582ccf5369a8de8ead217617e0716c4e81df902",
+        "configured_quorum_size": 6,
+        "effective_quorum_size": 6,
+        "validator_count": 72,
+        "committee_layout": {
+          "members": [
+            {
+              "node": "0505050505050505050505050505050505050505050505050505050505050505",
+              "site": "site-2"
+            },
+            {
+              "node": "1212121212121212121212121212121212121212121212121212121212121212",
+              "site": "site-0"
+            },
+            {
+              "node": "1515151515151515151515151515151515151515151515151515151515151515",
+              "site": "site-0"
+            },
+            {
+              "node": "1616161616161616161616161616161616161616161616161616161616161616",
+              "site": "site-1"
+            },
+            {
+              "node": "1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d",
+              "site": "site-2"
+            },
+            {
+              "node": "3131313131313131313131313131313131313131313131313131313131313131",
+              "site": "site-1"
+            }
+          ],
+          "members_by_site": {
+            "site-0": [
+              "1212121212121212121212121212121212121212121212121212121212121212",
+              "1515151515151515151515151515151515151515151515151515151515151515"
+            ],
+            "site-1": [
+              "1616161616161616161616161616161616161616161616161616161616161616",
+              "3131313131313131313131313131313131313131313131313131313131313131"
+            ],
+            "site-2": [
+              "0505050505050505050505050505050505050505050505050505050505050505",
+              "1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d"
+            ]
+          }
+        },
+        "local_finality_threshold": 4,
+        "global_finality_threshold": 48,
+        "local_minimum_intersection": 2,
+        "global_minimum_intersection": 24,
+        "validator_byzantine_fault_bound": 23,
+        "holder_fault_bound": 0,
+        "max_validator_liveness_omissions": 24,
+        "site_loss_tolerance": true,
+        "liveness_stop_conditions": [
+          "fewer than 48 validators can participate",
+          "fewer than 4 selected committee members can participate",
+          "a finalized reference at the stable-prefix head is unavailable"
+        ]
+      }
+    }
+  ]
+}

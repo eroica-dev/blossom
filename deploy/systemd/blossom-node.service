@@ -1,0 +1,29 @@
+[Unit]
+Description=Blossom v2 node
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=blossom
+Group=blossom
+EnvironmentFile=/etc/blossom/blossom-node.env
+ExecStart=/usr/local/bin/blossom-node \
+  --host ${BLOSSOM_HOST} \
+  --port ${BLOSSOM_PORT} \
+  --state-snapshot ${BLOSSOM_STATE_SNAPSHOT} \
+  --block-store ${BLOSSOM_BLOCK_STORE} \
+  --bootstrap-services ${BLOSSOM_BOOTSTRAP_SERVICES} \
+  --auto-consensus \
+  --sync-bootstrap-address-books
+Restart=on-failure
+RestartSec=5
+LimitNOFILE=1048576
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+ReadWritePaths=/var/lib/blossom
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,107 @@
+[package]
+name = "blossom-consensus"
+version = "2.0.0"
+edition = "2024"
+rust-version = "1.93"
+description = "Native Blossom consensus runtimes for global, active-active, and active-passive deployments."
+license = "MIT"
+repository = "https://github.com/d-tietjen/blossom"
+homepage = "https://github.com/d-tietjen/blossom"
+documentation = "https://docs.rs/blossom-consensus"
+readme = "README.md"
+keywords = ["consensus", "distributed-systems", "high-availability", "raft"]
+categories = ["algorithms", "asynchronous", "network-programming"]
+include = [
+    "src/**/*.rs",
+    "examples/**/*.rs",
+    "benches/**/*.rs",
+    "tests/**/*.rs",
+    "guides/**/*.md",
+    "/README.md",
+    "/CHANGELOG.md",
+    "/RELEASING.md",
+    "/CONTRIBUTING.md",
+    "/SECURITY.md",
+    "/LICENSE",
+    "/Blossom-Consensus-Protocol-v2-Whitepaper.pdf",
+]
+
+[lib]
+name = "blossom"
+
+[package.metadata.docs.rs]
+all-features = true
+
+[features]
+default = ["fair-block-ordering"]
+availability-gossip = ["filtered-transactions"]
+active-passive = ["high-availability", "dep:openraft"]
+external-transaction-hashes = []
+fair-block-ordering = []
+filtered-transactions = []
+high-availability = ["dep:hmac"]
+insecure-fast-hash = ["dep:xxhash-rust"]
+telemetry = ["fast-telemetry/macros", "fast-telemetry/runtime"]
+eden-logger = ["dep:eden_logger"]
+observability = ["telemetry", "eden-logger"]
+trusted-checkpoint-dag = []
+parallel-networks = ["high-availability", "trusted-checkpoint-dag"]
+propagation-adaptive = [
+    "propagation-push",
+    "propagation-inventory",
+    "blossom-propagation/adaptive",
+]
+propagation-inventory = [
+    "dep:blossom-propagation",
+    "blossom-propagation/bandwidth-inventory",
+]
+propagation-push = ["dep:blossom-propagation", "blossom-propagation/latency-push"]
+
+[dependencies]
+blossom-propagation = { version = "2.0.0", path = "crates/blossom-propagation", optional = true }
+borsh = { version = "1.5.7", features = ["derive"] }
+bytes = "1.11.1"
+clap = { version = "4.5", features = ["derive", "env"] }
+ed25519-dalek = { version = "2.2.0", features = ["batch", "hazmat", "rand_core"] }
+eden_logger = { version = "=0.1.2", default-features = false, features = ["log-info", "log-warn", "log-error", "log-internal", "fast-telemetry-context"], optional = true }
+fast-telemetry = { version = "=0.9.0", default-features = false }
+hex = { version = "0.4.3", features = ["serde"] }
+hmac = { version = "=0.12.1", optional = true }
+indextreemap = "0.2.0"
+itoa = "1.0.15"
+log = "0.4.28"
+openraft = { version = "=0.9.24", features = ["serde", "storage-v2"], optional = true }
+rand_core = { version = "0.6.4", features = ["getrandom"] }
+rs_merkle = "1.5.0"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.145"
+sha2 = "0.10.9"
+shardlog = { version = "0.1.0", git = "https://github.com/d-tietjen/shard-stream.git", rev = "03ef769a46d574622a838fca7b4884a93ba24177" }
+thiserror = "1.0.69"
+tokio = { version = "1.48", features = ["io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+xxhash-rust = { version = "0.8.15", features = ["xxh3"], optional = true }
+
+[dev-dependencies]
+criterion = "0.7.0"
+env_logger = "0.11.8"
+hegeltest = "=0.28.2"
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(kani)"] }
+
+[[bench]]
+name = "protocol"
+harness = false
+
+[[bench]]
+name = "log_store"
+harness = false
+
+[workspace]
+members = [
+    ".",
+    "crates/blossom-observer",
+    "crates/blossom-bench-harness",
+    "crates/blossom-propagation",
+]
+resolver = "3"

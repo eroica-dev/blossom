@@ -1,0 +1,22 @@
+[package]
+name = "blossom-propagation"
+version = "2.0.0"
+edition = "2024"
+rust-version = "1.93"
+description = "Feature-gated Blossom data-plane propagation policy primitives."
+license = "MIT"
+repository = "https://github.com/d-tietjen/blossom"
+homepage = "https://github.com/d-tietjen/blossom"
+documentation = "https://docs.rs/blossom-propagation"
+readme = "README.md"
+keywords = ["consensus", "distributed-systems", "networking", "propagation"]
+categories = ["algorithms", "network-programming"]
+
+[package.metadata.docs.rs]
+all-features = true
+
+[features]
+default = ["latency-push"]
+adaptive = ["latency-push", "bandwidth-inventory"]
+bandwidth-inventory = []
+latency-push = []
