@@ -1,3 +1,5 @@
+//! Filtered-payload gossip benchmark and feature-gated fallback.
+
 #[cfg(not(feature = "availability-gossip"))]
 fn main() {
     eprintln!("blossom-gossip-bench requires --features availability-gossip");

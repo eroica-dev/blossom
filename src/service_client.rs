@@ -1,8 +1,11 @@
+//! Typed client operations over Blossom's bounded TCP wire surface.
+
 use std::collections::BTreeMap;
+use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore, TryAcquireError};
 
 use crate::address_book::Service;
 #[cfg(feature = "availability-gossip")]
@@ -19,9 +22,26 @@ use crate::wire::{
     WireResponse,
 };
 
-#[derive(Clone, Default)]
+const CONNECT_ATTEMPTS: usize = 4;
+const CONNECT_RETRY_DELAY: Duration = Duration::from_millis(10);
+// Covers Blossom's default six-member committee without eviction while the
+// tested 36-node in-process topology stays below a 1,024-descriptor limit.
+const DEFAULT_MAX_POOLED_CONNECTIONS: usize = 6;
+
+struct PooledTcpConnection {
+    connection: Mutex<TcpConnection>,
+    _slot: OwnedSemaphorePermit,
+}
+
+struct TcpServicePool {
+    connections: Mutex<BTreeMap<String, Arc<PooledTcpConnection>>>,
+    slots: Arc<Semaphore>,
+    max_connections: usize,
+}
+
+#[derive(Clone)]
 pub struct TcpServiceClient {
-    connections: Arc<Mutex<BTreeMap<String, Arc<Mutex<TcpConnection>>>>>,
+    pool: Arc<TcpServicePool>,
 }
 
 #[derive(Clone, Debug)]
@@ -31,8 +51,33 @@ pub struct TimedNodePong {
 }
 
 impl TcpServiceClient {
+    /// Creates a client with Blossom's bounded default persistent pool.
     pub fn new() -> Self {
-        Self::default()
+        Self::with_max_connections(
+            NonZeroUsize::new(DEFAULT_MAX_POOLED_CONNECTIONS)
+                .expect("the default TCP pool size is non-zero"),
+        )
+    }
+
+    /// Creates a client with an explicit maximum number of live connections.
+    ///
+    /// Idle connections are evicted when the pool is full. If every pooled
+    /// connection is active, new destinations wait for a slot instead of
+    /// exhausting the process file-descriptor limit.
+    pub fn with_max_connections(max_connections: NonZeroUsize) -> Self {
+        let max_connections = max_connections.get();
+        Self {
+            pool: Arc::new(TcpServicePool {
+                connections: Mutex::new(BTreeMap::new()),
+                slots: Arc::new(Semaphore::new(max_connections)),
+                max_connections,
+            }),
+        }
+    }
+
+    /// Returns the maximum number of persistent connections owned by this pool.
+    pub fn max_connections(&self) -> usize {
+        self.pool.max_connections
     }
 
     pub async fn request(&self, service: &Service, request: &WireRequest) -> Result<WireResponse> {
@@ -48,15 +93,16 @@ impl TcpServiceClient {
         let address = service.socket_addr();
         let connection = self.connection(&address).await?;
         let response = {
-            let mut connection = connection.lock().await;
+            let mut connection = connection.connection.lock().await;
             connection.request_frame(frame).await
         };
         match response {
             Ok(response) => Ok(response),
             Err(first_error) => {
                 self.remove_connection(&address, &connection).await;
+                drop(connection);
                 let replacement = self.connection(&address).await?;
-                let mut replacement = replacement.lock().await;
+                let mut replacement = replacement.connection.lock().await;
                 replacement.request_frame(frame).await.map_err(|second_error| {
                     BlossomError::ExternalService(format!(
                         "persistent request failed ({first_error}); reconnect failed ({second_error})"
@@ -66,20 +112,62 @@ impl TcpServiceClient {
         }
     }
 
-    async fn connection(&self, address: &str) -> Result<Arc<Mutex<TcpConnection>>> {
-        if let Some(connection) = self.connections.lock().await.get(address).cloned() {
-            return Ok(connection);
+    async fn connection(&self, address: &str) -> Result<Arc<PooledTcpConnection>> {
+        let mut last_error = None;
+        for attempt in 0..CONNECT_ATTEMPTS {
+            let permit = loop {
+                let mut connections = self.pool.connections.lock().await;
+                if let Some(connection) = connections.get(address).cloned() {
+                    return Ok(connection);
+                }
+                match self.pool.slots.clone().try_acquire_owned() {
+                    Ok(permit) => break permit,
+                    Err(TryAcquireError::Closed) => {
+                        return Err(BlossomError::Io(
+                            "TCP service connection pool is closed".to_string(),
+                        ));
+                    }
+                    Err(TryAcquireError::NoPermits) => {
+                        let idle = connections.iter().find_map(|(address, connection)| {
+                            (Arc::strong_count(connection) == 1).then(|| address.clone())
+                        });
+                        if let Some(idle) = idle {
+                            connections.remove(&idle);
+                            continue;
+                        }
+                    }
+                }
+                drop(connections);
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            };
+            match TcpConnection::connect(address).await {
+                Ok(connection) => {
+                    let connection = Arc::new(PooledTcpConnection {
+                        connection: Mutex::new(connection),
+                        _slot: permit,
+                    });
+                    let mut connections = self.pool.connections.lock().await;
+                    return Ok(connections
+                        .entry(address.to_string())
+                        .or_insert_with(|| connection.clone())
+                        .clone());
+                }
+                Err(error) => last_error = Some(error),
+            }
+            if attempt + 1 < CONNECT_ATTEMPTS {
+                let multiplier = u32::try_from(attempt + 1).unwrap_or(u32::MAX);
+                tokio::time::sleep(CONNECT_RETRY_DELAY.saturating_mul(multiplier)).await;
+            }
         }
-        let connection = Arc::new(Mutex::new(TcpConnection::connect(address).await?));
-        let mut connections = self.connections.lock().await;
-        Ok(connections
-            .entry(address.to_string())
-            .or_insert_with(|| connection.clone())
-            .clone())
+        Err(last_error.unwrap_or_else(|| {
+            BlossomError::Io(format!(
+                "failed to connect to {address} after {CONNECT_ATTEMPTS} attempts"
+            ))
+        }))
     }
 
-    async fn remove_connection(&self, address: &str, failed: &Arc<Mutex<TcpConnection>>) {
-        let mut connections = self.connections.lock().await;
+    async fn remove_connection(&self, address: &str, failed: &Arc<PooledTcpConnection>) {
+        let mut connections = self.pool.connections.lock().await;
         if connections
             .get(address)
             .is_some_and(|current| Arc::ptr_eq(current, failed))
@@ -263,6 +351,12 @@ impl TcpServiceClient {
         self.request(service, &request)
             .await
             .map_err(|err| BlossomError::ExternalService(err.to_string()))
+    }
+}
+
+impl Default for TcpServiceClient {
+    fn default() -> Self {
+        Self::new()
     }
 }
 

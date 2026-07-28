@@ -1,3 +1,5 @@
+//! Signed node admission records and checkpoint-bound reconnect votes.
+
 use borsh::{BorshDeserialize, BorshSerialize};
 use serde::{Deserialize, Serialize};
 

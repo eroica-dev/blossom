@@ -1,3 +1,5 @@
+//! Adaptive propagation policy selection from latency and bandwidth signals.
+
 use crate::{
     ManifestAuthentication, PropagationPlan, PropagationPolicyError, PropagationStrategy,
     RedundancyPlan, TrustBoundary, bandwidth_inventory, latency_push,

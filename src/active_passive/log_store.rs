@@ -1,3 +1,5 @@
+//! OpenRaft log-storage adapter over the shared transactional Blossom LogStore.
+
 #![allow(clippy::result_large_err)] // OpenRaft exposes its concrete StorageError.
 
 use std::collections::BTreeMap;

@@ -1,3 +1,5 @@
+//! Bounded node-local block construction and dispatch queues.
+
 use std::collections::VecDeque;
 use std::mem;
 
@@ -150,25 +152,25 @@ impl LocalBlock {
         nonce: Nonce,
         _round: u8,
     ) -> Result<Option<Block>> {
-        while let Some(block) = self.block_deque.pop_front() {
+        while let Some(block) = self.block_deque.front() {
             if block.body.nonce.value() < nonce.value() {
+                self.block_deque.pop_front();
                 continue;
             }
             if block.body.nonce.value() > nonce.value() {
                 let actual = block.body.nonce;
-                self.block_deque.push_front(block);
                 return Err(BlossomError::InvalidBlockNonce {
                     expected: nonce,
                     actual,
                 });
             }
             if block.body.last_epoch != last_epoch {
-                continue;
+                return Err(BlossomError::InvalidBlockLastEpoch);
             }
             if validator.is_some_and(|validator| block.body.validator != validator) {
                 return Err(BlossomError::UnknownSender);
             }
-            return Ok(Some(block));
+            return Ok(self.block_deque.pop_front());
         }
 
         Ok(None)
@@ -360,6 +362,23 @@ mod tests {
             queue.dequeue_block(Some(PubKey([99; 32])), HashType([1; 32]), Nonce::new(1), 0),
             Err(BlossomError::UnknownSender)
         ));
-        assert!(queue.is_empty());
+        assert_eq!(queue.len(), 1);
+    }
+
+    #[test]
+    fn dequeue_preserves_a_block_when_the_epoch_anchor_changed() {
+        let keypair = Keypair::generate();
+        let mut queue = LocalBlock::new(2);
+        let mut block = Block::default();
+        block.body.last_epoch = HashType([1; 32]);
+        block.body.nonce = Nonce::new(1);
+        block.sign(&keypair.secret);
+        queue.enqueue_block(block).unwrap();
+
+        assert!(matches!(
+            queue.dequeue_block(None, HashType([2; 32]), Nonce::new(1), 0),
+            Err(BlossomError::InvalidBlockLastEpoch)
+        ));
+        assert_eq!(queue.len(), 1);
     }
 }

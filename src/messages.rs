@@ -1,3 +1,5 @@
+//! Top-level consensus message envelope and stable message discriminants.
+
 use borsh::{BorshDeserialize, BorshSerialize};
 use serde::{Deserialize, Serialize};
 use std::fmt;

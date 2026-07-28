@@ -1,3 +1,5 @@
+//! Certified filtered-payload availability, gossip, fetch, and delivery.
+
 use std::collections::BTreeMap;
 
 use borsh::{BorshDeserialize, BorshSerialize};

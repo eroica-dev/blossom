@@ -1,3 +1,5 @@
+//! Command-line telemetry collection and report generation.
+
 use std::path::PathBuf;
 use std::sync::Arc;
 

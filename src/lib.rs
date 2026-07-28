@@ -14,50 +14,88 @@
 //! for topology-aware fan-out without epoch state, [`WireRequest`] for TCP
 //! integration, and [`Transaction`] plus [`Block`] for application bytes.
 
+/// Durable application-owned commands with globally certified ordering.
 pub mod active_active;
 #[cfg(feature = "high-availability")]
+/// Recovery and contract-cutover orchestration for active-active HA groups.
 pub mod active_active_ha;
 #[cfg(feature = "active-passive")]
+/// Native OpenRaft active-passive replication and durable log adapters.
 pub mod active_passive;
+/// Service records and the node-local address book.
 pub mod address_book;
+/// Signed node admission and reconnect evidence.
 pub mod admission;
+/// Quorum thresholds, deterministic selection, and topology calculations.
 pub mod algorithm;
 #[cfg(feature = "availability-gossip")]
+/// Certified availability metadata and filtered-payload transfer.
 pub mod availability;
+/// Blocks, opaque transactions, commitments, and fair ordering.
 pub mod block;
+/// Durable block indexing by nonce and hash.
 pub mod block_store;
+/// Consensus protocol messages and their validation rules.
 pub mod blossom;
+/// Public keys, signing keys, signatures, and verification helpers.
 pub mod crypto;
+/// Signed peer-encounter evidence.
 pub mod encounter;
+/// Crate-wide errors and the [`Result`] alias.
 pub mod error;
+/// Consensus group identifiers.
 pub mod group;
+/// In-process test and benchmark harnesses.
 pub mod harness;
+/// Protocol hashes, domains, and feature registry.
 pub mod hash;
 #[cfg(feature = "high-availability")]
+/// Trusted fixed-membership HA consensus for two through seven nodes.
 pub mod high_availability;
+/// Latency relationships and topology-aware peer selection.
 pub mod latency_topology;
+/// Node-local block construction and bounded pending queues.
 pub mod local_block;
+/// Transactional embedded persistence backed by ShardLog.
 pub mod log_store;
+/// Validator membership, service capabilities, and freshness certificates.
 pub mod membership;
+/// The top-level consensus message enum and stable message keys.
 pub mod messages;
+/// Public node identity and node-role types.
 pub mod node;
+/// Monotonic epoch nonces.
 pub mod nonce;
+/// Topology fan-out without consensus epoch ownership.
 pub mod overlay;
 #[cfg(feature = "parallel-networks")]
+/// Coordination records for independent HA and Global Blossom networks.
 pub mod parallel_networks;
+/// Per-round message matrices and quorum queues.
 pub mod register;
+/// Certified round skipping and future-round assistance.
 pub mod round_skip;
+/// The embeddable verified and trusted node runtime.
 pub mod runtime;
+/// Site-aware committee layout and safety manifests.
 pub mod safety;
+/// Typed TCP service-client operations.
 pub mod service_client;
+/// Epoch chains and in-progress consensus state.
 pub mod state;
 #[cfg(feature = "availability-gossip")]
+/// Subset-gossip and prefill propagation models.
 pub mod subset_gossip;
+/// TCP nodes, drivers, and connection helpers.
 pub mod tcp;
+/// Structured protocol telemetry and optional exporters.
 pub mod telemetry;
 #[cfg(feature = "trusted-checkpoint-dag")]
+/// Append-only dissemination beneath trusted sequential checkpoints.
 pub mod trusted_dag;
+/// Crash-safe trusted epoch and confirmation storage.
 pub mod trusted_log;
+/// Bounded Borsh wire frames and optimized hot-path codecs.
 pub mod wire;
 
 #[cfg(any(
@@ -202,12 +240,12 @@ pub use round_skip::{
     skipped_round_assist_decision,
 };
 pub use runtime::{
-    AcceptedBlock, ConsensusRoundStatus, EpochTarget, MessageReceipt, MultiGroupRuntime,
-    NodeRuntime, NodeStatus, ObservedEncounterRecord, PeerApplicationState,
-    PrefillDispatchBroadcastReport, PrefillDispatchPlan, ReconnectAdmissionDecision,
-    ReconnectAdmissionEvidence, RuntimeConfig, RuntimeMode, RuntimeSnapshotV1, TrustMode,
-    TrustedOperationalStatus, TrustedServiceHealth, genesis_epoch, genesis_epoch_for_group,
-    genesis_epoch_for_group_with_parameters,
+    AcceptedBlock, ConsensusRoundStatus, EpochDisseminationStatus, EpochTarget, MessageReceipt,
+    MultiGroupRuntime, NodeRuntime, NodeStatus, ObservedEncounterRecord, PeerApplicationState,
+    PrefillDispatchBroadcastReport, PrefillDispatchPlan, PrefillStageStatus,
+    ReconnectAdmissionDecision, ReconnectAdmissionEvidence, RuntimeConfig, RuntimeMode,
+    RuntimeSnapshotV1, TrustMode, TrustedOperationalStatus, TrustedServiceHealth, genesis_epoch,
+    genesis_epoch_for_group, genesis_epoch_for_group_with_parameters,
 };
 pub use safety::{
     CommitteeLayout, CommitteeParticipant, SafetyManifest, SiteId, generate_safety_manifest,

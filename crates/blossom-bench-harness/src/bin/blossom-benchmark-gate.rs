@@ -1,3 +1,5 @@
+//! Correctness-gated benchmark runner used by release validation.
+
 use std::fs;
 use std::path::{Path, PathBuf};
 

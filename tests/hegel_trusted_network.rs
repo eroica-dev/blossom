@@ -1,3 +1,5 @@
+//! Property checks for trusted-network durability and failover behavior.
+
 use std::collections::BTreeMap;
 
 use blossom::blossom::{Header, TrustedAcknowledgement, Verification, VerificationBody};

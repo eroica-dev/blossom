@@ -1,3 +1,5 @@
+//! Topology-aware message fan-out without consensus epoch ownership.
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, RwLock};
 
@@ -9,6 +11,7 @@ use crate::hash::HashType;
 use crate::messages::Msg;
 use crate::node::NodeIdentity;
 use crate::runtime::{RuntimeConfig, RuntimeMode};
+use crate::service_client::TcpServiceClient;
 use crate::tcp::send_wire_frame;
 use crate::wire::{EncodedFrame, WireRequest, WireResponse};
 
@@ -287,6 +290,40 @@ pub(crate) async fn broadcast_wire_request(
         });
     }
 
+    Ok(BroadcastReport { receipts })
+}
+
+pub(crate) async fn broadcast_wire_request_pooled(
+    request: WireRequest,
+    targets: Vec<Service>,
+    client: &TcpServiceClient,
+) -> Result<BroadcastReport> {
+    let frame = EncodedFrame::encode_wire_request(&request)?;
+    let mut handles = Vec::with_capacity(targets.len());
+    for service in targets {
+        let client = client.clone();
+        let frame = frame.clone();
+        let service_for_task = service.clone();
+        handles.push((
+            service,
+            tokio::spawn(async move { client.request_frame(&service_for_task, &frame).await }),
+        ));
+    }
+
+    let mut receipts = Vec::with_capacity(handles.len());
+    for (service, handle) in handles {
+        let response = match handle.await {
+            Ok(response) => response,
+            Err(error) => Err(BlossomError::Io(format!(
+                "pooled broadcast task failed: {error}"
+            ))),
+        };
+        receipts.push(BroadcastReceipt {
+            target: service.public_key,
+            service,
+            response,
+        });
+    }
     Ok(BroadcastReport { receipts })
 }
 

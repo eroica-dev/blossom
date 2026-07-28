@@ -1,3 +1,5 @@
+//! End-to-end OpenRaft election, write, membership, snapshot, and restart tests.
+
 #![cfg(feature = "active-passive")]
 #![allow(clippy::result_large_err)]
 

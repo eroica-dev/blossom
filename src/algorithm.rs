@@ -1,3 +1,5 @@
+//! Quorum thresholds, deterministic selection, and topology calculations.
+
 use std::collections::BTreeSet;
 use std::env;
 use std::fmt;

@@ -1,3 +1,5 @@
+//! Bounded TCP node service, request routing, and consensus drivers.
+
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -47,6 +49,12 @@ pub struct ConsensusDriverConfig {
     /// epochs.
     pub event_driven: bool,
     pub max_round: u8,
+    /// Enables proactive block prefill before hierarchical consensus rounds.
+    ///
+    /// Verified consensus with more than one round always enables prefill,
+    /// even when this compatibility flag is `false`, because every validator
+    /// must derive the same epoch hash before issuing a global certificate
+    /// share. Trusted consensus may still opt out.
     pub drive_prefill: bool,
     pub drive_dispatch: bool,
     /// Do not initiate an epoch until this node has a locally submitted block.
@@ -238,7 +246,40 @@ impl TcpNode {
         config: &ConsensusDriverConfig,
     ) -> Result<ConsensusDriverTick> {
         let mut tick = ConsensusDriverTick::default();
-        if config.drive_prefill
+        let drive_target = self.runtime.next_epoch_target()?;
+        let catch_up_peers = self.runtime.epoch_started_catch_up_services()?;
+        if !catch_up_peers.is_empty() {
+            tick.catch_up_updates = self
+                .catch_up_from_epoch_started_peers(&catch_up_peers)
+                .await?;
+            if tick.catch_up_updates != 0 {
+                return Ok(tick);
+            }
+        }
+        if !self.runtime.trust_mode().is_trusted()
+            && let Some(epoch_started) = self.runtime.try_produce_epoch_started()?
+        {
+            let report = self.broadcast_epoch_started(epoch_started.clone()).await?;
+            self.runtime.complete_epoch_started_broadcast(
+                &epoch_started,
+                report
+                    .receipts
+                    .iter()
+                    .filter(|receipt| receipt.accepted())
+                    .map(|receipt| receipt.target),
+            );
+            self.runtime.record_epoch_started_broadcast_failures(
+                &epoch_started,
+                report.receipts.iter().filter_map(epoch_started_failure),
+            );
+            tick.epoch_started_broadcasts += 1;
+        }
+        if self.runtime.next_epoch_target()? != drive_target {
+            return Ok(tick);
+        }
+        let drive_prefill = config.drive_prefill
+            || (!self.runtime.trust_mode().is_trusted() && config.max_round > 0);
+        if drive_prefill
             && config.max_round > 0
             && self
                 .runtime
@@ -249,10 +290,10 @@ impl TcpNode {
             tick.prefill_broadcasts += 1;
         }
 
-        if config.drive_prefill
-            && config.max_round > 0
-            && !self.runtime.try_activate_prefill_round()?
-        {
+        if drive_prefill && config.max_round > 0 && !self.runtime.try_activate_prefill_round()? {
+            return Ok(tick);
+        }
+        if self.runtime.next_epoch_target()? != drive_target {
             return Ok(tick);
         }
 
@@ -267,17 +308,23 @@ impl TcpNode {
             self.runtime.receive_message(message)?;
         }
         if config.drive_dispatch
-            && let Some(dispatch) = self.runtime.try_produce_dispatch(round)?
+            && let Some(dispatch) = self
+                .runtime
+                .try_produce_dispatch_for_target(round, Some(&drive_target))?
         {
             let blocks_hash = dispatch.body.blocks_hash;
             let report = self
                 .broadcast_round_message(round, Msg::Dispatch(dispatch))
                 .await?;
-            if self.runtime.trust_mode().is_trusted() && report.failed() != 0 {
-                self.runtime
-                    .schedule_trusted_dispatch_retry(round, blocks_hash)?;
+            if report.failed() != 0 {
+                self.runtime.schedule_dispatch_retry(round, blocks_hash)?;
+                tick.dispatch_broadcasts += 1;
+                return Ok(tick);
             }
             tick.dispatch_broadcasts += 1;
+        }
+        if self.runtime.next_epoch_target()? != drive_target {
+            return Ok(tick);
         }
         if self.runtime.trust_mode().is_trusted()
             && let Some(acknowledgement) =
@@ -293,14 +340,22 @@ impl TcpNode {
             }
             tick.trusted_acknowledgement_broadcasts += 1;
         }
+        if self.runtime.next_epoch_target()? != drive_target {
+            return Ok(tick);
+        }
         if let Some(verification) = self.runtime.try_produce_verification(round)? {
             let blocks_hash = verification.body.blocks_hash;
             let report = self
                 .broadcast_round_message(round, Msg::Verification(verification))
                 .await?;
-            if self.runtime.trust_mode().is_trusted() && report.failed() != 0 {
-                self.runtime
-                    .schedule_trusted_confirmation_retry(round, blocks_hash)?;
+            if report.failed() != 0 {
+                if self.runtime.trust_mode().is_trusted() {
+                    self.runtime
+                        .schedule_trusted_confirmation_retry(round, blocks_hash)?;
+                } else {
+                    self.runtime
+                        .schedule_verification_retry(round, blocks_hash)?;
+                }
             }
             tick.verification_broadcasts += 1;
             if self.runtime.trust_mode().is_trusted() {
@@ -308,35 +363,137 @@ impl TcpNode {
                     .complete_trusted_verification(round, blocks_hash)?;
             }
         }
+        if self.runtime.next_epoch_target()? != drive_target {
+            return Ok(tick);
+        }
         if self.runtime.trust_mode().is_trusted() {
             self.runtime.try_complete_trusted_verification(round)?;
             if let Some(epoch_started) = self.runtime.try_produce_epoch_started()? {
-                self.broadcast_round_message(0, Msg::EpochStarted(epoch_started))
-                    .await?;
+                let report = self.broadcast_epoch_started(epoch_started.clone()).await?;
+                self.runtime.complete_epoch_started_broadcast(
+                    &epoch_started,
+                    report
+                        .receipts
+                        .iter()
+                        .filter(|receipt| receipt.accepted())
+                        .map(|receipt| receipt.target),
+                );
+                self.runtime.record_epoch_started_broadcast_failures(
+                    &epoch_started,
+                    report.receipts.iter().filter_map(epoch_started_failure),
+                );
                 tick.epoch_started_broadcasts += 1;
             }
             return Ok(tick);
         }
         if let Some(proposal) = self.runtime.try_produce_proposal(round)? {
-            self.broadcast_round_message(round, Msg::Proposal(proposal))
+            let signature = proposal.header.signature;
+            let report = self
+                .broadcast_round_message(round, Msg::Proposal(proposal))
                 .await?;
+            if report.failed() != 0 {
+                self.runtime.schedule_proposal_retry(round, signature)?;
+            }
             tick.proposal_broadcasts += 1;
+        }
+        if self.runtime.next_epoch_target()? != drive_target {
+            return Ok(tick);
         }
         if let Some(proposal) = self.runtime.try_produce_false_proposal(round)? {
-            self.broadcast_round_message(round, Msg::Proposal(proposal))
+            let signature = proposal.header.signature;
+            let report = self
+                .broadcast_round_message(round, Msg::Proposal(proposal))
                 .await?;
+            if report.failed() != 0 {
+                self.runtime.schedule_proposal_retry(round, signature)?;
+            }
             tick.proposal_broadcasts += 1;
         }
-        if let Some(commit) = self.runtime.try_produce_commit(round)? {
-            self.broadcast_round_message(round, Msg::Commit(commit))
-                .await?;
+        if self.runtime.next_epoch_target()? != drive_target {
+            return Ok(tick);
+        }
+        let finality_collectors = if self.runtime.is_final_consensus_round(round)? {
+            Some(self.runtime.finality_collector_services()?)
+        } else {
+            None
+        };
+        let commit = match self.runtime.try_produce_commit(round)? {
+            Some(commit) => Some(commit),
+            None if finality_collectors.is_some() => self.runtime.retry_final_commit(round)?,
+            None => None,
+        };
+        if let Some(commit) = commit {
+            if let Some(collectors) = finality_collectors {
+                self.broadcast_message_to(collectors, Msg::Commit(commit))
+                    .await?;
+            } else {
+                self.broadcast_round_message(round, Msg::Commit(commit))
+                    .await?;
+            }
             tick.commit_broadcasts += 1;
         }
-        if let Some(epoch_started) = self.runtime.try_produce_epoch_started()? {
-            self.broadcast_round_message(0, Msg::EpochStarted(epoch_started))
+        Ok(tick)
+    }
+
+    /// Drives only certified epoch announcement and catch-up work.
+    ///
+    /// Manual protocol harnesses use this after a node has finalized their
+    /// requested epoch so it can disseminate the certificate without starting
+    /// another epoch.
+    pub async fn drive_epoch_dissemination_once(&self) -> Result<ConsensusDriverTick> {
+        let mut tick = ConsensusDriverTick::default();
+        let catch_up_peers = self.runtime.epoch_started_catch_up_services()?;
+        if !catch_up_peers.is_empty() {
+            tick.catch_up_updates = self
+                .catch_up_from_epoch_started_peers(&catch_up_peers)
                 .await?;
+            if tick.catch_up_updates != 0 {
+                return Ok(tick);
+            }
+        }
+        if !self.runtime.trust_mode().is_trusted()
+            && let Some(epoch_started) = self.runtime.try_produce_epoch_started()?
+        {
+            let report = self.broadcast_epoch_started(epoch_started.clone()).await?;
+            self.runtime.complete_epoch_started_broadcast(
+                &epoch_started,
+                report
+                    .receipts
+                    .iter()
+                    .filter(|receipt| receipt.accepted())
+                    .map(|receipt| receipt.target),
+            );
+            self.runtime.record_epoch_started_broadcast_failures(
+                &epoch_started,
+                report.receipts.iter().filter_map(epoch_started_failure),
+            );
             tick.epoch_started_broadcasts += 1;
         }
+        Ok(tick)
+    }
+
+    /// Drives only verified v2 prefill and its activation barrier.
+    ///
+    /// Manual protocol harnesses use this before ordinary round dispatch so a
+    /// writer's queued block cannot be consumed twice.
+    pub async fn drive_prefill_stage_once(&self, max_round: u8) -> Result<ConsensusDriverTick> {
+        let mut tick = ConsensusDriverTick::default();
+        if self.runtime.trust_mode().is_trusted() || max_round == 0 {
+            return Ok(tick);
+        }
+        let drive_target = self.runtime.next_epoch_target()?;
+        if self
+            .runtime
+            .try_broadcast_prefill_dispatch()
+            .await?
+            .is_some()
+        {
+            tick.prefill_broadcasts = 1;
+        }
+        if self.runtime.next_epoch_target()? != drive_target {
+            return Ok(tick);
+        }
+        self.runtime.try_activate_prefill_round()?;
         Ok(tick)
     }
 
@@ -347,6 +504,7 @@ impl TcpNode {
     /// production. Normal autonomous operation continues to use
     /// [`Self::drive_consensus_once`].
     pub async fn drive_dispatch_stage_once(&self, max_round: u8) -> Result<ConsensusDriverTick> {
+        let drive_target = self.runtime.next_epoch_target()?;
         let round = self.runtime.current_consensus_round()?;
         if round > max_round {
             return Err(crate::BlossomError::WireProtocol(format!(
@@ -357,14 +515,19 @@ impl TcpNode {
             self.runtime.receive_message(message)?;
         }
         let mut tick = ConsensusDriverTick::default();
-        if let Some(dispatch) = self.runtime.try_produce_dispatch(round)? {
+        if self.runtime.next_epoch_target()? != drive_target {
+            return Ok(tick);
+        }
+        if let Some(dispatch) = self
+            .runtime
+            .try_produce_dispatch_for_target(round, Some(&drive_target))?
+        {
             let blocks_hash = dispatch.body.blocks_hash;
             let report = self
                 .broadcast_round_message(round, Msg::Dispatch(dispatch))
                 .await?;
-            if self.runtime.trust_mode().is_trusted() && report.failed() != 0 {
-                self.runtime
-                    .schedule_trusted_dispatch_retry(round, blocks_hash)?;
+            if report.failed() != 0 {
+                self.runtime.schedule_dispatch_retry(round, blocks_hash)?;
             }
             tick.dispatch_broadcasts = 1;
         }
@@ -387,11 +550,10 @@ impl TcpNode {
             }) else {
                 continue;
             };
-            match send_wire_request(
-                service.socket_addr(),
-                WireRequest::GetBlocksByHash { hashes },
-            )
-            .await?
+            match self
+                .services
+                .request(service, &WireRequest::GetBlocksByHash { hashes })
+                .await?
             {
                 WireResponse::BlocksByHash(blocks) => {
                     fetched.extend(blocks);
@@ -419,6 +581,8 @@ impl TcpNode {
 
     pub async fn catch_up_from_epoch_started_peers(&self, peers: &[Service]) -> Result<usize> {
         let mut updates = 0usize;
+        let mut successful_responses = 0usize;
+        let mut last_error = None;
         for service in peers {
             let local_tip = self
                 .runtime
@@ -436,29 +600,62 @@ impl TcpNode {
                     max_epochs: 4096,
                 }
             };
-            match send_wire_request(service.socket_addr(), request).await? {
-                WireResponse::CertifiedEpochSuffix(suffix) => {
-                    updates += usize::from(self.runtime.catch_up_certified_suffix(suffix)?);
+            match self.services.request(service, &request).await {
+                Ok(WireResponse::CertifiedEpochSuffix(suffix)) => {
+                    successful_responses += 1;
+                    if self.runtime.catch_up_certified_suffix(suffix)? {
+                        updates += 1;
+                        break;
+                    }
                 }
-                WireResponse::EpochChain(chain) => {
-                    updates += usize::from(self.runtime.catch_up_from_epoch_started(chain)?);
+                Ok(WireResponse::EpochChain(chain)) => {
+                    successful_responses += 1;
+                    if self.runtime.catch_up_from_epoch_started(chain)? {
+                        updates += 1;
+                        break;
+                    }
                 }
-                WireResponse::Error(message) => {
-                    return Err(BlossomError::ExternalService(message));
+                Ok(WireResponse::Error(message)) => {
+                    last_error = Some(BlossomError::ExternalService(message));
                 }
-                response => {
-                    return Err(BlossomError::WireProtocol(format!(
+                Ok(response) => {
+                    last_error = Some(BlossomError::WireProtocol(format!(
                         "expected epoch_chain response during catch-up, got {}",
                         response.kind()
                     )));
                 }
+                Err(error) => {
+                    last_error = Some(error);
+                }
             }
+        }
+        if successful_responses == 0
+            && let Some(error) = last_error
+        {
+            return Err(error);
         }
         Ok(updates)
     }
 
     async fn broadcast_round_message(&self, round: u8, msg: Msg) -> Result<BroadcastReport> {
         let targets = self.runtime.round_consensus_services(round)?;
+        self.broadcast_message_to(targets, msg).await
+    }
+
+    async fn broadcast_epoch_started(
+        &self,
+        message: crate::EpochStarted,
+    ) -> Result<BroadcastReport> {
+        let targets = self.runtime.epoch_started_retry_services(&message);
+        self.broadcast_message_to(targets, Msg::EpochStarted(message))
+            .await
+    }
+
+    async fn broadcast_message_to(
+        &self,
+        targets: Vec<Service>,
+        msg: Msg,
+    ) -> Result<BroadcastReport> {
         let frame = EncodedFrame::encode_wire_request(&WireRequest::Message(msg))?;
         let mut handles = Vec::with_capacity(targets.len());
         for service in targets {
@@ -542,6 +739,18 @@ impl TcpNode {
             request => handle_runtime_request(&self.runtime, &self.services, request).await,
         }
     }
+}
+
+fn epoch_started_failure(receipt: &BroadcastReceipt) -> Option<(crate::PubKey, String)> {
+    if receipt.accepted() {
+        return None;
+    }
+    let error = match &receipt.response {
+        Ok(WireResponse::Error(message)) => message.clone(),
+        Ok(response) => format!("unexpected {} response", response.kind()),
+        Err(error) => error.to_string(),
+    };
+    Some((receipt.target, error))
 }
 
 fn request_drives_consensus(request: &WireRequest) -> bool {
@@ -904,429 +1113,4 @@ pub async fn send_wire_request_raw_response(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::block::{Block, Transaction};
-    use crate::blossom::{BlossomBody, EchoRequest, Header};
-    use crate::crypto::Keypair;
-    use crate::group::ConsensusGroupId;
-    use crate::messages::MSGKey;
-    use crate::node::NodeIdentity;
-    use crate::runtime::{
-        MultiGroupRuntime, RuntimeConfig, genesis_epoch, genesis_epoch_for_group,
-    };
-
-    fn tcp_node() -> (TcpNode, Keypair) {
-        let keypair = Keypair::generate();
-        let identity = NodeIdentity::new(
-            keypair.public,
-            Some(keypair.secret.clone()),
-            "tcp",
-            "127.0.0.1",
-            8080,
-            false,
-        );
-        (
-            TcpNode::new(crate::NodeRuntime::new(RuntimeConfig::new(identity))),
-            keypair,
-        )
-    }
-
-    fn signed_test_header<T: BlossomBody>(
-        signer: &Keypair,
-        target: &crate::EpochTarget,
-        round: u8,
-        kind: MSGKey,
-        body: &T,
-    ) -> Header {
-        let signature_hash = Header::signature_hash_for_body(
-            &signer.public,
-            &target.last_epoch,
-            target.nonce,
-            round,
-            kind,
-            body,
-        );
-        Header {
-            sender: signer.public,
-            last_epoch: target.last_epoch,
-            nonce: target.nonce,
-            round,
-            signature: signer.signer().sign(signature_hash.as_ref()),
-        }
-    }
-
-    fn six_node_tcp_runtime() -> (TcpNode, Vec<Keypair>) {
-        let keypairs = (0..6).map(|_| Keypair::generate()).collect::<Vec<_>>();
-        let identities = keypairs
-            .iter()
-            .enumerate()
-            .map(|(index, keypair)| {
-                NodeIdentity::new(
-                    keypair.public,
-                    (index == 0).then_some(keypair.secret.clone()),
-                    "tcp",
-                    "127.0.0.1",
-                    8700 + index as u16,
-                    false,
-                )
-            })
-            .collect::<Vec<_>>();
-        let genesis = genesis_epoch(identities.clone());
-        let mut config = RuntimeConfig::new(identities[0].clone());
-        config.genesis = Some(genesis);
-        (TcpNode::new(crate::NodeRuntime::new(config)), keypairs)
-    }
-
-    #[tokio::test]
-    async fn handle_request_returns_health_and_errors() {
-        let (node, keypair) = tcp_node();
-
-        match node.handle_request(WireRequest::Health).await.unwrap() {
-            WireResponse::Health(health) => {
-                assert_eq!(health.public_key, keypair.public);
-                assert!(health.protocol_hash_compatible());
-            }
-            response => panic!("expected health, got {}", response.kind()),
-        }
-
-        match node
-            .handle_request(WireRequest::GetBlock(crate::Nonce::new(1)))
-            .await
-            .unwrap_err()
-        {
-            BlossomError::WireProtocol(message) => assert!(message.contains("does not have")),
-            error => panic!("unexpected error: {error}"),
-        }
-    }
-
-    #[tokio::test]
-    async fn application_handler_round_trips_over_node_request_path() {
-        let (base_node, keypair) = tcp_node();
-        let node = TcpNode::with_application_handler(base_node.runtime, |request| {
-            Box::pin(async move {
-                assert_eq!(request.kind, "test/echo");
-                Ok(ApplicationResponse::new("test/echo", request.payload))
-            })
-        });
-
-        match node
-            .handle_request(WireRequest::Application(ApplicationRequest::new(
-                "test/echo",
-                b"payload",
-            )))
-            .await
-            .unwrap()
-        {
-            WireResponse::Application(response) => {
-                assert_eq!(response.kind, "test/echo");
-                assert_eq!(response.payload, b"payload");
-            }
-            response => panic!(
-                "expected application response from {}, got {}",
-                keypair.public,
-                response.kind()
-            ),
-        }
-
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
-        let server = tokio::spawn(node.clone().serve(listener));
-        let service = Service::new(
-            ServiceKind::Engine,
-            keypair.public,
-            "tcp",
-            "127.0.0.1",
-            port,
-        );
-        let response = TcpServiceClient::new()
-            .application(&service, ApplicationRequest::new("test/echo", b"network"))
-            .await
-            .unwrap();
-        assert_eq!(response.kind, "test/echo");
-        assert_eq!(response.payload, b"network");
-        server.abort();
-    }
-
-    #[tokio::test]
-    async fn handle_request_serves_durable_blocks_by_nonce() {
-        let keypair = Keypair::generate();
-        let identity = NodeIdentity::new(
-            keypair.public,
-            Some(keypair.secret.clone()),
-            "tcp",
-            "127.0.0.1",
-            8080,
-            false,
-        );
-        let root = std::env::temp_dir().join(format!(
-            "blossom-tcp-block-store-{}-{}",
-            std::process::id(),
-            keypair.public
-        ));
-        let mut config = RuntimeConfig::new(identity);
-        config.block_store_path = Some(root.clone());
-        let node = TcpNode::new(crate::NodeRuntime::new(config));
-        let target = node.runtime.next_epoch_target().unwrap();
-        let mut block = Block::default();
-        block.body.last_epoch = target.last_epoch;
-        block.body.nonce = target.nonce;
-        block.sign(&keypair.secret);
-        let hash = block.hash;
-
-        node.handle_request(WireRequest::SendBlock(block))
-            .await
-            .unwrap();
-
-        match node
-            .handle_request(WireRequest::GetBlock(target.nonce))
-            .await
-            .unwrap()
-        {
-            WireResponse::Block(block) => assert_eq!(block.hash, hash),
-            response => panic!("expected block, got {}", response.kind()),
-        }
-        std::fs::remove_dir_all(root).ok();
-    }
-
-    #[tokio::test]
-    async fn handle_request_returns_direct_pong_without_consensus() {
-        let (node, keypair) = tcp_node();
-        let ping = crate::NodePing::with_payload(42, b"hello-peer");
-
-        match node.handle_request(WireRequest::Ping(ping)).await.unwrap() {
-            WireResponse::Pong(pong) => {
-                assert_eq!(pong.group_id, ConsensusGroupId::root());
-                assert_eq!(pong.public_key, keypair.public);
-                assert!(pong.protocol_hash_compatible());
-                assert_eq!(pong.nonce, 42);
-                assert_eq!(pong.payload, b"hello-peer");
-            }
-            response => panic!("expected pong, got {}", response.kind()),
-        }
-    }
-
-    #[tokio::test]
-    async fn handle_request_serves_durable_blocks_by_hash() {
-        let keypair = Keypair::generate();
-        let identity = NodeIdentity::new(
-            keypair.public,
-            Some(keypair.secret.clone()),
-            "tcp",
-            "127.0.0.1",
-            8610,
-            false,
-        );
-        let root = std::env::temp_dir().join(format!(
-            "blossom-tcp-block-store-hash-{}-{}",
-            std::process::id(),
-            keypair.public
-        ));
-        let mut config = RuntimeConfig::new(identity);
-        config.block_store_path = Some(root.clone());
-        let runtime = NodeRuntime::new(config);
-        let target = runtime.next_epoch_target().unwrap();
-        let mut block = Block::default();
-        block.body.last_epoch = target.last_epoch;
-        block.body.nonce = target.nonce;
-        block.body.txs.push(Transaction::new("tcp-hash-repair"));
-        block.sign(&keypair.secret);
-        runtime.submit_block(block.clone()).unwrap();
-        let node = TcpNode::new(runtime);
-
-        match node
-            .handle_request(WireRequest::GetBlocksByHash {
-                hashes: vec![block.hash, HashType([9; 32])],
-            })
-            .await
-            .unwrap()
-        {
-            WireResponse::BlocksByHash(blocks) => {
-                assert_eq!(blocks.len(), 1);
-                assert_eq!(blocks.get(&block.hash).unwrap().hash, block.hash);
-            }
-            response => panic!("expected blocks_by_hash, got {}", response.kind()),
-        }
-
-        std::fs::remove_dir_all(root).ok();
-    }
-
-    #[tokio::test]
-    async fn echo_request_returns_targeted_redispatch_response() {
-        let (node, keypairs) = six_node_tcp_runtime();
-        let target = node.runtime.next_epoch_target().unwrap();
-        let mut block = Block::default();
-        block.body.last_epoch = target.last_epoch;
-        block.body.nonce = target.nonce;
-        block.body.txs.push(Transaction::new("tcp-echo-redispatch"));
-        block.sign(&keypairs[0].secret);
-        node.runtime.submit_block(block).unwrap();
-        let dispatch = node.runtime.dispatch_local_block(0).unwrap();
-        let block_hash = *dispatch.body.blocks.keys().next().unwrap();
-        let requested_blocks = [(block_hash, ())].into_iter().collect();
-        let request = EchoRequest {
-            header: signed_test_header(
-                &keypairs[1],
-                &target,
-                0,
-                MSGKey::EchoRequest,
-                &requested_blocks,
-            ),
-            requested_blocks,
-        };
-
-        match node
-            .handle_request(WireRequest::Message(Msg::EchoRequest(request)))
-            .await
-            .unwrap()
-        {
-            WireResponse::EchoReDispatch(Some(redispatch)) => {
-                assert_eq!(redispatch.header.sender, keypairs[0].public);
-                assert!(redispatch.redispatched_blocks.contains_key(&block_hash));
-            }
-            response => panic!("expected echo_redispatch response, got {}", response.kind()),
-        }
-    }
-
-    #[tokio::test]
-    async fn consensus_driver_broadcasts_prefill_once_before_verified_rounds() {
-        let keypairs = (0..36).map(|_| Keypair::generate()).collect::<Vec<_>>();
-        let identities = keypairs
-            .iter()
-            .enumerate()
-            .map(|(index, keypair)| {
-                NodeIdentity::new(
-                    keypair.public,
-                    (index == 0).then_some(keypair.secret.clone()),
-                    "tcp",
-                    "127.0.0.1",
-                    8600 + index as u16,
-                    false,
-                )
-            })
-            .collect::<Vec<_>>();
-        let genesis = genesis_epoch(identities.clone());
-        let mut config = RuntimeConfig::new(identities[0].clone());
-        config.genesis = Some(genesis);
-        let runtime = NodeRuntime::new(config);
-        let target = runtime.next_epoch_target().unwrap();
-        let mut block = Block::default();
-        block.body.last_epoch = target.last_epoch;
-        block.body.nonce = target.nonce;
-        block.body.txs.push(Transaction::new("tcp-driver-prefill"));
-        block.sign(&keypairs[0].secret);
-        runtime.submit_block(block).unwrap();
-
-        let node = TcpNode::new(runtime.clone());
-        let driver = ConsensusDriverConfig {
-            max_round: 1,
-            drive_prefill: true,
-            drive_dispatch: false,
-            ..ConsensusDriverConfig::default()
-        };
-        let first = node.drive_consensus_once(&driver).await.unwrap();
-        let second = node.drive_consensus_once(&driver).await.unwrap();
-
-        assert_eq!(first.prefill_broadcasts, 1);
-        assert_eq!(first.dispatch_broadcasts, 0);
-        assert_eq!(second.prefill_broadcasts, 0);
-        assert!(runtime.has_local_prefill_dispatch().unwrap());
-    }
-
-    #[tokio::test]
-    async fn multi_group_node_routes_grouped_requests_to_subnets() {
-        let keypairs = (0..6).map(|_| Keypair::generate()).collect::<Vec<_>>();
-        let identities = keypairs
-            .iter()
-            .enumerate()
-            .map(|(index, keypair)| {
-                NodeIdentity::new(
-                    keypair.public,
-                    (index == 0).then_some(keypair.secret.clone()),
-                    "tcp",
-                    "127.0.0.1",
-                    8000 + index as u16,
-                    false,
-                )
-            })
-            .collect::<Vec<_>>();
-
-        let root_genesis = genesis_epoch(identities.clone());
-        let subnet_id = ConsensusGroupId::named("cache-hotset-a");
-        let subnet_genesis = genesis_epoch_for_group(subnet_id, identities[..3].to_vec());
-
-        let mut root_config = RuntimeConfig::new(identities[0].clone());
-        root_config.genesis = Some(root_genesis.clone());
-        let root_runtime = NodeRuntime::new(root_config);
-
-        let mut subnet_config = RuntimeConfig::new(identities[0].clone());
-        subnet_config.group_id = subnet_id;
-        subnet_config.genesis = Some(subnet_genesis.clone());
-        let subnet_runtime = NodeRuntime::new(subnet_config);
-        subnet_runtime
-            .set_application_state(b"subnet-only")
-            .unwrap();
-
-        let root_target = root_runtime.next_epoch_target().unwrap();
-        let subnet_target = subnet_runtime.next_epoch_target().unwrap();
-        let node = TcpMultiGroupNode::new(MultiGroupRuntime::with_groups(
-            root_runtime,
-            [subnet_runtime],
-        ));
-
-        match node.handle_request(WireRequest::NextNonce).await.unwrap() {
-            WireResponse::NextNonce(target) => {
-                assert_eq!(target.last_epoch, root_target.last_epoch)
-            }
-            response => panic!("expected root next nonce, got {}", response.kind()),
-        }
-
-        let grouped_next = WireRequest::Group {
-            group_id: subnet_id,
-            request: Box::new(WireRequest::NextNonce),
-        };
-        match node.handle_request(grouped_next).await.unwrap() {
-            WireResponse::NextNonce(target) => {
-                assert_eq!(target.last_epoch, subnet_target.last_epoch);
-                assert_eq!(target.nonce, subnet_target.nonce);
-            }
-            response => panic!("expected subnet next nonce, got {}", response.kind()),
-        }
-
-        let grouped_ping = WireRequest::Group {
-            group_id: subnet_id,
-            request: Box::new(WireRequest::Ping(crate::NodePing::new(7))),
-        };
-        match node.handle_request(grouped_ping).await.unwrap() {
-            WireResponse::Pong(pong) => {
-                assert_eq!(pong.group_id, subnet_id);
-                assert_eq!(pong.public_key, keypairs[0].public);
-                assert_eq!(pong.nonce, 7);
-                assert!(pong.payload.is_empty());
-            }
-            response => panic!("expected subnet pong, got {}", response.kind()),
-        }
-
-        let grouped_dispatch = WireRequest::Group {
-            group_id: subnet_id,
-            request: Box::new(WireRequest::Dispatch { round: 0 }),
-        };
-        match node.handle_request(grouped_dispatch).await.unwrap() {
-            WireResponse::Dispatch(dispatch) => {
-                assert_eq!(dispatch.header.last_epoch, subnet_target.last_epoch);
-                let block = dispatch.body.blocks.values().next().unwrap();
-                assert_eq!(block.application_state(), b"subnet-only");
-            }
-            response => panic!("expected subnet dispatch, got {}", response.kind()),
-        }
-
-        let unknown_group = WireRequest::Group {
-            group_id: ConsensusGroupId::named("not-hosted"),
-            request: Box::new(WireRequest::NextNonce),
-        };
-        assert!(matches!(
-            node.handle_request(unknown_group).await,
-            Err(BlossomError::WireProtocol(message)) if message.contains("unknown consensus group")
-        ));
-    }
-}
+mod tests;

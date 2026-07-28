@@ -8,9 +8,7 @@ public Rust APIs and separately versions consensus and durable wire formats.
 
 ## [Unreleased]
 
-No changes yet.
-
-## [2.0.0] - 2026-07-27
+## [2.0.0] - 2026-07-28
 
 ### Added
 
@@ -37,6 +35,11 @@ No changes yet.
 - Certified HA history compaction and checkpoint-bound reactivation evidence.
 - Configurable network deadlines, connection limits, request bounds, signed
   watermarks, and crash-safe durable recovery.
+- A multi-core OpenRaft production campaign runner with stable, message-aware
+  request/response fault IDs and explicit fault-coverage admission.
+- Regression coverage for ordinary append catch-up after partition healing,
+  snapshot installation, leader transitions, certified epoch dissemination,
+  and large TCP driver clusters.
 
 ### Changed
 
@@ -50,6 +53,49 @@ No changes yet.
 - Active-passive and active-active durability now share the embedded ShardLog
   backend. Earlier development redb files are an explicit reset or certified
   recovery boundary and are never overwritten.
+- Final-round commit shares are collected by a deterministic bounded committee
+  into a certificate signed by a supermajority of the complete validator set.
+
+### Fixed
+
+- Verified 24-node and 36-node epochs are published to a validator
+  supermajority through authenticated epoch hints and certified suffix
+  catch-up. Prefill runs before ordinary dispatch and retains its exact signed
+  message until every routed recipient acknowledges it, preventing accepted
+  writer blocks from being replaced by empty prefill blocks. Exact dispatch
+  replay is idempotent, conflicting replay is rejected, and final-certificate
+  shares remain retryable after incomplete broadcasts. Consensus driver ticks
+  are bound to the epoch target on which they began, so an in-flight tick
+  cannot resume after finalization and seal an empty dispatch for the next
+  epoch. Late application admission after a local dispatch is sealed now fails
+  closed. The native validation adapter rechecks every activation barrier
+  after a complete cluster-wide prefill wave, preventing a validator whose
+  last required dispatch arrived late in that wave from remaining in round
+  zero. Verified verification and proposal broadcasts retry their exact signed
+  messages after incomplete delivery. Verified finality validation now applies
+  its timeout to inactivity, refreshing the deadline when signed round
+  progress is observed, as the trusted validator already did. Each epoch hint
+  is retried only to validators that have not acknowledged it, and hints for an
+  unknown newer head no longer fail the current-target envelope check.
+- Healed OpenRaft replicas now resume ordinary append replication even when
+  the first post-heal heartbeat discovers a newer term.
+- Active-passive client writes retry the same idempotent command across
+  transient leader transitions, including `ForwardToLeader(None)`.
+- Idle consensus-driver recovery assessment now materializes the deterministic
+  round instead of failing with `UnknownSender`.
+- Test driver failures are reported to their parent test, large TCP cases are
+  serialized, and benchmark Raft nodes shut down as one cluster operation.
+- Membership lease certificates commit an absolute issuance time and expiry,
+  so reinstalling cached evidence cannot renew an isolated node. Published
+  relay expiry also clamps the verified view's forwarding deadline.
+- Normal member-registry add and key-rotation operations can no longer grant
+  validator authority; new validator keys require certified supermajority
+  `NodeAdmission` evidence.
+- Secret-key seeds zeroize on drop, and both individual and batch Ed25519
+  verification reject weak public keys.
+- HA production validation scopes filtered unit and soak runs to the library
+  target, avoiding redundant late-stage linker pressure without dropping the
+  dedicated HA integration suite.
 
 ### Removed
 

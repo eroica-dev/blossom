@@ -1,3 +1,5 @@
+//! Adapter that drives Blossom's fixed-membership HA runtime in benchmarks.
+
 use std::path::Path;
 use std::time::Instant;
 

@@ -1,3 +1,5 @@
+//! Errors shared by protocol, runtime, storage, and transport APIs.
+
 use std::fmt;
 
 pub type Result<T> = std::result::Result<T, BlossomError>;

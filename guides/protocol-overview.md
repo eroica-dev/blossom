@@ -27,14 +27,35 @@ complete validator set. The resolved value is committed in consensus
 parameters. A joining or restored node must match the committed value; changing
 the process environment cannot change a live network.
 
-Supermajority checks use two-thirds-plus-one and reject duplicate or unknown
-senders. Topology and threshold calculations use checked integer arithmetic.
+Supermajority checks use the ceiling of two thirds and reject duplicate or
+unknown senders. Topology and threshold calculations use checked integer
+arithmetic.
+In the final round, every validator sends its exact-hash commit share to a
+deterministically selected bounded collector committee. A collector may
+publish only after assembling signatures from a supermajority of the complete
+previous verifier set. Signed epoch-start messages are bounded hints, not
+proofs: a lagging validator changes committed state only after fetching and
+validating the corresponding `CertifiedEpochSuffix`. Publishers retain the
+exact signed hint and retry only its unacknowledged validator recipients, so a
+temporary partition cannot permanently strand a validator after healing.
 
 ## v2 Prefill Dispatch
 
 In v2, each node first dispatches its local block to the peers it will meet
 across future rounds. This prefill stage is not a consensus decision; it
 improves availability before verified rounds begin.
+
+The exact signed prefill dispatch is retained and retried only to routed peers
+that have not acknowledged it. Manual drivers must complete this stage before
+ordinary dispatch. Dispatch production is single-writer and idempotent for a
+sealed round, and application admission after the local dispatch is sealed
+fails closed.
+
+Every network driver tick is bound to the epoch target captured when the tick
+begins. If certified finality advances the runtime while the tick awaits a
+network response, the remaining stages stop instead of resuming against the
+next epoch. If a verification or proposal broadcast is only partially
+delivered, later ticks replay the exact original signed message.
 
 Later rounds still verify, propose, and commit the epoch view. Prefilled blocks
 seed local availability, but canonical state changes only after signed quorum

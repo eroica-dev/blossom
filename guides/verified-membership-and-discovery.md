@@ -7,11 +7,13 @@ membership without making every network participant a consensus validator.
 
 `SecKey` is signing material, not protocol state. It is non-`Copy`, has only
 redacted `Debug`, and implements neither `Display` nor Serde/Borsh
-serialization. `NodeRuntime` extracts a `SecretSigner` during construction and
-immediately converts its stored `NodeIdentity` to public-only form. Epochs,
-snapshots, HA recovery manifests, logs, wire messages, and status/debug output
-therefore contain only public identity. Deployments still keep key loading and
-rotation in their secret manager.
+serialization, and zeroizes its seed bytes on drop. Individual and batch
+signature verification reject weak Ed25519 public keys. `NodeRuntime` extracts
+a `SecretSigner` during construction and immediately converts its stored
+`NodeIdentity` to public-only form. Epochs, snapshots, HA recovery manifests,
+logs, wire messages, and status/debug output therefore contain only public
+identity. Deployments still keep key loading and rotation in their secret
+manager.
 
 Verified catch-up uses `CertifiedEpochSuffix`, identified by an exact
 `(anchor_hash, anchor_nonce)` pair. Use
@@ -39,8 +41,10 @@ and public-key rotation transitions. A validator stages one with
 after the containing epoch is certified.
 
 Only active records with the `validator` capability enter the consensus
-verifier set. NAT-hidden clients and relays therefore do not increase the
-consensus quorum.
+verifier set. Registry add and key-rotation operations cannot grant
+`validator`; new validator keys must pass the distinct-validator
+supermajority `NodeAdmission` path. NAT-hidden clients and relays therefore do
+not increase or bypass the consensus quorum.
 
 ## Signed service records
 
@@ -74,10 +78,14 @@ let membership = runtime.watch_verified_membership();
 The receiver carries `Arc<VerifiedMembershipView>`, including the group,
 certified epoch hash and nonce, member and relay sets, and a monotonic
 `valid_until`. A new epoch publishes an already-expired view. Validators sign
-one fresh `MembershipLeaseStatement` per random challenge; after the caller
-collects a supermajority, `install_membership_lease` publishes the renewed
-view. Signed service updates are published only while that exact epoch lease
-is fresh and never extend the lease.
+one fresh `MembershipLeaseStatement` per random challenge, including an
+absolute signed issuance time and expiry; after the caller collects a
+supermajority, `install_membership_lease` publishes the renewed view. Reusing
+the same cached certificate cannot move `valid_until` forward, including
+after reinstall. Signed service updates are published only while that exact
+epoch lease is fresh and never extend the lease. If a published relay record
+expires sooner, its signed deadline clamps `valid_until` so forwarding stops
+promptly.
 
 Every forwarding decision must call `VerifiedMembershipView::require_fresh`
 and then check the required `client` or `relay` capability. Once

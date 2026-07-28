@@ -41,12 +41,15 @@ semantics.
 
 - [Quick Start](guides/quick-start.md)
 - [Changelog](CHANGELOG.md)
+- [Security Policy](SECURITY.md)
 - [Release Procedure](RELEASING.md)
 - [Protocol Overview](guides/protocol-overview.md)
+- [Code Organization and Maintenance](guides/code-organization.md)
 - [Feature Flags](guides/feature-flags.md)
 - [Operations](guides/operations.md)
 - [Observability](guides/observability.md)
 - [Testing And Validation](guides/testing-and-validation.md)
+- [OpenRaft Production Testing](guides/openraft-production-testing.md)
 - [Deterministic Verification Sandbox](guides/deterministic-sandbox.md)
 - [Direct Active-Active Integration](guides/active-active-integration.md)
 - [Embedded Blossom LogStore](guides/log-store.md)
@@ -69,7 +72,9 @@ semantics.
 `2.0.0` is prepared as the first public package release. The core protocol
 paths are covered by unit tests, TCP end-to-end tests, externally owned
 deterministic simulations, formal threshold checks, and release-gate
-validation. The package has not been uploaded to crates.io yet.
+validation. Verified 24-node and 36-node regressions require both a global
+certificate and publication by a validator supermajority. The package has not
+been uploaded to crates.io yet.
 
 Stable public trustless deployments still require independent security review,
 deployment-specific key management, monitoring, public-join abuse controls, and

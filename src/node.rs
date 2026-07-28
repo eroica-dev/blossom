@@ -1,3 +1,5 @@
+//! Public node identities, signer separation, and node roles.
+
 use std::fmt;
 
 use borsh::{BorshDeserialize, BorshSerialize};

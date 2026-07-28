@@ -1,3 +1,5 @@
+//! Multi-writer active-active smoke workload.
+
 use std::fs;
 use std::path::PathBuf;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};

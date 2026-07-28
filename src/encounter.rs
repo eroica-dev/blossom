@@ -1,3 +1,5 @@
+//! Signed evidence of peer behavior observed during consensus phases.
+
 use borsh::{BorshDeserialize, BorshSerialize};
 use serde::{Deserialize, Serialize};
 

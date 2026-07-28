@@ -1,3 +1,5 @@
+//! Property checks for trusted checkpoint-DAG ordering and recovery.
+
 #![cfg(feature = "trusted-checkpoint-dag")]
 
 use blossom::{

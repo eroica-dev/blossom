@@ -1,3 +1,5 @@
+//! Command-line entry point for the in-process Blossom harness.
+
 use clap::Parser;
 
 use blossom::{

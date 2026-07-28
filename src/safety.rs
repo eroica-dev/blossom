@@ -1,3 +1,5 @@
+//! Site-aware committee layout and auditable safety manifests.
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::Path;

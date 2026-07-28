@@ -1,3 +1,5 @@
+//! Shared workload generation, execution, measurement, and reporting.
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 

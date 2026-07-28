@@ -1,3 +1,5 @@
+//! Fast benchmark smoke test for local and CI validation.
+
 use std::fs;
 use std::path::PathBuf;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};

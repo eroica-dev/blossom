@@ -1,3 +1,5 @@
+//! Property checks for quorum thresholds and deterministic selection.
+
 use std::str::FromStr;
 
 use blossom::{

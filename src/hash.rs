@@ -1,3 +1,5 @@
+//! Protocol hash types, domain separation, and feature compatibility registry.
+
 use borsh::{BorshDeserialize, BorshSerialize};
 use indextreemap::{IndexTreeMap, SharedIndexTreeMap};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};

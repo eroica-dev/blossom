@@ -1,3 +1,5 @@
+//! Subset-gossip propagation benchmark and feature-gated fallback.
+
 #[cfg(not(feature = "availability-gossip"))]
 fn main() {
     eprintln!("blossom-subset-gossip-bench requires --features availability-gossip");

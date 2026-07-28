@@ -1,3 +1,5 @@
+//! Per-round message matrices, quorum queues, and progress counters.
+
 use serde::{Deserialize, Serialize};
 
 use crate::algorithm::supermajority_count;

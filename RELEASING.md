@@ -16,6 +16,8 @@ published yet.
 - Run `scripts/release-gate.sh` and retain `target/release-gate/`.
 - Review `CHANGELOG.md`, package contents, normalized manifests, and generated
   rustdoc.
+- Confirm the code-organization guide still matches the public facade and child
+  module layout.
 
 ## Dependency order
 

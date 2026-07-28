@@ -50,6 +50,41 @@ votes:
 scripts/trusted-production-validation.sh
 ```
 
+The native benchmark adapter has explicit multi-epoch lifecycle regressions.
+Its manual TCP driver is target bounded: after a node finalizes the requested
+nonce, later manual ticks for that nonce must not advance it into empty
+epochs, and an in-flight tick stops when finality changes its captured target.
+Exact dispatch replay is idempotent while a conflicting replay is rejected.
+A cluster-wide prefill wave is followed by a second activation-barrier pass,
+covering validators whose last required dispatch arrived after their own
+broadcast task checked the barrier. The native finality timeout is an
+inactivity bound: signed round progress refreshes it, while an actually stalled
+round still fails with per-node consensus, prefill, dissemination, and traffic
+diagnostics.
+A validator may acknowledge or confirm only after its complete current-round
+dispatch set is present; validators in earlier hierarchy rounds continue
+dispatching independently. The active-active regression executes 16
+consecutive universal-writer epochs through admission, availability, ordering,
+application, and all-node convergence. These tests protect against
+schedule-sensitive validator drift and conflicting trusted epoch hashes that
+one-epoch smoke tests cannot observe:
+
+```sh
+cargo test -p blossom-bench-harness \
+  blossom_adapter::tests::manual_driver_never_advances_beyond_the_requested_epoch
+cargo test -p blossom-bench-harness \
+  blossom_adapter::tests::active_active_cluster_remains_bounded_across_many_epochs
+```
+
+The external native scale gate additionally requires a supermajority of
+validators to publish the same globally certified epoch at 24 and 36 nodes.
+The product TCP helper and benchmark adapter enforce the same threshold and
+validate the exact-hash certificate against the previous verifier set. These
+regressions cover final-share collection, authenticated newer-head hints,
+per-recipient hint retries, exact dispatch replay after transient rejection,
+exact prefill replay and writer-payload inclusion, certified-suffix
+installation, and bounded manual-driver dissemination.
+
 The focused HA gate also includes 1,001+ epoch durability tests, authenticated
 subprocess kill/restart, ENOSPC and fsync atomicity, and Hegel properties:
 
@@ -59,12 +94,34 @@ scripts/ha-production-validation.sh
 
 The active-passive gate runs the native OpenRaft election, contract-fence,
 learner, joint-consensus replacement, failover, and read-barrier integration
-test. It also performs 1,001 opaque writes while repeatedly killing and
+test. It also runs message-aware request loss, response loss, duplication,
+delay, election, membership-change, and durable snapshot scenarios. Every
+scripted fault has a stable ID and must appear in the executed-fault coverage;
+a configured fault that never reaches a matching RPC fails the gate.
+
+The gate then performs 1,001 opaque writes while repeatedly killing and
 restarting leaders and followers against the shipped ShardLog-backed log:
 
 ```sh
 scripts/active-passive-production-validation.sh
 ```
+
+The standalone multi-core campaign runner has `pr`, `nightly`, and `release`
+profiles:
+
+```sh
+scripts/openraft-production-campaign.sh pr
+BLOSSOM_RAFT_JOBS=16 scripts/openraft-production-campaign.sh nightly
+```
+
+Its report fails admission on any observed process or Tokio task panic, even
+when the final state converges. The report explicitly records deterministic
+inputs with `exact_task_schedule_replay=false`; native Tokio scheduling is not
+an exact replay guarantee.
+
+See [OpenRaft Production Testing](openraft-production-testing.md) for profile
+sizes, custom fault selection, artifacts, coverage admission, and the boundary
+between repeatable native runs and exact simulation replay.
 
 ## Benchmarks
 
@@ -76,7 +133,7 @@ Useful starting points:
 benchmarks/scripts/run-prefill-head-to-head.sh
 benchmarks/scripts/run-proof-validation-matrix.sh
 ```
-# Deterministic protocol exploration
+## Deterministic protocol exploration
 
 The simulation repository owns `blossom-sim`, the protocol-v1 process adapter,
 PR/nightly/release profiles, deterministic fault and recovery models, VM tiers,

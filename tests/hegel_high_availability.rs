@@ -1,3 +1,5 @@
+//! Property checks for native fixed-membership HA behavior.
+
 #![cfg(feature = "high-availability")]
 
 use blossom::{

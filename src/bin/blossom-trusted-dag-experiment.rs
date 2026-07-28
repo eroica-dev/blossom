@@ -1,3 +1,5 @@
+//! Experimental trusted checkpoint-DAG workload driver.
+
 #[cfg(feature = "trusted-checkpoint-dag")]
 use std::fs;
 #[cfg(feature = "trusted-checkpoint-dag")]

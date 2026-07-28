@@ -1,3 +1,5 @@
+//! Cross-engine correctness checks and canonical workload results.
+
 use std::collections::{BTreeMap, BTreeSet};
 
 use blossom::{ActiveActiveCommand, HashType};

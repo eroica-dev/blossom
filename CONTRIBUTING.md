@@ -32,3 +32,8 @@ benchmark artifacts remain under that repository's `target/`.
 Keep trusted and trustless behavior separate. Optimizations that change
 cryptographic assumptions, payload availability, admission, reconciliation, or
 Byzantine fault tolerance need explicit feature flags or runtime validation.
+
+Follow [Code Organization and Maintenance](guides/code-organization.md) when
+adding APIs or moving implementation code. Keep public paths on the parent
+facade, use focused child files without `mod.rs`, and avoid widening visibility
+solely to cross a module boundary.

@@ -1,3 +1,5 @@
+//! Inventory-first propagation for bandwidth-sensitive deployments.
+
 use crate::{
     ManifestAuthentication, PropagationPlan, PropagationStrategy, RedundancyPlan, TrustBoundary,
 };

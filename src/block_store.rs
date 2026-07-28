@@ -1,3 +1,5 @@
+//! Durable block indexing by epoch nonce and block hash.
+
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;

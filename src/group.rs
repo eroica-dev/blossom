@@ -1,3 +1,5 @@
+//! Stable identifiers for independent consensus groups.
+
 use std::fmt;
 
 use borsh::{BorshDeserialize, BorshSerialize};

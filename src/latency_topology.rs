@@ -1,3 +1,5 @@
+//! Observed latency relationships and topology-aware peer selection.
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::{SystemTime, UNIX_EPOCH};
 

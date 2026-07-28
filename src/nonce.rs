@@ -1,3 +1,5 @@
+//! Monotonic epoch nonce type and successor operations.
+
 use borsh::{BorshDeserialize, BorshSerialize};
 use serde::{Deserialize, Serialize};
 use std::fmt;

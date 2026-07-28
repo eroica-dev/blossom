@@ -25,9 +25,9 @@ fi
 
 matches '^#\[cfg\(feature = "high-availability"\)\]$' src/lib.rs \
   || fail "the HA module is not feature gated"
-matches '^pub enum HaWireRequest \{' src/high_availability.rs \
+matches '^pub enum HaWireRequest \{' src/high_availability/transport.rs \
   || fail "the isolated HA request envelope is missing"
-matches '^pub enum HaWireResponse \{' src/high_availability.rs \
+matches '^pub enum HaWireResponse \{' src/high_availability/transport.rs \
   || fail "the isolated HA response envelope is missing"
 matches '^high-availability = \["dep:hmac"\]$' Cargo.toml \
   || fail "the HA feature dependency boundary changed"

@@ -1,3 +1,5 @@
+//! Property checks for isolated parallel-network coordination.
+
 #![cfg(feature = "parallel-networks")]
 
 use blossom::{ConsensusGroupId, HaGroupRegistration, HighAvailabilityParameters, PubKey};

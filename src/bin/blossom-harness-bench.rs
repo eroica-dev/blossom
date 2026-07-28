@@ -1,3 +1,5 @@
+//! Configurable in-process Blossom consensus harness benchmark.
+
 use std::fs::{OpenOptions, create_dir_all};
 use std::io::Write;
 use std::path::PathBuf;

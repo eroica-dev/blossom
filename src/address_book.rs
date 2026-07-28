@@ -1,3 +1,5 @@
+//! Validated service records and the node-local reachability address book.
+
 use std::collections::BTreeMap;
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
@@ -281,14 +283,20 @@ impl AddressBook {
         group_id: ConsensusGroupId,
         now_unix_millis: u64,
     ) -> impl Iterator<Item = Service> + '_ {
-        self.signed_records
-            .values()
-            .filter(move |record| {
-                record.body.group_id == group_id
-                    && !record.body.tombstone
-                    && record.body.expires_at_unix_millis > now_unix_millis
-            })
+        self.active_signed_records(group_id, now_unix_millis)
             .map(|record| record.body.service())
+    }
+
+    pub(crate) fn active_signed_records(
+        &self,
+        group_id: ConsensusGroupId,
+        now_unix_millis: u64,
+    ) -> impl Iterator<Item = &SignedServiceRecord> + '_ {
+        self.signed_records.values().filter(move |record| {
+            record.body.group_id == group_id
+                && !record.body.tombstone
+                && record.body.expires_at_unix_millis > now_unix_millis
+        })
     }
 
     pub fn prune_expired_signed_records(&mut self, now_unix_millis: u64) {
@@ -521,20 +529,16 @@ mod tests {
     #[test]
     fn writes_and_reads_bootstrap_services_json() {
         let mut book = AddressBook::new();
+        let consensus_key = Keypair::generate().public;
+        let block_key = Keypair::generate().public;
         let consensus = Service::new(
             ServiceKind::Consensus,
-            PubKey([4; 32]),
+            consensus_key,
             "tcp",
             "127.0.0.1",
             8100,
         );
-        let block = Service::new(
-            ServiceKind::Block,
-            PubKey([5; 32]),
-            "tcp",
-            "127.0.0.1",
-            9100,
-        );
+        let block = Service::new(ServiceKind::Block, block_key, "tcp", "127.0.0.1", 9100);
         book.extend_services([consensus.clone(), block.clone()]);
 
         let path =

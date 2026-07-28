@@ -1,3 +1,5 @@
+//! Full-payload push propagation for latency-sensitive deployments.
+
 use crate::{
     ManifestAuthentication, PropagationPlan, PropagationStrategy, RedundancyPlan, TrustBoundary,
 };

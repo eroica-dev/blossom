@@ -1,3 +1,5 @@
+//! Standalone TCP node for local operation and integration testing.
+
 use std::io;
 use std::path::PathBuf;
 use std::sync::Arc;

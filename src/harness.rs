@@ -1,3 +1,5 @@
+//! In-process deterministic cluster fixtures for tests and examples.
+
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 

@@ -27,3 +27,11 @@ TCP end-to-end tests, Hegel properties, OpenRaft comparison controls, formal
 models, and production-code dynamic analysis. A new profile, simulated fault,
 simulation container, VM test, or replay regression belongs in the simulation
 repository.
+
+Blossom's production-side OpenRaft controls are documented in
+[OpenRaft Production Testing](openraft-production-testing.md). They expose
+message-aware one-shot faults and multi-core `pr`, `nightly`, and `release`
+runners to the simulation adapter without duplicating the framework. Native
+Tokio runs reproduce workloads and fault identities from a seed but do not
+promise byte-identical schedules. Exact production execution replay requires
+the simulation repository's Linux TCG tier.

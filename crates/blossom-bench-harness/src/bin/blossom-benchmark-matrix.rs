@@ -1,3 +1,5 @@
+//! Benchmark matrix runner for supported replication profiles.
+
 use std::fs;
 use std::path::PathBuf;
 

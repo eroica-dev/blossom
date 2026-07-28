@@ -1,3 +1,5 @@
+//! Public identities, memory-only signing material, signatures, and verification.
+
 use std::fmt;
 use std::ops::Deref;
 use std::sync::Arc;
@@ -12,6 +14,7 @@ use ed25519_dalek::{
 use rand_core::OsRng;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use sha2::Sha512;
+use zeroize::Zeroize;
 
 use crate::error::{BlossomError, Result};
 
@@ -110,7 +113,9 @@ impl TryFrom<&[u8]> for PubKey {
             expected: PUBLIC_KEY_LENGTH,
             actual,
         })?;
-        Ok(Self(bytes))
+        let public_key = Self(bytes);
+        validating_key(&public_key)?;
+        Ok(public_key)
     }
 }
 
@@ -147,6 +152,12 @@ pub struct SecKey(pub [u8; SECRET_KEY_LENGTH]);
 impl fmt::Debug for SecKey {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("SecKey([REDACTED])")
+    }
+}
+
+impl Drop for SecKey {
+    fn drop(&mut self) {
+        self.0.zeroize();
     }
 }
 
@@ -214,8 +225,7 @@ impl Signature {
     }
 
     pub fn verify(&self, message: &[u8], public_key: &PubKey) -> Result<()> {
-        let verifying_key = VerifyingKey::from_bytes(public_key.as_array())
-            .map_err(|_| BlossomError::InvalidPublicKey)?;
+        let verifying_key = validating_key(public_key)?;
         let signature = DalekSignature::from_bytes(&self.0);
         verifying_key
             .verify(message, &signature)
@@ -242,14 +252,8 @@ pub fn verify_batch(
 
     let verifying_keys = public_keys
         .iter()
-        .map(|public_key| {
-            VerifyingKey::from_bytes(public_key.as_array())
-                .map_err(|_| BlossomError::InvalidPublicKey)
-        })
+        .map(validating_key)
         .collect::<Result<Vec<_>>>()?;
-    if verifying_keys.iter().any(VerifyingKey::is_weak) {
-        return Err(BlossomError::InvalidPublicKey);
-    }
 
     let signatures = signatures
         .iter()
@@ -257,6 +261,15 @@ pub fn verify_batch(
         .collect::<Vec<_>>();
     dalek_verify_batch(messages, &signatures, &verifying_keys)
         .map_err(|_| BlossomError::SignatureError)
+}
+
+fn validating_key(public_key: &PubKey) -> Result<VerifyingKey> {
+    let verifying_key = VerifyingKey::from_bytes(public_key.as_array())
+        .map_err(|_| BlossomError::InvalidPublicKey)?;
+    if verifying_key.is_weak() {
+        return Err(BlossomError::InvalidPublicKey);
+    }
+    Ok(verifying_key)
 }
 
 pub struct SecretSigner {
@@ -473,6 +486,24 @@ mod tests {
                 actual: 8
             })
         );
+    }
+
+    #[test]
+    fn weak_public_keys_are_rejected_by_parsing_and_verification() {
+        let weak_bytes = [0; PUBLIC_KEY_LENGTH];
+        assert_eq!(
+            PubKey::try_from(weak_bytes.as_slice()),
+            Err(BlossomError::InvalidPublicKey)
+        );
+        assert_eq!(
+            Signature::default().verify(b"message", &PubKey(weak_bytes)),
+            Err(BlossomError::InvalidPublicKey)
+        );
+    }
+
+    #[test]
+    fn secret_keys_are_zeroized_on_drop() {
+        assert!(std::mem::needs_drop::<SecKey>());
     }
 
     #[test]

@@ -18,18 +18,18 @@ run ha-clippy \
   cargo clippy -p blossom-consensus --all-targets --features high-availability -- -D warnings
 
 run ha-unit-and-integration \
-  cargo test -p blossom-consensus --features high-availability high_availability
+  cargo test -p blossom-consensus --lib --features high-availability high_availability
 
 run ha-authenticated-process-restart \
-  cargo test -p blossom-consensus --features high-availability \
+  cargo test -p blossom-consensus --lib --features high-availability \
   high_availability::tests::authenticated_transport_and_durable_state_survive_forced_process_restart
 
 run ha-storage-fault-atomicity \
-  cargo test -p blossom-consensus --features high-availability \
+  cargo test -p blossom-consensus --lib --features high-availability \
   high_availability::tests::durable_acknowledgement_rolls_back
 
 run ha-finalization-fsync-atomicity \
-  cargo test -p blossom-consensus --features high-availability \
+  cargo test -p blossom-consensus --lib --features high-availability \
   high_availability::tests::finalized_epoch_is_not_applied_until_durable_commit_succeeds
 
 run ha-hegel \
@@ -37,7 +37,7 @@ run ha-hegel \
 
 run ha-durable-soak \
   env BLOSSOM_HA_SOAK_EPOCHS="$SOAK_EPOCHS" \
-  cargo test --release -p blossom-consensus --features high-availability \
+  cargo test --release -p blossom-consensus --lib --features high-availability \
   high_availability::tests::durable_runtime_survives_thousand_epoch_restart_and_recovery_soak \
   -- --ignored --nocapture
 

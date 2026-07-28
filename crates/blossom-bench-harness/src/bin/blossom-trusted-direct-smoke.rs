@@ -1,3 +1,5 @@
+//! Trusted-direct active-active smoke workload.
+
 use std::fs;
 use std::path::PathBuf;
 use std::time::Instant;

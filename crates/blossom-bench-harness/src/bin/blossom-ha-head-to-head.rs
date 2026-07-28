@@ -1,3 +1,5 @@
+//! Head-to-head native HA and OpenRaft comparison runner.
+
 use std::fs;
 use std::path::PathBuf;
 use std::time::Instant;

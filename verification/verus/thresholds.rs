@@ -1,3 +1,5 @@
+//! Verus proofs for Blossom quorum-threshold arithmetic.
+
 use vstd::prelude::*;
 
 verus! {

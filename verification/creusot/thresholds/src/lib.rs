@@ -1,3 +1,5 @@
+//! Creusot proofs for Blossom quorum-threshold arithmetic.
+
 use creusot_std::prelude::*;
 
 #[requires(total@ <= 1_000_000)]

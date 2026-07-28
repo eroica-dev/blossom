@@ -1,3 +1,5 @@
+//! Property checks for globally ordered active-active application behavior.
+
 use blossom::{
     ActiveActiveCommand, AdmittedCommand, ApplicationCommand, ClientEpoch, ClientId,
     CommandIdentity, ConsensusGroupId, DurableAdmissionStore, HashType, Keypair,
