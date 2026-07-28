@@ -1,0 +1,40 @@
+name: Rust Dynamic Analysis
+
+on:
+  schedule:
+    - cron: "41 4 * * 2,5"
+  workflow_dispatch:
+
+concurrency:
+  group: rust-dynamic-analysis-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  dynamic-analysis:
+    name: ${{ matrix.mode }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        mode:
+          - miri
+          - asan
+          - tsan
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install nightly Rust analysis tools
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: miri,rust-src
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: dynamic-${{ matrix.mode }}
+
+      - name: Run ${{ matrix.mode }}
+        run: ./scripts/rust-dynamic-analysis.sh "${{ matrix.mode }}"

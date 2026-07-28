@@ -1,0 +1,32 @@
+/target
+/benchmarks/results
+.idea/
+.env
+.env.*
+!.env.example
+.DS_Store
+__pycache__/
+private/
+docs/
+paper/
+
+# Formal verification backend outputs
+_apalache-out/
+verification/creusot/thresholds/target/
+verification/creusot/thresholds/verif/
+verification/creusot/thresholds/.why3find/
+
+# Local document build outputs
+*.aux
+*.bbl
+*.bcf
+*.blg
+*.fdb_latexmk
+*.fls
+*.log
+*.out
+*.pdf
+!Blossom-Consensus-Protocol-v2-Whitepaper.pdf
+*.run.xml
+*.synctex*
+*.toc

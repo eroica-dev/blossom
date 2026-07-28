@@ -1,0 +1,56 @@
+name: OpenRaft Production Campaign
+
+on:
+  schedule:
+    - cron: "23 3 * * *"
+  workflow_dispatch:
+    inputs:
+      profile:
+        description: Campaign profile
+        required: true
+        default: nightly
+        type: choice
+        options:
+          - pr
+          - nightly
+          - release
+
+concurrency:
+  group: openraft-production-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  campaign:
+    name: Native OpenRaft production campaign
+    runs-on: ubuntu-latest
+    timeout-minutes: 720
+    env:
+      BLOSSOM_RAFT_JOBS: 4
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust 1.93
+        uses: dtolnay/rust-toolchain@1.93.0
+
+      - name: Cache Cargo build outputs
+        uses: Swatinem/rust-cache@v2
+
+      - name: Run campaign
+        env:
+          REQUESTED_PROFILE: ${{ inputs.profile }}
+        run: |
+          profile="${REQUESTED_PROFILE:-nightly}"
+          scripts/openraft-production-campaign.sh "$profile"
+
+      - name: Publish campaign evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: openraft-production-${{ github.run_id }}
+          path: target/openraft-production
+          if-no-files-found: error
+          retention-days: 30
