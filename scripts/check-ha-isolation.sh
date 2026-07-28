@@ -29,7 +29,7 @@ matches '^pub enum HaWireRequest \{' src/high_availability/transport.rs \
   || fail "the isolated HA request envelope is missing"
 matches '^pub enum HaWireResponse \{' src/high_availability/transport.rs \
   || fail "the isolated HA response envelope is missing"
-matches '^high-availability = \["dep:hmac"\]$' Cargo.toml \
+matches '^high-availability = \["active-active", "dep:hmac"\]$' Cargo.toml \
   || fail "the HA feature dependency boundary changed"
 
 printf 'HA wire and feature isolation passed (comparison base: %s)\n' "$BASE_REF"

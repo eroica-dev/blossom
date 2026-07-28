@@ -8,6 +8,11 @@ public Rust APIs and separately versions consensus and durable wire formats.
 
 ## [Unreleased]
 
+### Fixed
+
+- The HA isolation gate recognizes that the `high-availability` feature
+  intentionally enables the feature-gated active-active API.
+
 ## [2.0.0] - 2026-07-28
 
 ### Added
