@@ -1,6 +1,6 @@
 [package]
 name = "blossom-consensus"
-version = "2.0.0"
+version = "2.1.0"
 edition = "2024"
 rust-version = "1.93"
 description = "Native Blossom consensus runtimes for global, active-active, and active-passive deployments."
@@ -70,7 +70,7 @@ hmac = { version = "=0.12.1", optional = true }
 indextreemap = "0.2.0"
 itoa = "1.0.15"
 log = "0.4.28"
-openraft = { version = "=0.9.24", features = ["serde", "storage-v2"], optional = true }
+openraft = { version = "=0.9.25", features = ["serde", "storage-v2"], optional = true }
 rand_core = { version = "0.6.4", features = ["getrandom"] }
 rs_merkle = "1.5.0"
 serde = { version = "1.0.228", features = ["derive"] }
@@ -86,6 +86,7 @@ zeroize = "1.8.2"
 criterion = "0.7.0"
 env_logger = "0.11.8"
 hegeltest = "=0.28.2"
+tempfile = "3.23"
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ["cfg(kani)"] }

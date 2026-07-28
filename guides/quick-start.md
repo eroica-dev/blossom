@@ -53,7 +53,7 @@ Applications import Blossom directly and select only the profiles they need:
 
 ```toml
 [dependencies]
-blossom = { package = "blossom-consensus", version = "2.0.0", features = [
+blossom = { package = "blossom-consensus", version = "2.1.0", features = [
     "high-availability",
     "active-passive",
     "trusted-checkpoint-dag",

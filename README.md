@@ -5,7 +5,7 @@ deterministic quorum protocol for distributing node-local blocks, committing the
 same epoch view on every correct node, and testing that behavior under latency,
 faults, and Byzantine pressure.
 
-Prepared release: `2.0.0` (not yet published).
+Prepared release: `2.1.0`.
 
 Minimum supported Rust version: `1.93`. This applies to the full workspace,
 including the HA adapter and benchmark bridge.
@@ -70,11 +70,13 @@ semantics.
 ## Release Status
 
 `2.0.0` is prepared as the first public package release. The core protocol
-paths are covered by unit tests, TCP end-to-end tests, externally owned
-deterministic simulations, formal threshold checks, and release-gate
-validation. Verified 24-node and 36-node regressions require both a global
-certificate and publication by a validator supermajority. The package has not
-been uploaded to crates.io yet.
+`2.1.0` adds crash-safe direct coordination between durable active-active
+lifecycle admission and globally ordered application. The core protocol paths
+are covered by unit tests, TCP end-to-end tests, externally owned deterministic
+simulations, formal threshold checks, and release-gate validation. Verified
+24-node and 36-node regressions require both a global certificate and
+publication by a validator supermajority. The packages have not been uploaded
+to crates.io yet.
 
 Stable public trustless deployments still require independent security review,
 deployment-specific key management, monitoring, public-join abuse controls, and

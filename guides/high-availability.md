@@ -239,7 +239,29 @@ locally accepted write from the old contract must be recertified, translated
 and rehashed with `recertify_accepted_as`, or explicitly aborted. The manifest
 commits those resolutions together with both application generations, the HA
 membership generation, and the active mask, so neither a membership change nor
-a decoder upgrade can silently reinterpret or discard accepted work.
+a decoder upgrade can silently reinterpret or discard accepted work. New
+command identities are rejected while a cutover is active; idempotent retries
+of already accepted identities remain available.
+
+Production services must open both durable layers on distinct redb files:
+`HighAvailabilityRuntime::open` for protocol state and
+`ActiveActiveHaEngine::open` for accepted writes, application-contract state,
+and cutover progress. Every active-active lifecycle mutation is committed with
+immediate durability before it returns. `ActiveActiveHaEngine::new` remains the
+in-memory simulation and test constructor. `recovery_status` exposes both
+durability flags, and `is_production_durable` requires both stores. Because the
+lifecycle file contains opaque application commands, Unix deployments reject
+files with group or other permissions; create and retain it as an owner-only
+regular file.
+
+If HA membership changes after a cutover is prepared, activation fails closed
+because the membership generation and active mask no longer match. Call
+`cancel_application_cutover` to durably return its accepted-write resolutions
+to `Pending`, then begin and resolve a new cutover against current membership.
+
+Cutover and recovery manifests use format version 2 and reject version-1
+payloads. Accepted lifecycle state is bounded to 4,096 writes and 64 MiB of
+original plus translated command bytes.
 
 Durable runtime state uses an explicit format-v1 envelope in
 `ha_runtime_state_v1`. Unversioned development state from before 2.0.0 is a
@@ -359,6 +381,8 @@ change:
 The gate includes:
 
 - all HA unit, TCP, and Hegel state-machine/property tests;
+- durable active-active acceptance, command translation, cutover cancellation,
+  restart, format-version, and resource-bound tests;
 - authenticated-session spoof, wrong-key, raw-client, frame-integrity, and
   replay rejection;
 - an authenticated subprocess SIGKILL/reopen/reconnect check with durable
@@ -367,9 +391,13 @@ The gate includes:
   in-memory rollback, and recovery from the last durable commit;
 - the formal strict-majority checks for every supported size;
 - a 1,001-epoch immediate-durability soak with repeated reopen and snapshot
-  recovery;
-- three deterministic 1,200-epoch campaigns for every cluster size from two
-  through seven;
+  recovery.
+
+The authoritative deterministic fault campaigns are owned by the separate
+`deterministic-simulation` repository. Its pinned Blossom adapter and
+`blossom-protocol-{pr,nightly,release}` profiles cover:
+
+- deterministic campaigns for every cluster size from two through seven;
 - transient asymmetric loss, duplicate and reordered delivery, all tolerated
   boundary crash counts, minority isolation, suspension/reactivation,
   redeployment, mutable amendments, corrupted recovery snapshots, and an
@@ -381,9 +409,12 @@ safety violations. A fixed seed is exactly replayable because simulations use
 `HighAvailabilityRuntime::build_dispatch_at` to remove wall-clock timestamps
 from protocol input.
 
-The repository's `HA Merge Gate / Release and HA production gate` check runs
-this gate for every pull request and push to `main`; configure branch protection
-to require that exact check before merging.
+The Blossom repository's `HA Merge Gate / Release and HA production gate`
+check runs the local gate for every pull request and push to `main`. The
+deterministic-simulation repository runs its pinned Blossom PR campaign in CI
+and its longer profile on releases. Production qualification requires both
+repositories to pin each other's reviewed revisions and both required checks
+to pass; neither checkout silently substitutes the other's gate.
 
 This gate is necessary, not sufficient, for a production rollout. It now
 exercises the authenticated wire profile, real subprocess kill/restart, and

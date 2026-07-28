@@ -241,6 +241,12 @@ pub struct CommandBatch {
 impl CommandBatch {
     /// Validates count, byte, identity, and contiguous-sequence bounds.
     pub fn validate(&self) -> Result<()> {
+        self.validate_commands()?;
+        let encoded = borsh::to_vec(self).map_err(encode_error)?;
+        Self::validate_encoded_len(encoded.len())
+    }
+
+    fn validate_commands(&self) -> Result<()> {
         let Some(first) = self.commands.first() else {
             return Err(BlossomError::InvalidConfiguration(
                 "command batch cannot be empty".to_string(),
@@ -270,12 +276,14 @@ impl CommandBatch {
                 BlossomError::InvalidConfiguration("origin sequence overflow".to_string())
             })?;
         }
-        let encoded = borsh::to_vec(self).map_err(encode_error)?;
-        if encoded.len() > DEFAULT_MAX_BATCH_BYTES {
+        Ok(())
+    }
+
+    fn validate_encoded_len(encoded_len: usize) -> Result<()> {
+        if encoded_len > DEFAULT_MAX_BATCH_BYTES {
             return Err(BlossomError::InvalidConfiguration(format!(
                 "batch encoded size {} exceeds maximum {}",
-                encoded.len(),
-                DEFAULT_MAX_BATCH_BYTES
+                encoded_len, DEFAULT_MAX_BATCH_BYTES
             )));
         }
         Ok(())
@@ -283,10 +291,18 @@ impl CommandBatch {
 
     /// Returns the canonical Borsh bytes committed by a reference.
     pub fn canonical_bytes(&self) -> Result<Vec<u8>> {
-        self.validate()?;
-        borsh::to_vec(self).map_err(|err| {
+        self.validate_commands()?;
+        let encoded = borsh::to_vec(self).map_err(|err| {
             BlossomError::WireProtocol(format!("encode active-active command batch: {err}"))
-        })
+        })?;
+        Self::validate_encoded_len(encoded.len())?;
+        Ok(encoded)
+    }
+
+    /// Computes the domain-separated hash of the complete canonical batch.
+    pub fn hash(&self) -> Result<HashType> {
+        let encoded = self.canonical_bytes()?;
+        Ok(sha256_hash(COMMAND_BATCH_HASH_DOMAIN, &[&encoded]))
     }
 
     /// Computes the canonical binary Merkle root of admitted commands.
@@ -605,6 +621,7 @@ impl BatchReference {
     /// Constructs a reference that commits the verified batch and metadata.
     pub fn for_batch(batch: &CommandBatch, metadata: BatchReferenceMetadata) -> Result<Self> {
         batch.validate()?;
+        validate_shard_id(&metadata.shard)?;
         let bytes = batch.canonical_bytes()?;
         let first = batch
             .commands
@@ -654,6 +671,7 @@ impl BatchReference {
         }
         self.route_generation.validate()?;
         self.command_spec_version.validate()?;
+        validate_shard_id(&self.shard)?;
         if self.command_count == 0
             || self.first_origin_sequence == 0
             || self.last_origin_sequence < self.first_origin_sequence

@@ -97,7 +97,10 @@ async fn verified_scale_clusters_publish_finality_to_a_supermajority() {
                 require_local_pending_block: false,
                 continue_after_error: true,
             },
-            Duration::from_secs(30),
+            // This is a correctness gate, not a latency SLA. A 36-node
+            // verified cluster exchanges O(n²) signed messages, so leave
+            // enough scheduling headroom for shared two-core CI runners.
+            Duration::from_secs(90),
         )
         .await
         .unwrap();

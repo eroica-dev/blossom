@@ -5,13 +5,14 @@ use crate::address_book::ServiceKind;
 use crate::block::Transaction;
 use crate::crypto::Keypair;
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicU8, Ordering as AtomicOrdering};
+use std::sync::atomic::{AtomicU8, AtomicU64, Ordering as AtomicOrdering};
 use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const STORAGE_FAULT_NONE: u8 = 0;
 const STORAGE_FAULT_FULL: u8 = 1;
 const STORAGE_FAULT_SYNC: u8 = 2;
+static NEXT_FAULT_STORAGE_ID: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone)]
 struct HaFaultStorage {
@@ -21,10 +22,7 @@ struct HaFaultStorage {
 
 impl HaFaultStorage {
     fn new() -> Self {
-        let unique = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos();
+        let unique = NEXT_FAULT_STORAGE_ID.fetch_add(1, AtomicOrdering::Relaxed);
         Self {
             path: Arc::new(
                 std::env::temp_dir()

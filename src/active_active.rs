@@ -44,11 +44,13 @@ use crate::state::Epoch;
 use crate::telemetry::{TelemetryEvent, TelemetryEventKind, TelemetryHandle};
 
 const COMMAND_HASH_DOMAIN: &[u8] = b"blossom/active-active/command/v2";
+const COMMAND_BATCH_HASH_DOMAIN: &[u8] = b"blossom/active-active/command-batch/v1";
 const REFERENCE_HASH_DOMAIN: &[u8] = b"blossom/active-active/batch-reference/v2";
 const REFERENCE_TRANSACTION_DOMAIN: &[u8] = b"blossom/active-active/reference-transaction/v2";
 const MERKLE_LEAF_DOMAIN: &[u8] = b"blossom/active-active/merkle-leaf/v1";
 const MERKLE_NODE_DOMAIN: &[u8] = b"blossom/active-active/merkle-node/v1";
 const ADMISSION_RECEIPT_DOMAIN: &[u8] = b"blossom/active-active/admission-receipt/v1";
+const ADMISSION_BATCH_RECEIPT_DOMAIN: &[u8] = b"blossom/active-active/admission-batch-receipt/v1";
 const AVAILABILITY_RECEIPT_DOMAIN: &[u8] = b"blossom/active-active/availability-receipt/v1";
 const ORDER_STATEMENT_DOMAIN: &[u8] = b"blossom/active-active/order-statement/v1";
 const ORDER_CERTIFICATE_DOMAIN: &[u8] = b"blossom/active-active/order-certificate/v1";
@@ -64,6 +66,8 @@ pub const MAX_APPLICATION_RESULT_BYTES: usize = 64 << 20;
 pub const DEFAULT_MAX_BATCH_COMMANDS: usize = 4_096;
 /// Default upper bound on a batch's canonical encoded size.
 pub const DEFAULT_MAX_BATCH_BYTES: usize = 64 << 20;
+/// Maximum encoded bytes in an application shard identifier.
+pub const MAX_ACTIVE_ACTIVE_SHARD_ID_BYTES: usize = 256;
 /// Maximum number of finalized-but-unapplied availability windows.
 pub const MAX_PIPELINED_AVAILABILITY_WINDOWS: usize = 8;
 /// Largest timeout accepted by bounded milestone waits.
@@ -78,6 +82,7 @@ pub const MAX_REFERENCES_PER_ORDERING_WINDOW: usize = 65_536;
 
 const COMMANDS_TABLE: &str = "active_active_commands_v1";
 const COMMAND_IDENTITIES_TABLE: &str = "active_active_command_identities_v1";
+const ADMISSION_BATCHES_TABLE: &str = "active_active_admission_batches_v3";
 const BATCHES_TABLE: &str = "active_active_batches_v1";
 const MILESTONES_TABLE: &str = "active_active_milestones_v1";
 const REFERENCE_STATUS_TABLE: &str = "active_active_reference_status_v3";
@@ -172,6 +177,15 @@ impl OrderedStateDelta {
             origin_tail_upserts: Vec::new(),
         }
     }
+}
+
+fn validate_shard_id(shard: &[u8]) -> Result<()> {
+    if shard.is_empty() || shard.len() > MAX_ACTIVE_ACTIVE_SHARD_ID_BYTES {
+        return Err(BlossomError::InvalidConfiguration(format!(
+            "active-active shard id must contain 1..={MAX_ACTIVE_ACTIVE_SHARD_ID_BYTES} bytes"
+        )));
+    }
+    Ok(())
 }
 
 #[derive(BorshSerialize, BorshDeserialize, Debug, Clone, PartialEq, Eq)]

@@ -51,6 +51,96 @@ fn durable_store_rejects_identity_equivocation_and_recovers_state() {
 }
 
 #[test]
+fn sharded_batch_admission_is_one_commit_and_binds_complete_membership() {
+    let keypairs = (0..3).map(|_| Keypair::generate()).collect::<Vec<_>>();
+    let paths = keypairs
+        .iter()
+        .enumerate()
+        .map(|(index, keypair)| {
+            std::env::temp_dir().join(format!(
+                "blossom-active-active-batch-{index}-{}-{}",
+                std::process::id(),
+                keypair.public
+            ))
+        })
+        .collect::<Vec<_>>();
+    let stores = keypairs
+        .iter()
+        .enumerate()
+        .map(|(index, keypair)| {
+            DurableAdmissionStore::open(
+                &paths[index],
+                SiteId("site-a".to_string()),
+                StoreGeneration(1),
+                keypair.signer(),
+            )
+            .unwrap()
+        })
+        .collect::<Vec<_>>();
+    let batch = CommandBatch {
+        commands: vec![
+            AdmittedCommand {
+                origin_sequence: 7,
+                command: command(31, 1, b"first"),
+            },
+            AdmittedCommand {
+                origin_sequence: 8,
+                command: command(31, 2, b"second"),
+            },
+        ],
+    };
+    let mut receipts = Vec::new();
+    for store in &stores {
+        let before = store.durability_metrics();
+        receipts.push(
+            store
+                .admit_command_batch(b"cache-shard-7".to_vec(), &batch, ReplicaMembershipEpoch(4))
+                .unwrap(),
+        );
+        let after = store.durability_metrics();
+        assert_eq!(after.commit_count, before.commit_count + 1);
+        assert_eq!(after.fsync_count, before.fsync_count + 1);
+    }
+    let certificate = LocalAdmissionBatchCertificate {
+        policy: LocalAdmissionPolicy {
+            site: SiteId("site-a".to_string()),
+            membership_epoch: ReplicaMembershipEpoch(4),
+            members: keypairs.iter().map(|keypair| keypair.public).collect(),
+            store_generations: keypairs
+                .iter()
+                .map(|keypair| (keypair.public, StoreGeneration(1)))
+                .collect(),
+        },
+        shard: b"cache-shard-7".to_vec(),
+        command_batch_hash: batch.hash().unwrap(),
+        first_origin_sequence: 7,
+        last_origin_sequence: 8,
+        command_count: 2,
+        receipts,
+    };
+    certificate.verify_batch(&batch).unwrap();
+
+    let mut wrong_shard = certificate.clone();
+    wrong_shard.shard = b"cache-shard-8".to_vec();
+    assert!(wrong_shard.verify_batch(&batch).is_err());
+    let conflicting = CommandBatch {
+        commands: vec![
+            batch.commands[0].clone(),
+            AdmittedCommand {
+                origin_sequence: 8,
+                command: command(31, 2, b"conflicting"),
+            },
+        ],
+    };
+    assert!(certificate.verify_batch(&conflicting).is_err());
+
+    drop(stores);
+    for path in paths {
+        std::fs::remove_dir_all(path).ok();
+    }
+}
+
+#[test]
 fn durable_store_reopen_fails_closed_on_identity_and_scope_mismatch() {
     let keypair = Keypair::generate();
     let other = Keypair::generate();

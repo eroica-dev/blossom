@@ -13,15 +13,12 @@ cargo package "${package_args[@]}" -p blossom-propagation
 
 if [[ "${REGISTRY_DEPS_READY:-0}" == "1" ]]; then
   cargo package "${package_args[@]}" -p blossom-consensus
-  cargo package "${package_args[@]}" -p blossom-observer
 else
   mkdir -p target/release-package
   cargo package "${package_args[@]}" -p blossom-consensus --list \
-    >target/release-package/blossom-consensus-2.0.0.files
-  cargo package "${package_args[@]}" -p blossom-observer --list \
-    >target/release-package/blossom-observer-2.0.0.files
+    >target/release-package/blossom-consensus-2.1.0.files
   printf '%s\n' \
     "Registry-dependent archives deferred until shardlog and blossom-propagation are published."
 fi
 
-printf '%s\n' "Blossom packages prepared; no registry upload was performed."
+printf '%s\n' "Blossom release packages prepared; no registry upload was performed."

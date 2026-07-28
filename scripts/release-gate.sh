@@ -43,6 +43,7 @@ run_step cargo-package ./scripts/package-release.sh
 run_step active-passive-production-validation \
   ./scripts/active-passive-production-validation.sh
 run_step trusted-production-validation ./scripts/trusted-production-validation.sh
+run_step cargo-clean-before-ha cargo clean -p blossom-consensus
 run_step ha-production-validation ./scripts/ha-production-validation.sh
 run_step formal ./verification/run-formal.sh
 

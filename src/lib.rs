@@ -17,6 +17,9 @@
 /// Durable application-owned commands with globally certified ordering.
 pub mod active_active;
 #[cfg(feature = "high-availability")]
+/// Crash-safe coordination between accepted lifecycle and global ordering.
+pub mod active_active_coordinator;
+#[cfg(feature = "high-availability")]
 /// Recovery and contract-cutover orchestration for active-active HA groups.
 pub mod active_active_ha;
 #[cfg(feature = "active-passive")]
@@ -106,28 +109,37 @@ pub mod wire;
 pub use blossom_propagation as propagation;
 
 pub use active_active::{
-    ActiveActiveCommand, ActiveActiveConsistencyMode, AdmissionReceipt, AdmissionReceiptBody,
+    ActiveActiveCommand, ActiveActiveConsistencyMode, ActiveActiveDurabilityMetrics,
+    AdmissionBatchReceipt, AdmissionBatchReceiptBody, AdmissionReceipt, AdmissionReceiptBody,
     AdmittedCommand, ApplicationCommand, ApplicationCommandEnvelope, ApplicationContractActivation,
     ApplicationResult, AppliedBy, AppliedByTracker, AppliedCompletion, ApplyProgress,
     AuthenticatedAvailabilityReceipt, AvailabilityCertificate, AvailabilityReceiptBody,
     AvailabilityTrust, BatchReference, BatchReferenceMetadata, CertifiedReadBarrier, ClientEpoch,
     ClientId, CommandBatch, CommandIdentity, CommandSpecVersion, DurableAdmissionStore,
-    GlobalOrderedEngine, HolderMembership, LocalAdmissionCertificate, LocalAdmissionPolicy,
+    GlobalOrderedEngine, HolderMembership, LocalAdmissionBatchCertificate,
+    LocalAdmissionCertificate, LocalAdmissionPolicy, MAX_ACTIVE_ACTIVE_SHARD_ID_BYTES,
     MAX_APPLICATION_COMMAND_BYTES, MAX_APPLICATION_RESULT_BYTES,
     MAX_PIPELINED_AVAILABILITY_WINDOWS, MAX_REFERENCES_PER_ORDERING_WINDOW, MAX_WAIT_FOR_TIMEOUT,
     MembershipCutoverDisposition, Milestone, MilestoneEvent, OrderCertificate, OrderStatement,
     OrderVote, OrderedApplication, OrderedBatch, ReadBarrierCertificate, ReadBarrierChallenge,
     ReadBarrierRequest, ReadBarrierStatement, ReadBarrierVote, ReadConsistency, ReferenceStatus,
     ReplicaMembershipEpoch, RetentionEvidence, RouteGeneration, StoreGeneration,
-    ValidatorGeneration, WaitForOutcome, Watermark, WriteMode, ordered_batch_references,
-    ordered_batch_references_trusted, required_cutover_disposition,
+    ValidatorGeneration, VerifiedLocalAdmissionBatch, WaitForOutcome, Watermark, WriteMode,
+    ordered_batch_references, ordered_batch_references_trusted, required_cutover_disposition,
+};
+#[cfg(feature = "high-availability")]
+pub use active_active_coordinator::{
+    ActiveActiveCoordinatorDurability, ActiveActiveGlobalCoordinator,
 };
 #[cfg(feature = "high-availability")]
 pub use active_active_ha::{
     ACTIVE_ACTIVE_HA_CUTOVER_MANIFEST_VERSION, ACTIVE_ACTIVE_HA_RECOVERY_MANIFEST_VERSION,
     AcceptedWriteDisposition, AcceptedWriteRecord, AcceptedWriteResolution, ActiveActiveCutover,
-    ActiveActiveHaCutoverManifest, ActiveActiveHaEngine, ActiveActiveHaRecoveryManifest,
-    ActiveActiveHaRecoveryStatus, LearnerCatchUp, MAX_ACCEPTED_WRITE_ABORT_REASON_BYTES,
+    ActiveActiveHaCutoverManifest, ActiveActiveHaEngine, ActiveActiveHaLifecycleDurabilityMetrics,
+    ActiveActiveHaRecoveryManifest, ActiveActiveHaRecoveryStatus, LearnerCatchUp,
+    MAX_ACCEPTED_WRITE_ABORT_REASON_BYTES, MAX_ACTIVE_ACTIVE_HA_ACCEPTED_COMMAND_BYTES,
+    MAX_ACTIVE_ACTIVE_HA_ACCEPTED_WRITES, MAX_ACTIVE_ACTIVE_HA_SHARD_LANES,
+    PreparedActiveActiveHaShardBatch,
 };
 #[cfg(feature = "active-passive")]
 pub use active_passive::{

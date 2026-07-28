@@ -157,43 +157,168 @@ impl DurableAdmissionStore {
         command: &AdmittedCommand,
         membership_epoch: ReplicaMembershipEpoch,
     ) -> Result<AdmissionReceipt> {
-        command.command.validate()?;
-        if command.origin_sequence == 0 {
-            return Err(BlossomError::InvalidConfiguration(
-                "origin sequences start at one".to_string(),
-            ));
-        }
-        let command_hash = command.command.hash()?;
-        let identity_key = borsh::to_vec(&command.command.identity).map_err(encode_error)?;
-        let command_key = borsh::to_vec(&(command.origin_sequence, command.command.identity))
-            .map_err(encode_error)?;
-        let command_bytes = borsh::to_vec(command).map_err(encode_error)?;
+        self.admit_batch(std::slice::from_ref(command), membership_epoch)?
+            .pop()
+            .ok_or_else(|| {
+                BlossomError::InvalidConfiguration(
+                    "single durable admission returned no receipt".to_string(),
+                )
+            })
+    }
 
-        self.transact(|transaction| {
-            if let Some(existing) =
-                transaction.get(COMMAND_IDENTITIES_TABLE, identity_key.as_slice())?
-            {
-                if existing.as_slice() != command_hash.as_ref() {
+    /// Persists a bounded command group with one durability commit.
+    pub fn admit_batch(
+        &self,
+        commands: &[AdmittedCommand],
+        membership_epoch: ReplicaMembershipEpoch,
+    ) -> Result<Vec<AdmissionReceipt>> {
+        if commands.len() > DEFAULT_MAX_BATCH_COMMANDS {
+            return Err(BlossomError::InvalidConfiguration(format!(
+                "durable admission batch count {} exceeds maximum {}",
+                commands.len(),
+                DEFAULT_MAX_BATCH_COMMANDS
+            )));
+        }
+        if commands.is_empty() {
+            return Ok(Vec::new());
+        }
+        let encoded = commands
+            .iter()
+            .map(|command| {
+                command.command.validate()?;
+                if command.origin_sequence == 0 {
                     return Err(BlossomError::InvalidConfiguration(
-                        "conflicting bytes for one command identity".to_string(),
+                        "origin sequences start at one".to_string(),
+                    ));
+                }
+                let command_hash = command.command.hash()?;
+                let identity_key =
+                    borsh::to_vec(&command.command.identity).map_err(encode_error)?;
+                let command_key =
+                    borsh::to_vec(&(command.origin_sequence, command.command.identity))
+                        .map_err(encode_error)?;
+                let command_bytes = borsh::to_vec(command).map_err(encode_error)?;
+                Ok((command_hash, identity_key, command_key, command_bytes))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        self.transact(|transaction| {
+            for (command_hash, identity_key, command_key, command_bytes) in &encoded {
+                if let Some(existing) =
+                    transaction.get(COMMAND_IDENTITIES_TABLE, identity_key.as_slice())?
+                {
+                    if existing.as_slice() != command_hash.as_ref() {
+                        return Err(BlossomError::InvalidConfiguration(
+                            "conflicting bytes for one command identity".to_string(),
+                        ));
+                    }
+                } else {
+                    transaction.insert(
+                        COMMAND_IDENTITIES_TABLE,
+                        identity_key.clone(),
+                        command_hash.as_ref().to_vec(),
+                    )?;
+                }
+                transaction.insert(COMMANDS_TABLE, command_key.clone(), command_bytes.clone())?;
+            }
+            Ok(())
+        })?;
+        commands
+            .iter()
+            .zip(encoded)
+            .map(|(command, (command_hash, _, _, _))| {
+                AdmissionReceipt::signed(
+                    AdmissionReceiptBody {
+                        command_identity: command.command.identity,
+                        command_hash,
+                        origin_sequence: command.origin_sequence,
+                        holder: self.holder,
+                        site: self.site.clone(),
+                        membership_epoch,
+                        durable_store_generation: self.store_generation,
+                    },
+                    &self.signer,
+                )
+            })
+            .collect()
+    }
+
+    /// Persists one canonical command batch and signs one receipt for it.
+    pub fn admit_command_batch(
+        &self,
+        shard: Vec<u8>,
+        batch: &CommandBatch,
+        membership_epoch: ReplicaMembershipEpoch,
+    ) -> Result<AdmissionBatchReceipt> {
+        validate_shard_id(&shard)?;
+        let batch_bytes = batch.canonical_bytes()?;
+        let command_batch_hash = batch.hash()?;
+        let identities = batch
+            .commands
+            .iter()
+            .map(|admitted| {
+                Ok((
+                    borsh::to_vec(&admitted.command.identity).map_err(encode_error)?,
+                    admitted.command.hash()?,
+                ))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        self.transact(|transaction| {
+            for (identity_key, command_hash) in &identities {
+                if let Some(existing) =
+                    transaction.get(COMMAND_IDENTITIES_TABLE, identity_key.as_slice())?
+                {
+                    if existing.as_slice() != command_hash.as_ref() {
+                        return Err(BlossomError::InvalidConfiguration(
+                            "conflicting bytes for one command identity".to_string(),
+                        ));
+                    }
+                } else {
+                    transaction.insert(
+                        COMMAND_IDENTITIES_TABLE,
+                        identity_key.clone(),
+                        command_hash.as_ref().to_vec(),
+                    )?;
+                }
+            }
+            if let Some(existing) =
+                transaction.get(ADMISSION_BATCHES_TABLE, command_batch_hash.as_ref())?
+            {
+                if existing != batch_bytes {
+                    return Err(BlossomError::InvalidConfiguration(
+                        "durable admission batch hash collision".to_string(),
                     ));
                 }
             } else {
                 transaction.insert(
-                    COMMAND_IDENTITIES_TABLE,
-                    identity_key,
-                    command_hash.as_ref().to_vec(),
+                    ADMISSION_BATCHES_TABLE,
+                    command_batch_hash.as_ref().to_vec(),
+                    batch_bytes.clone(),
                 )?;
             }
-            transaction.insert(COMMANDS_TABLE, command_key, command_bytes)?;
             Ok(())
         })?;
-
-        AdmissionReceipt::signed(
-            AdmissionReceiptBody {
-                command_identity: command.command.identity,
-                command_hash,
-                origin_sequence: command.origin_sequence,
+        let first_origin_sequence = batch
+            .commands
+            .first()
+            .expect("validated command batch is non-empty")
+            .origin_sequence;
+        let last_origin_sequence = batch
+            .commands
+            .last()
+            .expect("validated command batch is non-empty")
+            .origin_sequence;
+        let command_count = u32::try_from(batch.commands.len()).map_err(|_| {
+            BlossomError::InvalidConfiguration(
+                "durable admission batch command count exceeds u32".to_string(),
+            )
+        })?;
+        AdmissionBatchReceipt::signed(
+            AdmissionBatchReceiptBody {
+                shard,
+                command_batch_hash,
+                first_origin_sequence,
+                last_origin_sequence,
+                command_count,
                 holder: self.holder,
                 site: self.site.clone(),
                 membership_epoch,
@@ -284,48 +409,79 @@ impl DurableAdmissionStore {
 
     /// Appends a monotonic milestone and updates the indexed status atomically.
     pub fn record_milestone(&self, event: &MilestoneEvent) -> Result<u64> {
-        if event.milestone == Milestone::Applied {
-            return Err(BlossomError::InvalidConfiguration(
-                "Applied must be recorded atomically with an applied completion".to_string(),
-            ));
+        self.record_milestones(std::slice::from_ref(event))?
+            .pop()
+            .ok_or_else(|| {
+                BlossomError::InvalidConfiguration(
+                    "single milestone commit returned no sequence".to_string(),
+                )
+            })
+    }
+
+    /// Durably records a bounded group of non-applied milestones in one commit.
+    pub fn record_milestones(&self, events: &[MilestoneEvent]) -> Result<Vec<u64>> {
+        if events.len() > DEFAULT_MAX_BATCH_COMMANDS {
+            return Err(BlossomError::InvalidConfiguration(format!(
+                "milestone batch count {} exceeds maximum {}",
+                events.len(),
+                DEFAULT_MAX_BATCH_COMMANDS
+            )));
         }
-        let bytes = borsh::to_vec(event).map_err(encode_error)?;
+        if events.is_empty() {
+            return Ok(Vec::new());
+        }
+        let encoded = events
+            .iter()
+            .map(|event| {
+                if event.milestone == Milestone::Applied {
+                    return Err(BlossomError::InvalidConfiguration(
+                        "Applied must be recorded atomically with an applied completion"
+                            .to_string(),
+                    ));
+                }
+                borsh::to_vec(event).map_err(encode_error)
+            })
+            .collect::<Result<Vec<_>>>()?;
         self.transact(|transaction| {
-            let sequence = transaction
+            let mut sequence = transaction
                 .get(META_TABLE, b"next_milestone_sequence")?
                 .map(|value| decode_u64(&value, "next milestone sequence"))
                 .transpose()?
                 .unwrap_or(0);
-            let next = sequence.checked_add(1).ok_or_else(|| {
-                BlossomError::InvalidConfiguration("milestone sequence overflow".to_string())
-            })?;
+            let mut sequences = Vec::with_capacity(events.len());
+            for (event, bytes) in events.iter().zip(&encoded) {
+                if let Some(existing) =
+                    transaction.get(REFERENCE_STATUS_TABLE, event.reference_hash.as_ref())?
+                {
+                    let existing =
+                        borsh::from_slice::<MilestoneEvent>(&existing).map_err(encode_error)?;
+                    if existing.milestone.rank() > event.milestone.rank() {
+                        return Err(BlossomError::InvalidConfiguration(
+                            "reference milestone cannot regress".to_string(),
+                        ));
+                    }
+                }
+                transaction.insert(
+                    MILESTONES_TABLE,
+                    sequence.to_be_bytes().to_vec(),
+                    bytes.clone(),
+                )?;
+                transaction.insert(
+                    REFERENCE_STATUS_TABLE,
+                    event.reference_hash.as_ref().to_vec(),
+                    bytes.clone(),
+                )?;
+                sequences.push(sequence);
+                sequence = sequence.checked_add(1).ok_or_else(|| {
+                    BlossomError::InvalidConfiguration("milestone sequence overflow".to_string())
+                })?;
+            }
             transaction.insert(
                 META_TABLE,
                 b"next_milestone_sequence".to_vec(),
-                next.to_be_bytes().to_vec(),
-            )?;
-            transaction.insert(
-                MILESTONES_TABLE,
                 sequence.to_be_bytes().to_vec(),
-                bytes.clone(),
             )?;
-            if let Some(existing) =
-                transaction.get(REFERENCE_STATUS_TABLE, event.reference_hash.as_ref())?
-            {
-                let existing =
-                    borsh::from_slice::<MilestoneEvent>(&existing).map_err(encode_error)?;
-                if existing.milestone.rank() > event.milestone.rank() {
-                    return Err(BlossomError::InvalidConfiguration(
-                        "reference milestone cannot regress".to_string(),
-                    ));
-                }
-            }
-            transaction.insert(
-                REFERENCE_STATUS_TABLE,
-                event.reference_hash.as_ref().to_vec(),
-                bytes,
-            )?;
-            Ok(sequence)
+            Ok(sequences)
         })
     }
 

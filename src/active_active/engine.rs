@@ -132,6 +132,16 @@ impl GlobalOrderedEngine {
         &self.telemetry
     }
 
+    /// Returns whether ordered state and application completions are durable.
+    pub fn is_production_durable(&self) -> bool {
+        true
+    }
+
+    /// Returns process-local durability counters for the ordered store.
+    pub fn durability_metrics(&self) -> ActiveActiveDurabilityMetrics {
+        self.store.durability_metrics()
+    }
+
     /// Activates a new route and/or application command specification at a
     /// quiescent applied boundary. The next `BatchReference` must commit the
     /// new values.
@@ -180,19 +190,131 @@ impl GlobalOrderedEngine {
 
     /// Records a verified local-admission certificate.
     pub fn accept_local(&self, certificate: &LocalAdmissionCertificate) -> Result<MilestoneEvent> {
-        certificate.verify()?;
-        let event = milestone_event(
-            self.mode,
-            certificate.command_hash,
-            Milestone::AcceptedLocal,
-            None,
-        );
-        self.store.record_milestone(&event)?;
-        self.telemetry.record_milestone(&event);
-        Ok(event)
+        self.accept_local_batch(std::slice::from_ref(certificate))?
+            .pop()
+            .ok_or_else(|| {
+                BlossomError::InvalidConfiguration(
+                    "single local admission returned no milestone".to_string(),
+                )
+            })
+    }
+
+    /// Verifies and records a bounded group of local admissions in one commit.
+    pub fn accept_local_batch(
+        &self,
+        certificates: &[LocalAdmissionCertificate],
+    ) -> Result<Vec<MilestoneEvent>> {
+        if certificates.len() > DEFAULT_MAX_BATCH_COMMANDS {
+            return Err(BlossomError::InvalidConfiguration(format!(
+                "local admission batch count {} exceeds maximum {}",
+                certificates.len(),
+                DEFAULT_MAX_BATCH_COMMANDS
+            )));
+        }
+        let events = certificates
+            .iter()
+            .map(|certificate| {
+                certificate.verify()?;
+                validate_local_admission_policy_against_membership(
+                    &certificate.policy,
+                    &self.holder_membership,
+                )?;
+                Ok(milestone_event(
+                    self.mode,
+                    certificate.command_hash,
+                    Milestone::AcceptedLocal,
+                    None,
+                ))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        self.store.record_milestones(&events)?;
+        for event in &events {
+            self.telemetry.record_milestone(event);
+        }
+        Ok(events)
+    }
+
+    /// Verifies and records one locally durable command batch.
+    pub fn accept_local_command_batch(
+        &self,
+        batch: &CommandBatch,
+        certificate: &LocalAdmissionBatchCertificate,
+    ) -> Result<MilestoneEvent> {
+        self.accept_local_command_batches(&[(batch, certificate)])?
+            .pop()
+            .ok_or_else(|| {
+                BlossomError::InvalidConfiguration(
+                    "single local command-batch admission returned no milestone".to_string(),
+                )
+            })
+    }
+
+    /// Verifies shard-local certificates and records all batch milestones.
+    pub fn accept_local_command_batches(
+        &self,
+        batches: &[(&CommandBatch, &LocalAdmissionBatchCertificate)],
+    ) -> Result<Vec<MilestoneEvent>> {
+        if batches.len() > DEFAULT_MAX_BATCH_COMMANDS {
+            return Err(BlossomError::InvalidConfiguration(format!(
+                "local command-batch admission count {} exceeds maximum {}",
+                batches.len(),
+                DEFAULT_MAX_BATCH_COMMANDS
+            )));
+        }
+        let verified = batches
+            .iter()
+            .map(|(batch, certificate)| certificate.verify_and_bind(batch))
+            .collect::<Result<Vec<_>>>()?;
+        self.accept_verified_local_command_batches(&verified)
+    }
+
+    /// Records batches already verified by independent shard workers.
+    pub fn accept_verified_local_command_batches(
+        &self,
+        batches: &[VerifiedLocalAdmissionBatch],
+    ) -> Result<Vec<MilestoneEvent>> {
+        if batches.len() > DEFAULT_MAX_BATCH_COMMANDS {
+            return Err(BlossomError::InvalidConfiguration(format!(
+                "verified local command-batch admission count {} exceeds maximum {}",
+                batches.len(),
+                DEFAULT_MAX_BATCH_COMMANDS
+            )));
+        }
+        let events = batches
+            .iter()
+            .map(|batch| {
+                validate_local_admission_policy_against_membership(
+                    &batch.policy,
+                    &self.holder_membership,
+                )?;
+                Ok(milestone_event(
+                    self.mode,
+                    batch.command_batch_hash,
+                    Milestone::AcceptedLocal,
+                    None,
+                ))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        self.store.record_milestones(&events)?;
+        for event in &events {
+            self.telemetry.record_milestone(event);
+        }
+        Ok(events)
     }
 
     /// Validates and persists recoverable multi-site availability.
+    pub fn mark_available_with_batch(
+        &mut self,
+        batch: &CommandBatch,
+        certificate: AvailabilityCertificate,
+    ) -> Result<MilestoneEvent> {
+        certificate.reference.verify_batch(batch)?;
+        self.store.store_batch(&certificate.reference, batch)?;
+        self.mark_available(certificate)
+    }
+
+    /// Validates and persists recoverable multi-site availability after the
+    /// referenced batch bytes are already present in this holder's store.
     pub fn mark_available(
         &mut self,
         certificate: AvailabilityCertificate,

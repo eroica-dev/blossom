@@ -8,6 +8,43 @@ public Rust APIs and separately versions consensus and durable wire formats.
 
 ## [Unreleased]
 
+## [2.1.0] - 2026-07-28
+
+### Added
+
+- Durable active-active accepted-write and cutover lifecycle storage backed by
+  the shared ShardLog implementation.
+- Sharded lifecycle group admission, complete-batch holder receipts,
+  membership-bound admission certificates, accepted-hash lookup, and grouped
+  application completion.
+- `ActiveActiveGlobalCoordinator` for crash-safe lifecycle/order cutovers and
+  `GlobalApplied` cleanup only after durable application.
+- Production durability inspection for lifecycle, HA runtime, admission, and
+  ordered completion stores.
+- A multi-core OpenRaft production campaign runner with stable, message-aware
+  request/response fault IDs and explicit fault-coverage admission.
+- Regression coverage for ordinary append catch-up after partition healing,
+  snapshot installation, leader transitions, and large TCP driver clusters.
+
+### Fixed
+
+- HA production validation now rejects empty test filters, exercises the
+  modular durability and transport tests by their complete paths, and
+  serializes the linker-heavy Hegel target on shared runners. The release gate
+  reclaims obsolete package-profile artifacts before HA qualification to stay
+  within hosted-runner disk limits.
+- Parallel durability fault tests use collision-free temporary store IDs.
+- OpenRaft 0.9.25 handles a transient empty log-range read during leadership
+  changes without panicking a replication worker.
+- Healed OpenRaft replicas now resume ordinary append replication even when
+  the first post-heal heartbeat discovers a newer term.
+- Active-passive client writes retry the same idempotent command across
+  transient leader transitions, including `ForwardToLeader(None)`.
+- Idle consensus-driver recovery assessment now materializes the deterministic
+  round instead of failing with `UnknownSender`.
+- Test driver failures are reported to their parent test, large TCP cases are
+  serialized, and benchmark Raft nodes shut down as one cluster operation.
+
 ## [2.0.0] - 2026-07-28
 
 ### Added
@@ -107,5 +144,6 @@ public Rust APIs and separately versions consensus and durable wire formats.
 - Direct Blossom dependencies on `shard-stream-core`,
   `shard-stream-storage`, and redb.
 
-[Unreleased]: https://github.com/d-tietjen/blossom/compare/v2.0.0...HEAD
+[Unreleased]: https://github.com/d-tietjen/blossom/compare/v2.1.0...HEAD
+[2.1.0]: https://github.com/d-tietjen/blossom/compare/v2.0.0...v2.1.0
 [2.0.0]: https://github.com/d-tietjen/blossom/releases/tag/v2.0.0

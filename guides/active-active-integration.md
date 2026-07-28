@@ -6,7 +6,7 @@ storage schema.
 
 ```toml
 [dependencies]
-blossom = { package = "blossom-consensus", path = "../blossom" }
+blossom = { package = "blossom-consensus", version = "2.1.0" }
 ```
 
 ## Trusted-direct flow
@@ -47,16 +47,22 @@ payload can opt into the stronger asynchronous durable-reference flow:
 
 1. Open a `DurableAdmissionStore` for every local holder with its site and store
    generation.
-2. Persist commands with `DurableAdmissionStore::admit` and combine signed
-   receipts into a `LocalAdmissionCertificate`.
+2. For compatibility, a single command can use
+   `DurableAdmissionStore::admit` and `LocalAdmissionCertificate`. Production
+   shard pipelines should use `admit_command_batch(shard, batch, epoch)` and
+   combine the one signed receipt from each holder into a
+   `LocalAdmissionBatchCertificate`. The certificate binds the shard id and
+   canonical batch hash, so one signature covers every command without
+   weakening local durability or equivocation detection.
 3. Build a `CommandBatch` and cryptographic `BatchReference`, replicate the
    bytes, and collect `AuthenticatedAvailabilityReceipt` values. Reference
    format/codec v2 commits both `route_generation` and the application's
    `command_spec_version`; changing either changes the signed reference hash.
 4. Verify and submit the resulting `AvailabilityCertificate` with
-   `GlobalOrderedEngine::mark_available`. Encode compact references with
-   `BatchReference::to_transaction`. A trusted epoch may contain one reference
-   from every active writer.
+   `GlobalOrderedEngine::mark_available_with_batch`. This stores the exact
+   certified batch bytes before availability can reach finality. Encode compact
+   references with `BatchReference::to_transaction`. A trusted epoch may
+   contain one reference from every active writer.
 5. Once the Blossom epoch is finalized,
    `GlobalOrderedEngine::order_statement_for_finalized_epoch` deterministically
    derives its hash-chain position when the epoch carries a portable signature
@@ -84,6 +90,56 @@ concern.
 schema identity on first open. The first stored batch also binds the database
 to its cluster and consensus group. Reopening with different identity or scope
 fails closed, and pre-identity stores require fresh initialization.
+
+### Sharded HA throughput path
+
+Hashing, batch-certificate verification, and holder admission are shard-local.
+Each shard worker should:
+
+1. Build one contiguous `CommandBatch`.
+2. Durably admit it on the shard's local holder stores and collect a
+   `LocalAdmissionBatchCertificate`.
+3. Call `verify_and_bind` and prepare a
+   `PreparedActiveActiveHaShardBatch`.
+
+The coordinator passes all ready shard batches to
+`ActiveActiveGlobalCoordinator::accept_prepared_shard_batches`. Blossom commits
+the combined lifecycle delta once, then
+`GlobalOrderedEngine::accept_verified_local_command_batches` commits one
+accepted-local milestone per shard batch once. Shard order is preserved inside
+each batch; the later Blossom reference order remains the authority for
+cross-shard conflicts. Route, command-spec, and membership cutovers remain
+global barriers and must not be activated independently by a shard.
+
+Do not put every shard in an independently flushed HA lifecycle database.
+That multiplies `fsync` contention and loses the shared cutover boundary. The
+intended layout is parallel shard preparation feeding one bounded group commit.
+
+### Direct lifecycle and order coordination
+
+Production integrations open both durable engines and construct
+`ActiveActiveGlobalCoordinator`. Construction fails unless lifecycle state,
+the HA runtime, ordered state, and application completions are all
+production-durable. It also completes the recoverable half of a route/spec
+cutover when the ordered store committed before a crash but the lifecycle store
+did not.
+
+For each accepted batch:
+
+1. Call `accept_prepared_shard_batches`.
+2. Replicate the command batches to holders and obtain availability evidence.
+3. Call `mark_available(batch, certificate)` so local bytes precede
+   availability.
+4. Deliver verified or trusted finality through the coordinator's `finalize`
+   or `finalize_trusted` method.
+5. Call `complete_globally_applied(reference, batch, timeout, application)`.
+
+The coordinator checks every command identity against the durable accepted-hash
+index. It removes accepted lifecycle records only after the ordered store has
+durably committed `Applied`. A timeout or crash leaves those records available
+for idempotent retry. Application-contract cutovers must use the coordinator's
+begin, recertify/abort, cancel, and activate methods; callers must not activate
+the ordered and lifecycle engines independently.
 
 ## Apply contract
 
@@ -161,6 +217,17 @@ transition updates only changed records in one transaction with its milestone
 event. Blossom persists no application state-machine snapshot.
 `DurableAdmissionStore::durability_metrics` reports process-local commit,
 fsync, checkpoint, and byte counts.
+
+The HA service lifecycle has a separate immediate-durability contract. Use
+`ActiveActiveHaEngine::open` on a node-local ShardLog directory distinct from
+the `HighAvailabilityRuntime::open` directory. It restores accepted writes,
+translated command bytes and hashes, the active route/spec contract, and any
+prepared cutover before serving traffic. In-memory
+`ActiveActiveHaEngine::new` is not a production write profile. The lifecycle
+store bounds in-flight accepted state to 65,536 writes, 256 prepared shard
+lanes, and 64 MiB of command bytes. Use
+`ActiveActiveGlobalCoordinator::durability` for process-local lifecycle and
+ordered-store durability inspection.
 
 ## Configuration
 

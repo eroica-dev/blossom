@@ -50,6 +50,60 @@ impl AdmissionReceipt {
     }
 }
 
+#[derive(Serialize, Deserialize, BorshSerialize, BorshDeserialize, Debug, Clone, PartialEq, Eq)]
+/// Holder attestation for one complete canonical command batch.
+pub struct AdmissionBatchReceiptBody {
+    /// Application shard whose lane admitted the batch.
+    pub shard: Vec<u8>,
+    /// Domain-separated hash of the complete canonical batch.
+    pub command_batch_hash: HashType,
+    /// First writer-local sequence in the batch.
+    pub first_origin_sequence: u64,
+    /// Last writer-local sequence in the batch.
+    pub last_origin_sequence: u64,
+    /// Number of commands in the batch.
+    pub command_count: u32,
+    /// Public key of the durable holder.
+    pub holder: PubKey,
+    /// Site containing the holder.
+    pub site: SiteId,
+    /// Frozen holder membership generation.
+    pub membership_epoch: ReplicaMembershipEpoch,
+    /// Durable store incarnation used for admission.
+    pub durable_store_generation: StoreGeneration,
+}
+
+#[derive(Serialize, Deserialize, BorshSerialize, BorshDeserialize, Debug, Clone, PartialEq, Eq)]
+/// Holder-authenticated durable admission receipt for a complete batch.
+pub struct AdmissionBatchReceipt {
+    /// Signed batch admission statement.
+    pub body: AdmissionBatchReceiptBody,
+    /// Holder signature over the domain-separated statement.
+    pub signature: Signature,
+}
+
+impl AdmissionBatchReceipt {
+    /// Signs a batch admission statement with the named holder.
+    pub fn signed(body: AdmissionBatchReceiptBody, signer: &SecretSigner) -> Result<Self> {
+        if signer.public_key() != body.holder {
+            return Err(BlossomError::KeyMismatch);
+        }
+        validate_shard_id(&body.shard)?;
+        let message = signed_body_bytes(ADMISSION_BATCH_RECEIPT_DOMAIN, &body)?;
+        Ok(Self {
+            body,
+            signature: signer.sign(&message),
+        })
+    }
+
+    /// Verifies the holder signature and shard bound.
+    pub fn verify(&self) -> Result<()> {
+        validate_shard_id(&self.body.shard)?;
+        let message = signed_body_bytes(ADMISSION_BATCH_RECEIPT_DOMAIN, &self.body)?;
+        self.signature.verify(&message, &self.body.holder)
+    }
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 /// Frozen site-local policy for command admission.
 pub struct LocalAdmissionPolicy {
@@ -81,19 +135,7 @@ pub struct LocalAdmissionCertificate {
 impl LocalAdmissionCertificate {
     /// Validates policy membership, store generations, and receipt quorum.
     pub fn verify(&self) -> Result<()> {
-        if self.policy.members.is_empty()
-            || self
-                .policy
-                .store_generations
-                .keys()
-                .copied()
-                .collect::<BTreeSet<_>>()
-                != self.policy.members
-        {
-            return Err(BlossomError::InvalidConfiguration(
-                "admission policy must bind one store generation per member".to_string(),
-            ));
-        }
+        validate_local_admission_policy(&self.policy)?;
         let mut holders = BTreeSet::new();
         for receipt in &self.receipts {
             receipt.verify()?;
@@ -117,6 +159,168 @@ impl LocalAdmissionCertificate {
         }
         Ok(())
     }
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+/// Site-local durability quorum certificate for one canonical command batch.
+pub struct LocalAdmissionBatchCertificate {
+    /// Frozen admission policy.
+    pub policy: LocalAdmissionPolicy,
+    /// Application shard whose lane admitted the batch.
+    pub shard: Vec<u8>,
+    /// Domain-separated hash of the complete batch.
+    pub command_batch_hash: HashType,
+    /// First writer-local sequence in the batch.
+    pub first_origin_sequence: u64,
+    /// Last writer-local sequence in the batch.
+    pub last_origin_sequence: u64,
+    /// Number of commands in the batch.
+    pub command_count: u32,
+    /// Distinct authenticated holder receipts.
+    pub receipts: Vec<AdmissionBatchReceipt>,
+}
+
+/// In-process proof that a command batch matched a valid local admission
+/// quorum certificate.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerifiedLocalAdmissionBatch {
+    pub(super) policy: LocalAdmissionPolicy,
+    shard: Vec<u8>,
+    pub(super) command_batch_hash: HashType,
+}
+
+impl VerifiedLocalAdmissionBatch {
+    /// Borrows the validated shard identifier.
+    pub fn shard(&self) -> &[u8] {
+        &self.shard
+    }
+
+    /// Returns the validated canonical command-batch hash.
+    pub fn command_batch_hash(&self) -> HashType {
+        self.command_batch_hash
+    }
+}
+
+impl LocalAdmissionBatchCertificate {
+    /// Verifies that this certificate commits the supplied complete batch.
+    pub fn verify_batch(&self, batch: &CommandBatch) -> Result<()> {
+        self.verify_and_bind(batch).map(|_| ())
+    }
+
+    /// Verifies the batch and returns an unforgeable in-process proof.
+    pub fn verify_and_bind(&self, batch: &CommandBatch) -> Result<VerifiedLocalAdmissionBatch> {
+        validate_local_admission_policy(&self.policy)?;
+        validate_shard_id(&self.shard)?;
+        batch.validate()?;
+        let first = batch
+            .commands
+            .first()
+            .expect("validated command batch is non-empty")
+            .origin_sequence;
+        let last = batch
+            .commands
+            .last()
+            .expect("validated command batch is non-empty")
+            .origin_sequence;
+        let command_count = u32::try_from(batch.commands.len()).map_err(|_| {
+            BlossomError::InvalidConfiguration(
+                "local admission batch command count exceeds u32".to_string(),
+            )
+        })?;
+        if self.command_batch_hash != batch.hash()?
+            || self.first_origin_sequence != first
+            || self.last_origin_sequence != last
+            || self.command_count != command_count
+        {
+            return Err(BlossomError::InvalidConfiguration(
+                "local admission batch certificate does not match its command batch".to_string(),
+            ));
+        }
+        let mut holders = BTreeSet::new();
+        for receipt in &self.receipts {
+            receipt.verify()?;
+            if receipt.body.command_batch_hash != self.command_batch_hash
+                || receipt.body.shard != self.shard
+                || receipt.body.first_origin_sequence != self.first_origin_sequence
+                || receipt.body.last_origin_sequence != self.last_origin_sequence
+                || receipt.body.command_count != self.command_count
+                || receipt.body.site != self.policy.site
+                || receipt.body.membership_epoch != self.policy.membership_epoch
+                || !self.policy.members.contains(&receipt.body.holder)
+                || self.policy.store_generations.get(&receipt.body.holder)
+                    != Some(&receipt.body.durable_store_generation)
+                || !holders.insert(receipt.body.holder)
+            {
+                return Err(BlossomError::InvalidConfiguration(
+                    "admission batch receipt does not match its frozen policy".to_string(),
+                ));
+            }
+        }
+        if holders.len() < supermajority_count(self.policy.members.len()) {
+            return Err(BlossomError::FailedConsensus);
+        }
+        Ok(VerifiedLocalAdmissionBatch {
+            policy: self.policy.clone(),
+            shard: self.shard.clone(),
+            command_batch_hash: self.command_batch_hash,
+        })
+    }
+}
+
+fn validate_local_admission_policy(policy: &LocalAdmissionPolicy) -> Result<()> {
+    if policy.members.is_empty()
+        || policy
+            .store_generations
+            .keys()
+            .copied()
+            .collect::<BTreeSet<_>>()
+            != policy.members
+    {
+        return Err(BlossomError::InvalidConfiguration(
+            "admission policy must bind one store generation per member".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+pub(super) fn validate_local_admission_policy_against_membership(
+    policy: &LocalAdmissionPolicy,
+    membership: &HolderMembership,
+) -> Result<()> {
+    validate_local_admission_policy(policy)?;
+    membership.validate()?;
+    let expected_members = membership
+        .members_by_site
+        .get(&policy.site)
+        .ok_or_else(|| {
+            BlossomError::InvalidConfiguration(
+                "local admission policy site is not in holder membership".to_string(),
+            )
+        })?;
+    let expected_store_generations = expected_members
+        .iter()
+        .map(|member| {
+            membership
+                .store_generations
+                .get(member)
+                .copied()
+                .map(|generation| (*member, generation))
+                .ok_or_else(|| {
+                    BlossomError::InvalidConfiguration(
+                        "holder membership is missing a local store generation".to_string(),
+                    )
+                })
+        })
+        .collect::<Result<BTreeMap<_, _>>>()?;
+    if policy.membership_epoch != membership.epoch
+        || &policy.members != expected_members
+        || policy.store_generations != expected_store_generations
+    {
+        return Err(BlossomError::InvalidConfiguration(
+            "local admission policy does not match configured holder membership".to_string(),
+        ));
+    }
+    Ok(())
 }
 
 #[derive(Serialize, Deserialize, BorshSerialize, BorshDeserialize, Debug, Clone, PartialEq, Eq)]

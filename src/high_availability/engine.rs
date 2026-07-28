@@ -130,6 +130,11 @@ impl HighAvailabilityRuntime {
         &self.telemetry
     }
 
+    /// Returns whether every protocol mutation is persisted before success.
+    pub fn is_durable(&self) -> bool {
+        self.store.is_some()
+    }
+
     /// Emits an HA-scoped structured failure without applying a recovery
     /// policy. Services may use this for transport and dependency failures.
     /// Emits a structured failure event for an external operation.
