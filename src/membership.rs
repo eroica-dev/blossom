@@ -155,7 +155,9 @@ impl VerifiedMembershipView {
 )]
 pub struct MembershipLeaseChallenge(pub [u8; 32]);
 
-#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(
+    Serialize, Deserialize, BorshSerialize, BorshDeserialize, Debug, Clone, Copy, PartialEq, Eq,
+)]
 pub struct MembershipLeaseRequest {
     pub challenge: MembershipLeaseChallenge,
     /// Wall-clock issuance time committed by every validator signature.

@@ -64,6 +64,8 @@ pub mod local_block;
 pub mod log_store;
 /// Validator membership, service capabilities, and freshness certificates.
 pub mod membership;
+/// Authenticated membership-lease RPCs carried by the existing TCP listener.
+pub mod membership_transport;
 /// The top-level consensus message enum and stable message keys.
 pub mod messages;
 /// Public node identity and node-role types.
@@ -236,6 +238,11 @@ pub use membership::{
     apply_epoch_membership_transition, derive_consensus_node_admission_plan,
     derive_consensus_node_removal_plan,
 };
+pub use membership_transport::{
+    MEMBERSHIP_LEASE_RPC_KIND, MEMBERSHIP_LEASE_RPC_MAX_PAYLOAD_BYTES,
+    MembershipLeaseInstallRequest, MembershipLeaseRpc, MembershipLeaseRpcResponse,
+    MembershipLeaseRpcService, MembershipLeaseVoteRequest,
+};
 pub use messages::{MSGKey, Msg};
 pub use node::{NodeIdentity, NodeType};
 pub use nonce::Nonce;
@@ -283,8 +290,8 @@ pub use subset_gossip::{
 };
 pub use tcp::{
     ApplicationHandler, ApplicationHandlerFuture, ConsensusDriverConfig, ConsensusDriverTick,
-    TcpConnection, TcpMultiGroupNode, TcpNode, TcpNodeMetrics, TcpNodeMetricsSnapshot,
-    send_wire_frame, send_wire_request, send_wire_request_raw_response,
+    MultiGroupApplicationHandler, TcpConnection, TcpMultiGroupNode, TcpNode, TcpNodeMetrics,
+    TcpNodeMetricsSnapshot, send_wire_frame, send_wire_request, send_wire_request_raw_response,
 };
 #[cfg(feature = "eden-logger")]
 pub use telemetry::EdenLoggerTelemetrySink;
