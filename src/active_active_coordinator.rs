@@ -14,7 +14,7 @@ use crate::{
     ActiveActiveCommand, ActiveActiveDurabilityMetrics, ActiveActiveHaCutoverManifest,
     ActiveActiveHaEngine, ActiveActiveHaLifecycleDurabilityMetrics, ActiveActiveHaRecoveryStatus,
     AvailabilityCertificate, BatchReference, BlossomError, CommandBatch, CommandIdentity,
-    CommandSpecVersion, GlobalOrderedEngine, HighAvailabilityRuntime, MilestoneEvent,
+    CommandSpecVersion, Epoch, GlobalOrderedEngine, HighAvailabilityRuntime, MilestoneEvent,
     OrderCertificate, OrderStatement, OrderedApplication, PreparedActiveActiveHaShardBatch,
     ReferenceStatus, Result, RouteGeneration, Transaction, WaitForOutcome, WriteMode,
 };
@@ -89,6 +89,15 @@ impl ActiveActiveGlobalCoordinator {
     /// application-contract activation.
     pub fn finalize_trusted(&mut self, statement: OrderStatement) -> Result<MilestoneEvent> {
         self.ordered.finalize_trusted(statement)
+    }
+
+    /// Installs every active-active reference in one trusted, already
+    /// committed Blossom epoch.
+    ///
+    /// The ordered engine still validates the epoch's exact validator set,
+    /// reference availability, origin chains, and application contract.
+    pub fn finalize_trusted_epoch(&mut self, epoch: &Epoch) -> Result<Vec<MilestoneEvent>> {
+        self.ordered.finalize_trusted_epoch(epoch)
     }
 
     /// Mutably borrows the underlying HA protocol runtime.
