@@ -15,6 +15,7 @@ use crate::availability::{
 };
 use crate::block::Block;
 use crate::error::{BlossomError, Result};
+use crate::group::ConsensusGroupId;
 use crate::nonce::Nonce;
 use crate::tcp::TcpConnection;
 use crate::wire::{
@@ -42,6 +43,7 @@ struct TcpServicePool {
 #[derive(Clone)]
 pub struct TcpServiceClient {
     pool: Arc<TcpServicePool>,
+    group_id: Option<ConsensusGroupId>,
 }
 
 #[derive(Clone, Debug)]
@@ -72,7 +74,15 @@ impl TcpServiceClient {
                 slots: Arc::new(Semaphore::new(max_connections)),
                 max_connections,
             }),
+            group_id: None,
         }
+    }
+
+    /// Routes ordinary requests through one group on a shared multi-group
+    /// listener. Hot dispatch frames remain epoch-routed.
+    pub fn for_group(mut self, group_id: ConsensusGroupId) -> Self {
+        self.group_id = Some(group_id);
+        self
     }
 
     /// Returns the maximum number of persistent connections owned by this pool.
@@ -81,6 +91,21 @@ impl TcpServiceClient {
     }
 
     pub async fn request(&self, service: &Service, request: &WireRequest) -> Result<WireResponse> {
+        let grouped;
+        let request = if let Some(group_id) = self.group_id {
+            if matches!(request, WireRequest::Group { .. }) {
+                return Err(BlossomError::WireProtocol(
+                    "a group-routed TCP client cannot wrap an already grouped request".to_string(),
+                ));
+            }
+            grouped = WireRequest::Group {
+                group_id,
+                request: Box::new(request.clone()),
+            };
+            &grouped
+        } else {
+            request
+        };
         let frame = EncodedFrame::encode_wire_request(request)?;
         self.request_frame(service, &frame).await
     }

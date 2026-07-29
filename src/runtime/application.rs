@@ -4,8 +4,36 @@
 //! them domain semantics.
 
 use super::*;
+use crate::Transaction;
 
 impl NodeRuntime {
+    /// Adds one bounded opaque transaction to the next local block.
+    ///
+    /// The consensus driver closes and broadcasts the block. Applications
+    /// should retain the returned transaction hash and confirm that the
+    /// committed epoch contains it before exposing effects.
+    pub fn submit_transaction(&self, transaction: Transaction) -> Result<HashType> {
+        if transaction.payload.is_empty() {
+            return Err(BlossomError::InvalidConfiguration(
+                "application transactions must not be empty".to_string(),
+            ));
+        }
+        let encoded = borsh::to_vec(&transaction).map_err(|error| {
+            BlossomError::WireProtocol(format!("encode application transaction: {error}"))
+        })?;
+        if encoded.len() > crate::wire::configured_max_frame_size() {
+            return Err(BlossomError::InvalidConfiguration(
+                "application transaction exceeds the configured frame bound".to_string(),
+            ));
+        }
+        Ok(self
+            .inner
+            .local_blocks
+            .write()
+            .expect("block lock poisoned")
+            .add_transaction(transaction))
+    }
+
     /// Sets the opaque application state that will be piggy-backed onto this
     /// node's next dispatched block.
     ///
