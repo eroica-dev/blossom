@@ -302,6 +302,19 @@ impl GlobalOrderedEngine {
         Ok(events)
     }
 
+    /// Persists one referenced batch and returns this holder's signed
+    /// admission receipt without advancing availability.
+    ///
+    /// Coordinators use this to collect multi-holder availability while
+    /// retaining a single durable store owner per process.
+    pub fn store_batch(
+        &self,
+        reference: &BatchReference,
+        batch: &CommandBatch,
+    ) -> Result<AuthenticatedAvailabilityReceipt> {
+        self.store.store_batch(reference, batch)
+    }
+
     /// Validates and persists recoverable multi-site availability.
     pub fn mark_available_with_batch(
         &mut self,

@@ -79,6 +79,16 @@ impl ActiveActiveGlobalCoordinator {
         &self.ordered
     }
 
+    /// Persists one referenced batch through the coordinator-owned ordered
+    /// store and returns this holder's signed admission receipt.
+    pub fn store_batch(
+        &self,
+        reference: &BatchReference,
+        batch: &CommandBatch,
+    ) -> Result<crate::AuthenticatedAvailabilityReceipt> {
+        self.ordered.store_batch(reference, batch)
+    }
+
     /// Installs portable validator-signed finality without exposing unsafe
     /// independent application-contract activation.
     pub fn finalize(&mut self, certificate: OrderCertificate) -> Result<MilestoneEvent> {
