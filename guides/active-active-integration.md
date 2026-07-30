@@ -94,6 +94,27 @@ fails closed, and pre-identity stores require fresh initialization.
 ### Sharded HA throughput path
 
 Hashing, batch-certificate verification, and holder admission are shard-local.
+
+## Certified committee replacement
+
+Bootstrap holder and validator sets are genesis configuration. Every later
+replacement uses `CommitteeTransitionStatement`, which binds the cluster,
+consensus group, old and next generations, complete next holder membership,
+complete next validator set, and the current globally-applied order boundary.
+Current validators call `sign_committee_transition`; the durable store refuses
+to sign two different statements for one validator generation. Combine an
+old-validator supermajority with `CommitteeTransitionCertificate::from_votes`,
+then call `activate_committee_transition` on
+`ActiveActiveGlobalCoordinator`.
+
+Activation fails while any reference is available but unfinalized or while
+the applied watermark trails finality. The transition certificate and updated
+ordered metadata commit in one store transaction. On restart, Blossom replays
+the certificate chain from genesis, verifies every transition against the
+preceding validator committee, and uses the historical committee for each
+retained order certificate. A removed holder may reopen its historical store
+for audit or transfer, but its receipts and votes are rejected by the current
+membership.
 Each shard worker should:
 
 1. Build one contiguous `CommandBatch`.

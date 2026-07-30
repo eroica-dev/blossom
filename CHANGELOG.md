@@ -8,6 +8,14 @@ public Rust APIs and separately versions consensus and durable wire formats.
 
 ## [Unreleased]
 
+### Added
+
+- Globally ordered active-active engines can install holder and validator
+  replacements certified by an old-validator supermajority. Transition votes
+  are durably non-equivocating, activation is restricted to a quiescent
+  globally-applied boundary, and the full certificate history is replayed on
+  restart before historical order certificates are accepted.
+
 ### Fixed
 
 - The HA isolation gate recognizes that the `high-availability` feature

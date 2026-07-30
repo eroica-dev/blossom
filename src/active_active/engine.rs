@@ -64,18 +64,6 @@ impl GlobalOrderedEngine {
             ));
         }
         holder_membership.validate()?;
-        if holder_membership
-            .members_by_site
-            .get(&store.site)
-            .is_none_or(|members| !members.contains(&store.holder))
-            || holder_membership.store_generations.get(&store.holder)
-                != Some(&store.store_generation)
-        {
-            return Err(BlossomError::InvalidConfiguration(
-                "ordered-engine store identity is not a holder in the committed membership"
-                    .to_string(),
-            ));
-        }
         if validators.is_empty() {
             return Err(BlossomError::InvalidConfiguration(
                 "global ordering requires at least one validator".to_string(),
@@ -90,12 +78,18 @@ impl GlobalOrderedEngine {
         route_generation.validate()?;
         command_spec_version.validate()?;
         let loaded_ordered = store.load_ordered_state()?;
+        let genesis_holder_membership = holder_membership.clone();
+        let genesis_validators = validators.clone();
         let mut engine = Self {
             store,
             mode,
             holder_membership,
             validator_generation,
             validators,
+            genesis_holder_membership,
+            genesis_validator_generation: validator_generation,
+            genesis_validators,
+            committee_transitions: BTreeMap::new(),
             order_trust_mode,
             available: BTreeMap::new(),
             finalized: BTreeMap::new(),
@@ -110,8 +104,15 @@ impl GlobalOrderedEngine {
             telemetry: TelemetryHandle::default(),
         };
         if let Some(state) = loaded_ordered {
+            engine.restore_committee_history(&state.committee_transitions)?;
             engine.validate_durable_state(&state)?;
             engine.install_durable_state(state);
+        }
+        if !engine.local_store_was_authorized() {
+            return Err(BlossomError::InvalidConfiguration(
+                "ordered-engine store identity was never authorized by the certified holder history"
+                    .to_string(),
+            ));
         }
         Ok(engine)
     }
@@ -186,6 +187,100 @@ impl GlobalOrderedEngine {
         self.route_generation = route_generation;
         self.command_spec_version = command_spec_version;
         Ok(activation)
+    }
+
+    /// Atomically activates an old-validator-certified holder and validator
+    /// replacement at a quiescent globally-applied boundary.
+    pub fn activate_committee_transition(
+        &mut self,
+        certificate: CommitteeTransitionCertificate,
+    ) -> Result<CommitteeTransitionActivation> {
+        if !self.available.is_empty()
+            || self.applied_watermark.position != self.last_finalized_position
+        {
+            return Err(BlossomError::InvalidConfiguration(
+                "committee activation requires no available or unapplied references".to_string(),
+            ));
+        }
+        let (cluster_id, consensus_group_id) = self.store.protocol_scope()?.ok_or_else(|| {
+            BlossomError::InvalidConfiguration(
+                "committee activation requires a bound cluster and consensus group".to_string(),
+            )
+        })?;
+        certificate.verify(
+            cluster_id,
+            consensus_group_id,
+            &self.holder_membership,
+            self.validator_generation,
+            &self.validators,
+        )?;
+        if certificate.statement.activated_at != self.applied_watermark
+            || certificate.statement.order_certificate_hash != self.last_order_certificate_hash
+        {
+            return Err(BlossomError::InvalidConfiguration(
+                "committee transition does not bind the current globally-applied boundary"
+                    .to_string(),
+            ));
+        }
+        let transition_hash = certificate.hash()?;
+        let activation = CommitteeTransitionActivation {
+            previous_holder_membership_epoch: self.holder_membership.epoch,
+            holder_membership_epoch: certificate.statement.next_holder_membership.epoch,
+            previous_validator_generation: self.validator_generation,
+            validator_generation: certificate.statement.next_validator_generation,
+            activated_at: self.applied_watermark,
+            transition_hash,
+        };
+        let mut metadata = self.durable_metadata();
+        metadata.holder_membership_epoch = certificate.statement.next_holder_membership.epoch;
+        metadata.validator_generation = certificate.statement.next_validator_generation;
+        self.store
+            .persist_committee_transition(&metadata, &certificate)?;
+        self.holder_membership = certificate.statement.next_holder_membership.clone();
+        self.validator_generation = certificate.statement.next_validator_generation;
+        self.validators = certificate.statement.next_validators.clone();
+        self.committee_transitions
+            .insert(self.validator_generation, certificate);
+        Ok(activation)
+    }
+
+    /// Durably records and signs this local validator's one transition vote
+    /// for the current generation.
+    pub fn sign_committee_transition(
+        &self,
+        statement: &CommitteeTransitionStatement,
+    ) -> Result<CommitteeTransitionVote> {
+        let (cluster_id, consensus_group_id) = self.store.protocol_scope()?.ok_or_else(|| {
+            BlossomError::InvalidConfiguration(
+                "committee transition voting requires a bound protocol scope".to_string(),
+            )
+        })?;
+        if !self.validators.contains(&self.store.holder)
+            || statement.cluster_id != cluster_id
+            || statement.consensus_group_id != consensus_group_id
+            || statement.previous_holder_membership_epoch != self.holder_membership.epoch
+            || statement.previous_validator_generation != self.validator_generation
+            || statement.activated_at != self.applied_watermark
+            || statement.order_certificate_hash != self.last_order_certificate_hash
+            || !self.available.is_empty()
+            || self.applied_watermark.position != self.last_finalized_position
+        {
+            return Err(BlossomError::InvalidConfiguration(
+                "committee transition vote does not match the current quiescent boundary"
+                    .to_string(),
+            ));
+        }
+        self.store.sign_committee_transition_statement(statement)
+    }
+
+    /// Returns the current certified holder membership.
+    pub fn holder_membership(&self) -> &HolderMembership {
+        &self.holder_membership
+    }
+
+    /// Returns the current certified validator generation and exact keys.
+    pub fn validator_committee(&self) -> (ValidatorGeneration, &BTreeSet<PubKey>) {
+        (self.validator_generation, &self.validators)
     }
 
     /// Records a verified local-admission certificate.
@@ -1103,9 +1198,11 @@ impl GlobalOrderedEngine {
             ));
         }
         if self.order_trust_mode.is_trusted() {
-            certificate.verify_trusted(self.validator_generation)?;
+            certificate.verify_trusted(certificate.statement.validator_generation)?;
         } else {
-            certificate.verify(self.validator_generation, &self.validators)?;
+            let validators =
+                self.validators_for_generation(certificate.statement.validator_generation)?;
+            certificate.verify(certificate.statement.validator_generation, validators)?;
         }
         Ok((
             certificate.statement.position,
@@ -1154,6 +1251,7 @@ impl GlobalOrderedEngine {
         self.last_finalized_position = state.last_finalized_position;
         self.last_order_certificate_hash = state.last_order_certificate_hash;
         self.applied_watermark = state.applied_watermark;
+        self.committee_transitions = state.committee_transitions;
     }
 
     fn validate_durable_state(&self, state: &DurableOrderedState) -> Result<()> {
@@ -1194,6 +1292,32 @@ impl GlobalOrderedEngine {
                 availability.reference.consensus_group_id,
             )?;
         }
+        for certificate in state.committee_transitions.values() {
+            let boundary = certificate.statement.activated_at.position;
+            if boundary > state.applied_watermark.position {
+                return Err(BlossomError::InvalidConfiguration(
+                    "committee transition is newer than the durable applied watermark".to_string(),
+                ));
+            }
+            let expected_hash = if boundary == 0 {
+                HashType::default()
+            } else {
+                state
+                    .finalized
+                    .get(&boundary)
+                    .ok_or_else(|| {
+                        BlossomError::InvalidConfiguration(
+                            "committee transition boundary is absent from finality".to_string(),
+                        )
+                    })?
+                    .hash()?
+            };
+            if certificate.statement.order_certificate_hash != expected_hash {
+                return Err(BlossomError::InvalidConfiguration(
+                    "committee transition does not bind its durable order boundary".to_string(),
+                ));
+            }
+        }
         let mut previous_hash = HashType::default();
         for position in 1..=state.last_finalized_position {
             let certificate = state.finalized.get(&position).ok_or_else(|| {
@@ -1202,9 +1326,11 @@ impl GlobalOrderedEngine {
                 )
             })?;
             if self.order_trust_mode.is_trusted() {
-                certificate.verify_trusted(self.validator_generation)?;
+                certificate.verify_trusted(certificate.statement.validator_generation)?;
             } else {
-                certificate.verify(self.validator_generation, &self.validators)?;
+                let validators =
+                    self.validators_for_generation(certificate.statement.validator_generation)?;
+                certificate.verify(certificate.statement.validator_generation, validators)?;
             }
             if certificate.statement.position.position != position
                 || certificate.statement.previous_order_certificate_hash != previous_hash
@@ -1237,5 +1363,72 @@ impl GlobalOrderedEngine {
             ));
         }
         Ok(())
+    }
+
+    fn restore_committee_history(
+        &mut self,
+        transitions: &BTreeMap<ValidatorGeneration, CommitteeTransitionCertificate>,
+    ) -> Result<()> {
+        if transitions.is_empty() {
+            return Ok(());
+        }
+        let (cluster_id, consensus_group_id) = self.store.protocol_scope()?.ok_or_else(|| {
+            BlossomError::InvalidConfiguration(
+                "durable committee history lacks a bound protocol scope".to_string(),
+            )
+        })?;
+        for (generation, certificate) in transitions {
+            if *generation != certificate.statement.next_validator_generation {
+                return Err(BlossomError::InvalidConfiguration(
+                    "committee history key does not match its certificate".to_string(),
+                ));
+            }
+            certificate.verify(
+                cluster_id,
+                consensus_group_id,
+                &self.holder_membership,
+                self.validator_generation,
+                &self.validators,
+            )?;
+            self.holder_membership = certificate.statement.next_holder_membership.clone();
+            self.validator_generation = certificate.statement.next_validator_generation;
+            self.validators = certificate.statement.next_validators.clone();
+            self.committee_transitions
+                .insert(*generation, certificate.clone());
+        }
+        Ok(())
+    }
+
+    fn validators_for_generation(
+        &self,
+        generation: ValidatorGeneration,
+    ) -> Result<&BTreeSet<PubKey>> {
+        if generation == self.genesis_validator_generation {
+            return Ok(&self.genesis_validators);
+        }
+        self.committee_transitions
+            .get(&generation)
+            .map(|certificate| &certificate.statement.next_validators)
+            .ok_or_else(|| {
+                BlossomError::InvalidConfiguration(
+                    "order certificate names an unknown validator generation".to_string(),
+                )
+            })
+    }
+
+    fn local_store_was_authorized(&self) -> bool {
+        let authorized = |membership: &HolderMembership| {
+            membership
+                .members_by_site
+                .get(&self.store.site)
+                .is_some_and(|members| members.contains(&self.store.holder))
+                && membership.store_generations.get(&self.store.holder)
+                    == Some(&self.store.store_generation)
+        };
+        authorized(&self.genesis_holder_membership)
+            || self
+                .committee_transitions
+                .values()
+                .any(|certificate| authorized(&certificate.statement.next_holder_membership))
     }
 }

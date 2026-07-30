@@ -14,9 +14,11 @@ use crate::{
     ActiveActiveCommand, ActiveActiveDurabilityMetrics, ActiveActiveHaCutoverManifest,
     ActiveActiveHaEngine, ActiveActiveHaLifecycleDurabilityMetrics, ActiveActiveHaRecoveryStatus,
     AvailabilityCertificate, BatchReference, BlossomError, CommandBatch, CommandIdentity,
-    CommandSpecVersion, Epoch, GlobalOrderedEngine, HighAvailabilityRuntime, MilestoneEvent,
-    OrderCertificate, OrderStatement, OrderedApplication, PreparedActiveActiveHaShardBatch,
-    ReferenceStatus, Result, RouteGeneration, Transaction, WaitForOutcome, WriteMode,
+    CommandSpecVersion, CommitteeTransitionActivation, CommitteeTransitionCertificate,
+    CommitteeTransitionStatement, CommitteeTransitionVote, Epoch, GlobalOrderedEngine,
+    HighAvailabilityRuntime, MilestoneEvent, OrderCertificate, OrderStatement, OrderedApplication,
+    PreparedActiveActiveHaShardBatch, ReferenceStatus, Result, RouteGeneration, Transaction,
+    WaitForOutcome, WriteMode,
 };
 
 /// Process-local inspection of both durable halves of the active-active path.
@@ -77,6 +79,23 @@ impl ActiveActiveGlobalCoordinator {
     /// Borrows the global-order engine for status and barrier operations.
     pub fn ordered(&self) -> &GlobalOrderedEngine {
         &self.ordered
+    }
+
+    /// Atomically installs an old-validator-certified holder and validator
+    /// replacement at the current globally-applied boundary.
+    pub fn activate_committee_transition(
+        &mut self,
+        certificate: CommitteeTransitionCertificate,
+    ) -> Result<CommitteeTransitionActivation> {
+        self.ordered.activate_committee_transition(certificate)
+    }
+
+    /// Durably signs this node's one old-committee transition vote.
+    pub fn sign_committee_transition(
+        &self,
+        statement: &CommitteeTransitionStatement,
+    ) -> Result<CommitteeTransitionVote> {
+        self.ordered.sign_committee_transition(statement)
     }
 
     /// Persists one referenced batch through the coordinator-owned ordered

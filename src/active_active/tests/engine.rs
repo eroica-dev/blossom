@@ -318,3 +318,173 @@ fn availability_must_precede_finality_and_application_uses_certified_order() {
         std::fs::remove_dir_all(path).ok();
     }
 }
+
+#[test]
+fn certified_committee_transition_is_durable_and_old_validators_are_fenced() {
+    let old_keys = (0..3).map(|_| Keypair::generate()).collect::<Vec<_>>();
+    let next_keys = (0..3).map(|_| Keypair::generate()).collect::<Vec<_>>();
+    let directory = tempfile::tempdir().unwrap();
+    let store = DurableAdmissionStore::open(
+        directory.path(),
+        SiteId("site-a".to_string()),
+        StoreGeneration(1),
+        old_keys[0].signer(),
+    )
+    .unwrap();
+    let cluster_id = HashType([41; 32]);
+    let group = ConsensusGroupId::root();
+    store.bind_protocol_scope(cluster_id, group).unwrap();
+    let holder_membership = HolderMembership {
+        epoch: ReplicaMembershipEpoch(1),
+        members_by_site: [
+            (
+                SiteId("site-a".to_string()),
+                [old_keys[0].public].into_iter().collect(),
+            ),
+            (
+                SiteId("site-b".to_string()),
+                [old_keys[1].public].into_iter().collect(),
+            ),
+            (
+                SiteId("site-c".to_string()),
+                [old_keys[2].public].into_iter().collect(),
+            ),
+        ]
+        .into_iter()
+        .collect(),
+        store_generations: old_keys
+            .iter()
+            .map(|key| (key.public, StoreGeneration(1)))
+            .collect(),
+        holder_fault_bound: 0,
+    };
+    let validators = old_keys
+        .iter()
+        .map(|key| key.public)
+        .collect::<BTreeSet<_>>();
+    let next_holder_membership = HolderMembership {
+        epoch: ReplicaMembershipEpoch(2),
+        members_by_site: [
+            (
+                SiteId("site-a".to_string()),
+                [old_keys[0].public].into_iter().collect(),
+            ),
+            (
+                SiteId("site-b".to_string()),
+                [old_keys[1].public].into_iter().collect(),
+            ),
+            (
+                SiteId("site-c".to_string()),
+                [old_keys[2].public].into_iter().collect(),
+            ),
+        ]
+        .into_iter()
+        .collect(),
+        store_generations: old_keys
+            .iter()
+            .map(|key| (key.public, StoreGeneration(1)))
+            .collect(),
+        holder_fault_bound: 0,
+    };
+    let next_validators = next_keys
+        .iter()
+        .map(|key| key.public)
+        .collect::<BTreeSet<_>>();
+    let statement = CommitteeTransitionStatement {
+        cluster_id,
+        consensus_group_id: group,
+        previous_holder_membership_epoch: ReplicaMembershipEpoch(1),
+        previous_validator_generation: ValidatorGeneration(5),
+        next_holder_membership,
+        next_validator_generation: ValidatorGeneration(6),
+        next_validators: next_validators.clone(),
+        activated_at: Watermark::default(),
+        order_certificate_hash: HashType::default(),
+    };
+    let insufficient = CommitteeTransitionCertificate::from_votes(
+        statement.clone(),
+        [store
+            .sign_committee_transition_statement(&statement)
+            .unwrap()],
+    )
+    .unwrap();
+    let mut engine = GlobalOrderedEngine::new(
+        store.clone(),
+        ActiveActiveConsistencyMode::ActiveSyncGlobalOrdered,
+        holder_membership.clone(),
+        ValidatorGeneration(5),
+        validators.clone(),
+        64,
+    )
+    .unwrap();
+    assert!(engine.activate_committee_transition(insufficient).is_err());
+
+    let certificate = CommitteeTransitionCertificate::from_votes(
+        statement.clone(),
+        [
+            store
+                .sign_committee_transition_statement(&statement)
+                .unwrap(),
+            CommitteeTransitionVote::signed(statement.clone(), &old_keys[1].signer()).unwrap(),
+        ],
+    )
+    .unwrap();
+    let activation = engine
+        .activate_committee_transition(certificate.clone())
+        .unwrap();
+    assert_eq!(activation.validator_generation, ValidatorGeneration(6));
+    assert_eq!(
+        engine.validator_committee(),
+        (ValidatorGeneration(6), &next_validators)
+    );
+    drop(engine);
+
+    let mut restarted = GlobalOrderedEngine::new(
+        store.clone(),
+        ActiveActiveConsistencyMode::ActiveSyncGlobalOrdered,
+        holder_membership,
+        ValidatorGeneration(5),
+        validators,
+        64,
+    )
+    .unwrap();
+    assert_eq!(
+        restarted.validator_committee(),
+        (ValidatorGeneration(6), &next_validators)
+    );
+
+    let second_statement = CommitteeTransitionStatement {
+        cluster_id,
+        consensus_group_id: group,
+        previous_holder_membership_epoch: ReplicaMembershipEpoch(2),
+        previous_validator_generation: ValidatorGeneration(6),
+        next_holder_membership: HolderMembership {
+            epoch: ReplicaMembershipEpoch(3),
+            ..statement.next_holder_membership.clone()
+        },
+        next_validator_generation: ValidatorGeneration(7),
+        next_validators,
+        activated_at: Watermark::default(),
+        order_certificate_hash: HashType::default(),
+    };
+    let stale_old_certificate = CommitteeTransitionCertificate::from_votes(
+        second_statement.clone(),
+        old_keys.iter().take(2).map(|key| {
+            CommitteeTransitionVote::signed(second_statement.clone(), &key.signer()).unwrap()
+        }),
+    )
+    .unwrap();
+    assert!(
+        restarted
+            .activate_committee_transition(stale_old_certificate)
+            .is_err()
+    );
+    let mut conflicting_first_statement = statement;
+    conflicting_first_statement.next_validators = old_keys.iter().map(|key| key.public).collect();
+    assert!(
+        store
+            .sign_committee_transition_statement(&conflicting_first_statement)
+            .is_err(),
+        "durable vote prevents equivocation for one old validator generation"
+    );
+}
