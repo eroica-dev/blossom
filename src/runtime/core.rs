@@ -315,13 +315,16 @@ impl NodeRuntime {
         let statement_hash = HashType::hash(&borsh::to_vec(&statement).map_err(|error| {
             BlossomError::WireProtocol(format!("encode membership lease watermark: {error}"))
         })?);
+        let expires_at_unix_millis = statement.expires_at_unix_millis()?;
+        let now_unix_millis = service_unix_time_millis();
         let mut watermarks = self
             .inner
             .membership_lease_watermarks
             .lock()
             .expect("membership lease watermark lock poisoned");
+        watermarks.retain(|_, watermark| watermark.expires_at_unix_millis > now_unix_millis);
         match watermarks.get(&statement.challenge) {
-            Some(previous) if *previous != statement_hash => {
+            Some(previous) if previous.statement_hash != statement_hash => {
                 return Err(BlossomError::InvalidConfiguration(
                     "membership lease challenge was already signed for a different statement"
                         .to_string(),
@@ -329,7 +332,13 @@ impl NodeRuntime {
             }
             Some(_) => {}
             None => {
-                watermarks.insert(statement.challenge, statement_hash);
+                watermarks.insert(
+                    statement.challenge,
+                    MembershipLeaseWatermark {
+                        statement_hash,
+                        expires_at_unix_millis,
+                    },
+                );
             }
         }
         MembershipLeaseVote::signed(statement, signer)

@@ -13,6 +13,7 @@ impl NodeRuntime {
     /// should retain the returned transaction hash and confirm that the
     /// committed epoch contains it before exposing effects.
     pub fn submit_transaction(&self, transaction: Transaction) -> Result<HashType> {
+        self.ensure_consensus_mode("submit application transaction")?;
         if transaction.payload.is_empty() {
             return Err(BlossomError::InvalidConfiguration(
                 "application transactions must not be empty".to_string(),

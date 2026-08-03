@@ -10,6 +10,10 @@ public Rust APIs and separately versions consensus and durable wire formats.
 
 ### Added
 
+- Authenticated membership-lease vote and install RPCs can share the existing
+  group-routed TCP listener. Requests bind the requester, group, epoch,
+  challenge, and absolute expiry, with bounded payloads and independent
+  per-group requester rate limits.
 - Globally ordered active-active engines can install holder and validator
   replacements certified by an old-validator supermajority. Transition votes
   are durably non-equivocating, activation is restricted to a quiescent
@@ -18,6 +22,12 @@ public Rust APIs and separately versions consensus and durable wire formats.
 
 ### Fixed
 
+- Membership-lease anti-equivocation and RPC rate-limit state now expires and
+  is reclaimed instead of growing for the lifetime of the process. Snapshot
+  restoration remains backward compatible and conservatively ages legacy
+  watermarks for one maximum lease lifetime.
+- Topology-only runtimes now reject the generic application-transaction
+  submission entry point consistently with the other consensus APIs.
 - The HA isolation gate recognizes that the `high-availability` feature
   intentionally enables the feature-gated active-active API.
 

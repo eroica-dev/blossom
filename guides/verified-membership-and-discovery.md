@@ -87,6 +87,17 @@ epoch lease is fresh and never extend the lease. If a published relay record
 expires sooner, its signed deadline clamps `valid_until` so forwarding stops
 promptly.
 
+`MembershipLeaseRpcService` exposes lease vote and install operations through
+an `ApplicationRequest` on the existing `TcpMultiGroupNode` listener; it does
+not require another port. The signed request binds the requester identity,
+routed group, exact epoch, challenge, and absolute expiry. The handler admits
+only active members in that exact committed epoch, enforces the wire payload
+bound, and keeps an independent per-group requester rate window. Expired rate
+windows and anti-equivocation watermarks are reclaimed. Runtime snapshots
+persist watermark expiries; older version-1 snapshots without the additive
+expiry field retain their existing watermarks conservatively for one maximum
+lease lifetime after restoration.
+
 Every forwarding decision must call `VerifiedMembershipView::require_fresh`
 and then check the required `client` or `relay` capability. Once
 `valid_until` passes without quorum contact, forwarding stops. Do not cache a

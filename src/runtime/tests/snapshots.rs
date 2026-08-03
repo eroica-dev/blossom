@@ -91,6 +91,101 @@ fn membership_lease_signer_rejects_challenge_equivocation() {
 }
 
 #[test]
+fn membership_lease_watermarks_expire_and_are_reclaimed() {
+    let (runtime, _, _) = runtime_with_peers();
+    let request = MembershipLeaseRequest::fresh(1_000).unwrap();
+    runtime.vote_membership_lease(request).unwrap();
+    {
+        let mut watermarks = runtime
+            .inner
+            .membership_lease_watermarks
+            .lock()
+            .expect("membership lease watermark lock is available");
+        watermarks
+            .get_mut(&request.challenge)
+            .expect("signed challenge has a watermark")
+            .expires_at_unix_millis = service_unix_time_millis().saturating_sub(1);
+    }
+
+    let replacement = MembershipLeaseRequest {
+        issued_at_unix_millis: service_unix_time_millis(),
+        valid_for_millis: 2_000,
+        ..request
+    };
+    runtime.vote_membership_lease(replacement).unwrap();
+    assert_eq!(
+        runtime
+            .inner
+            .membership_lease_watermarks
+            .lock()
+            .expect("membership lease watermark lock is available")
+            .len(),
+        1
+    );
+}
+
+#[test]
+fn runtime_snapshot_preserves_membership_lease_watermark_expiry() {
+    let (runtime, keypairs, _) = runtime_with_peers();
+    let request = MembershipLeaseRequest::fresh(5_000).unwrap();
+    runtime.vote_membership_lease(request).unwrap();
+    let snapshot = runtime.snapshot().unwrap();
+    assert_eq!(snapshot.membership_lease_watermarks.len(), 1);
+    assert_eq!(snapshot.membership_lease_watermark_expiries.len(), 1);
+
+    let restored_node = NodeIdentity::new(
+        keypairs[0].public,
+        Some(keypairs[0].secret.clone()),
+        "tcp",
+        "127.0.0.1",
+        8000,
+        false,
+    );
+    let restored = NodeRuntime::new(
+        RuntimeConfig::from_snapshot(snapshot, restored_node).expect("valid restored runtime"),
+    );
+    let conflicting = MembershipLeaseRequest {
+        valid_for_millis: 4_000,
+        ..request
+    };
+    assert!(restored.vote_membership_lease(conflicting).is_err());
+}
+
+#[test]
+fn legacy_runtime_snapshot_without_watermark_expiries_remains_compatible() {
+    let (runtime, keypairs, _) = runtime_with_peers();
+    let request = MembershipLeaseRequest::fresh(5_000).unwrap();
+    runtime.vote_membership_lease(request).unwrap();
+    let mut encoded = serde_json::to_value(runtime.snapshot().unwrap()).unwrap();
+    encoded
+        .as_object_mut()
+        .expect("runtime snapshot serializes as an object")
+        .remove("membership_lease_watermark_expiries");
+    let legacy = serde_json::from_value::<RuntimeSnapshotV1>(encoded).unwrap();
+    assert!(legacy.membership_lease_watermark_expiries.is_empty());
+
+    let restored_node = NodeIdentity::new(
+        keypairs[0].public,
+        Some(keypairs[0].secret.clone()),
+        "tcp",
+        "127.0.0.1",
+        8000,
+        false,
+    );
+    let restored = NodeRuntime::new(
+        RuntimeConfig::from_snapshot(legacy, restored_node).expect("valid legacy snapshot"),
+    );
+    assert_eq!(
+        restored
+            .snapshot()
+            .unwrap()
+            .membership_lease_watermarks
+            .len(),
+        1
+    );
+}
+
+#[test]
 fn reinstalling_cached_membership_certificate_cannot_extend_freshness() {
     let (runtime, keypairs, _) = runtime_with_peers();
     let request = MembershipLeaseRequest::fresh(1_000).unwrap();

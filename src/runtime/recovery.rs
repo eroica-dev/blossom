@@ -194,6 +194,7 @@ impl NodeRuntime {
     pub fn snapshot(&self) -> Result<RuntimeSnapshotV1> {
         let state = self.inner.state.read().expect("state lock poisoned");
         let self_public_key = state.self_node.public_key();
+        let now_unix_millis = service_unix_time_millis();
         let address_book = self
             .inner
             .address_book
@@ -207,9 +208,25 @@ impl NodeRuntime {
             .read()
             .expect("address book lock poisoned")
             .signed_records()
-            .filter(|record| record.body.expires_at_unix_millis > service_unix_time_millis())
+            .filter(|record| record.body.expires_at_unix_millis > now_unix_millis)
             .cloned()
             .collect();
+        let mut membership_lease_watermarks = self
+            .inner
+            .membership_lease_watermarks
+            .lock()
+            .expect("membership lease watermark lock poisoned");
+        membership_lease_watermarks
+            .retain(|_, watermark| watermark.expires_at_unix_millis > now_unix_millis);
+        let membership_lease_watermark_hashes = membership_lease_watermarks
+            .iter()
+            .map(|(challenge, watermark)| (*challenge, watermark.statement_hash))
+            .collect();
+        let membership_lease_watermark_expiries = membership_lease_watermarks
+            .iter()
+            .map(|(challenge, watermark)| (*challenge, watermark.expires_at_unix_millis))
+            .collect();
+        drop(membership_lease_watermarks);
         let snapshot = RuntimeSnapshotV1 {
             version: RuntimeSnapshotV1::VERSION,
             group_id: self.inner.group_id,
@@ -222,14 +239,8 @@ impl NodeRuntime {
             trust_mode: self.inner.trust_mode,
             mode: self.inner.mode,
             consensus_node_removal_policy: self.inner.consensus_node_removal_policy,
-            membership_lease_watermarks: self
-                .inner
-                .membership_lease_watermarks
-                .lock()
-                .expect("membership lease watermark lock poisoned")
-                .iter()
-                .map(|(challenge, hash)| (*challenge, *hash))
-                .collect(),
+            membership_lease_watermarks: membership_lease_watermark_hashes,
+            membership_lease_watermark_expiries,
         };
         snapshot.validate()?;
         Ok(snapshot)

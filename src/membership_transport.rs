@@ -6,7 +6,7 @@
 //! handler validates current committed membership and applies a per-requester
 //! rate limit before invoking the runtime.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -198,10 +198,18 @@ struct RateWindow {
     requests: u16,
 }
 
+type RateKey = (ConsensusGroupId, PubKey);
+
+#[derive(Debug, Default)]
+struct RateLimitState {
+    windows: BTreeMap<RateKey, RateWindow>,
+    expirations: VecDeque<(Instant, RateKey)>,
+}
+
 /// Group-aware, rate-limited server for membership lease RPCs.
 pub struct MembershipLeaseRpcService {
     runtime: MultiGroupRuntime,
-    rate_windows: Mutex<BTreeMap<PubKey, RateWindow>>,
+    rate_limits: Mutex<RateLimitState>,
 }
 
 impl MembershipLeaseRpcService {
@@ -209,7 +217,7 @@ impl MembershipLeaseRpcService {
     pub fn new(runtime: MultiGroupRuntime) -> Self {
         Self {
             runtime,
-            rate_windows: Mutex::new(BTreeMap::new()),
+            rate_limits: Mutex::new(RateLimitState::default()),
         }
     }
 
@@ -244,7 +252,7 @@ impl MembershipLeaseRpcService {
                     request.epoch_hash,
                     request.epoch_nonce,
                 )?;
-                self.claim_rate_limit(request.requester)?;
+                self.claim_rate_limit(routed_group, request.requester)?;
                 MembershipLeaseRpcResponse::Vote(runtime.vote_membership_lease(request.request)?)
             }
             MembershipLeaseRpc::Install(request) => {
@@ -259,7 +267,7 @@ impl MembershipLeaseRpcService {
                     statement.epoch_hash,
                     statement.epoch_nonce.0,
                 )?;
-                self.claim_rate_limit(request.requester)?;
+                self.claim_rate_limit(routed_group, request.requester)?;
                 let view = runtime.install_membership_lease(request.certificate)?;
                 MembershipLeaseRpcResponse::Installed {
                     group_id: view.group_id,
@@ -280,27 +288,44 @@ impl MembershipLeaseRpcService {
         Ok(ApplicationResponse::new(MEMBERSHIP_LEASE_RPC_KIND, payload))
     }
 
-    fn claim_rate_limit(&self, requester: PubKey) -> Result<()> {
+    fn claim_rate_limit(&self, group_id: ConsensusGroupId, requester: PubKey) -> Result<()> {
         let now = Instant::now();
-        let mut windows = self.rate_windows.lock().map_err(|_| {
+        let mut state = self.rate_limits.lock().map_err(|_| {
             BlossomError::ExternalService(
                 "membership lease RPC rate-limit lock is unavailable".to_string(),
             )
         })?;
-        let window = windows.entry(requester).or_insert(RateWindow {
-            started: now,
-            requests: 0,
-        });
-        if now.duration_since(window.started) >= RATE_WINDOW {
-            window.started = now;
-            window.requests = 0;
+        while let Some((started, key)) = state.expirations.front().copied() {
+            if now.duration_since(started) < RATE_WINDOW {
+                break;
+            }
+            state.expirations.pop_front();
+            if state
+                .windows
+                .get(&key)
+                .is_some_and(|window| window.started == started)
+            {
+                state.windows.remove(&key);
+            }
         }
-        if window.requests >= MAX_REQUESTS_PER_WINDOW {
-            return Err(BlossomError::ExternalService(
-                "membership lease RPC requester is rate limited".to_string(),
-            ));
+        let key = (group_id, requester);
+        if let Some(window) = state.windows.get_mut(&key) {
+            if window.requests >= MAX_REQUESTS_PER_WINDOW {
+                return Err(BlossomError::ExternalService(
+                    "membership lease RPC requester is rate limited".to_string(),
+                ));
+            }
+            window.requests = window.requests.saturating_add(1);
+            return Ok(());
         }
-        window.requests = window.requests.saturating_add(1);
+        state.windows.insert(
+            key,
+            RateWindow {
+                started: now,
+                requests: 1,
+            },
+        );
+        state.expirations.push_back((now, key));
         Ok(())
     }
 }
@@ -518,5 +543,52 @@ mod tests {
                 assert!(result.is_err());
             }
         }
+    }
+
+    #[test]
+    fn rate_limits_are_group_scoped_and_expired_windows_are_reclaimed() {
+        let (runtime, keypairs) = runtime();
+        let service = MembershipLeaseRpcService::new(runtime);
+        let requester = keypairs[0].public;
+        let root = ConsensusGroupId::root();
+        let subnet = ConsensusGroupId::named("relay-subnet");
+
+        for _ in 0..MAX_REQUESTS_PER_WINDOW {
+            service
+                .claim_rate_limit(root, requester)
+                .expect("root-group request within the rate limit");
+        }
+        assert!(service.claim_rate_limit(root, requester).is_err());
+        service
+            .claim_rate_limit(subnet, requester)
+            .expect("another group has an independent rate limit");
+
+        let expired = Instant::now()
+            .checked_sub(RATE_WINDOW)
+            .expect("one-second rate window fits in the monotonic clock");
+        {
+            let mut state = service
+                .rate_limits
+                .lock()
+                .expect("rate-limit lock is available");
+            for window in state.windows.values_mut() {
+                window.started = expired;
+            }
+            for (started, _) in &mut state.expirations {
+                *started = expired;
+            }
+        }
+        service
+            .claim_rate_limit(root, requester)
+            .expect("expired entries are reclaimed before admission");
+        assert_eq!(
+            service
+                .rate_limits
+                .lock()
+                .expect("rate-limit lock is available")
+                .windows
+                .len(),
+            1
+        );
     }
 }
