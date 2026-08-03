@@ -71,8 +71,8 @@ use crate::latency_topology::{
 };
 use crate::local_block::LocalBlock;
 use crate::membership::{
-    CommittedMemberOperation, ConsensusNodeRemovalPolicy, MemberOperation,
-    MembershipLeaseCertificate, MembershipLeaseChallenge, MembershipLeaseRequest,
+    CommittedMemberOperation, ConsensusNodeRemovalPolicy, MAX_MEMBERSHIP_LEASE_MILLIS,
+    MemberOperation, MembershipLeaseCertificate, MembershipLeaseChallenge, MembershipLeaseRequest,
     MembershipLeaseStatement, MembershipLeaseVote, RelaySet, VerifiedMembershipView,
 };
 use crate::messages::{MSGKey, Msg};
@@ -149,7 +149,7 @@ pub struct RuntimeConfig {
     /// from verified snapshots so enabling trusted durability cannot alter the
     /// trustless protocol.
     pub trusted_epoch_log_path: Option<PathBuf>,
-    membership_lease_watermarks: BTreeMap<MembershipLeaseChallenge, HashType>,
+    membership_lease_watermarks: BTreeMap<MembershipLeaseChallenge, MembershipLeaseWatermark>,
 }
 
 impl RuntimeConfig {
@@ -236,6 +236,28 @@ impl RuntimeConfig {
                 )?;
             }
         }
+        let fallback_watermark_expiry = now.saturating_add(MAX_MEMBERSHIP_LEASE_MILLIS);
+        let mut watermark_expiries = snapshot
+            .membership_lease_watermark_expiries
+            .into_iter()
+            .collect::<BTreeMap<_, _>>();
+        let membership_lease_watermarks = snapshot
+            .membership_lease_watermarks
+            .into_iter()
+            .map(|(challenge, statement_hash)| {
+                let expires_at_unix_millis = watermark_expiries
+                    .remove(&challenge)
+                    .unwrap_or(fallback_watermark_expiry);
+                (
+                    challenge,
+                    MembershipLeaseWatermark {
+                        statement_hash,
+                        expires_at_unix_millis,
+                    },
+                )
+            })
+            .filter(|(_, watermark)| watermark.expires_at_unix_millis > now)
+            .collect();
         Ok(Self {
             group_id: snapshot.group_id,
             self_node,
@@ -251,7 +273,7 @@ impl RuntimeConfig {
             snapshot_path: None,
             block_store_path: None,
             trusted_epoch_log_path: None,
-            membership_lease_watermarks: snapshot.membership_lease_watermarks.into_iter().collect(),
+            membership_lease_watermarks,
         })
     }
 
@@ -352,7 +374,14 @@ struct RuntimeInner {
     next_telemetry_span_id: AtomicU64,
     epoch_commit_tx: watch::Sender<Nonce>,
     verified_membership_tx: watch::Sender<Arc<VerifiedMembershipView>>,
-    membership_lease_watermarks: Mutex<BTreeMap<MembershipLeaseChallenge, HashType>>,
+    membership_lease_watermarks:
+        Mutex<BTreeMap<MembershipLeaseChallenge, MembershipLeaseWatermark>>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct MembershipLeaseWatermark {
+    statement_hash: HashType,
+    expires_at_unix_millis: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -411,6 +440,13 @@ pub struct RuntimeSnapshotV1 {
     #[serde(default)]
     /// Anti-equivocation watermarks for membership lease challenges.
     pub membership_lease_watermarks: Vec<(MembershipLeaseChallenge, HashType)>,
+    #[serde(default)]
+    /// Absolute expiry for each membership-lease anti-equivocation watermark.
+    ///
+    /// Older version-1 snapshots may omit this additive field. Restoring one
+    /// conservatively retains its watermarks for a complete maximum lease
+    /// lifetime before allowing them to expire.
+    pub membership_lease_watermark_expiries: Vec<(MembershipLeaseChallenge, u64)>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]

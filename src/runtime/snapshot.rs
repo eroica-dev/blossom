@@ -133,6 +133,24 @@ impl RuntimeSnapshotV1 {
                 "snapshot self public key is not in latest verifier set".to_string(),
             ));
         }
+        let watermark_challenges = self
+            .membership_lease_watermarks
+            .iter()
+            .map(|(challenge, _)| *challenge)
+            .collect::<BTreeSet<_>>();
+        let expiry_challenges = self
+            .membership_lease_watermark_expiries
+            .iter()
+            .map(|(challenge, _)| *challenge)
+            .collect::<BTreeSet<_>>();
+        if watermark_challenges.len() != self.membership_lease_watermarks.len()
+            || expiry_challenges.len() != self.membership_lease_watermark_expiries.len()
+            || !expiry_challenges.is_subset(&watermark_challenges)
+        {
+            return Err(BlossomError::WireProtocol(
+                "snapshot membership lease watermarks are duplicated or inconsistent".to_string(),
+            ));
+        }
         Ok(())
     }
 

@@ -58,6 +58,10 @@ const ORDER_VOTE_HASH_DOMAIN: &[u8] = b"blossom/active-active/order-vote/v1";
 const READ_BARRIER_STATEMENT_DOMAIN: &[u8] = b"blossom/active-active/read-barrier-statement/v1";
 const READ_BARRIER_CERTIFICATE_DOMAIN: &[u8] = b"blossom/active-active/read-barrier-certificate/v1";
 const READ_BARRIER_VOTE_HASH_DOMAIN: &[u8] = b"blossom/active-active/read-barrier-vote/v1";
+const COMMITTEE_TRANSITION_STATEMENT_DOMAIN: &[u8] =
+    b"blossom/active-active/committee-transition-statement/v1";
+const COMMITTEE_TRANSITION_CERTIFICATE_DOMAIN: &[u8] =
+    b"blossom/active-active/committee-transition-certificate/v1";
 /// Maximum encoded bytes in one opaque application command.
 pub const MAX_APPLICATION_COMMAND_BYTES: usize = 64 << 20;
 /// Maximum encoded bytes in one opaque application result.
@@ -90,12 +94,14 @@ const APPLIED_COMPLETIONS_TABLE: &str = "active_active_applied_completions_v3";
 const META_TABLE: &str = "active_active_meta_v1";
 const ORDER_VOTES_TABLE: &str = "active_active_order_votes_v1";
 const READ_BARRIER_VOTES_TABLE: &str = "active_active_read_barrier_votes_v1";
+const COMMITTEE_TRANSITION_VOTES_TABLE: &str = "active_active_committee_transition_votes_v1";
 const STORE_IDENTITY_TABLE: &str = "active_active_store_identity_v3";
 const AVAILABLE_REFERENCES_TABLE: &str = "active_active_available_references_v3";
 const FINALIZED_POSITIONS_TABLE: &str = "active_active_finalized_positions_v3";
 const POSITION_REFERENCES_TABLE: &str = "active_active_position_references_v3";
 const ORIGIN_TAILS_TABLE: &str = "active_active_origin_tails_v3";
 const ORDERED_METADATA_TABLE: &str = "active_active_ordered_metadata_v3";
+const COMMITTEE_TRANSITIONS_TABLE: &str = "active_active_committee_transitions_v1";
 const STORE_IDENTITY_KEY: &str = "identity";
 const ORDERED_METADATA_KEY: &str = "metadata";
 const ACTIVE_ACTIVE_STORE_SCHEMA_VERSION: u16 = 3;
@@ -125,6 +131,7 @@ struct DurableOrderedState {
     last_finalized_position: u64,
     last_order_certificate_hash: HashType,
     applied_watermark: Watermark,
+    committee_transitions: BTreeMap<ValidatorGeneration, CommitteeTransitionCertificate>,
 }
 
 #[derive(BorshSerialize, BorshDeserialize, Debug, Clone, PartialEq, Eq)]
@@ -323,6 +330,10 @@ pub struct GlobalOrderedEngine {
     holder_membership: HolderMembership,
     validator_generation: ValidatorGeneration,
     validators: BTreeSet<PubKey>,
+    genesis_holder_membership: HolderMembership,
+    genesis_validator_generation: ValidatorGeneration,
+    genesis_validators: BTreeSet<PubKey>,
+    committee_transitions: BTreeMap<ValidatorGeneration, CommitteeTransitionCertificate>,
     order_trust_mode: TrustMode,
     available: BTreeMap<HashType, AvailabilityCertificate>,
     finalized: BTreeMap<u64, OrderCertificate>,

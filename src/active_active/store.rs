@@ -572,6 +572,52 @@ impl DurableAdmissionStore {
         })
     }
 
+    pub(super) fn sign_committee_transition_statement(
+        &self,
+        statement: &CommitteeTransitionStatement,
+    ) -> Result<CommitteeTransitionVote> {
+        statement.validate()?;
+        let (cluster_id, consensus_group_id) = self.protocol_scope()?.ok_or_else(|| {
+            BlossomError::InvalidConfiguration(
+                "committee transition voting requires a bound protocol scope".to_string(),
+            )
+        })?;
+        if statement.cluster_id != cluster_id || statement.consensus_group_id != consensus_group_id
+        {
+            return Err(BlossomError::InvalidConfiguration(
+                "committee transition vote scope does not match the durable store".to_string(),
+            ));
+        }
+        let statement_bytes = borsh::to_vec(statement).map_err(encode_error)?;
+        let statement_hash =
+            sha256_hash(COMMITTEE_TRANSITION_STATEMENT_DOMAIN, &[&statement_bytes]);
+        let key = statement
+            .previous_validator_generation
+            .0
+            .to_be_bytes()
+            .to_vec();
+        self.transact(|transaction| {
+            if let Some(existing) =
+                transaction.get(COMMITTEE_TRANSITION_VOTES_TABLE, key.as_slice())?
+            {
+                if existing.as_slice() != statement_hash.as_ref() {
+                    return Err(BlossomError::InvalidConfiguration(
+                        "validator already voted for another committee at this generation"
+                            .to_string(),
+                    ));
+                }
+            } else {
+                transaction.insert(
+                    COMMITTEE_TRANSITION_VOTES_TABLE,
+                    key,
+                    statement_hash.as_ref().to_vec(),
+                )?;
+            }
+            Ok(())
+        })?;
+        CommitteeTransitionVote::signed(statement.clone(), &self.signer)
+    }
+
     /// Returns durable milestone events in append order.
     pub fn milestones(&self) -> Result<Vec<MilestoneEvent>> {
         self.store
@@ -742,6 +788,41 @@ impl DurableAdmissionStore {
         })
     }
 
+    pub(super) fn persist_committee_transition(
+        &self,
+        metadata: &DurableOrderedMetadata,
+        certificate: &CommitteeTransitionCertificate,
+    ) -> Result<()> {
+        let metadata_bytes = borsh::to_vec(metadata).map_err(encode_error)?;
+        let certificate_bytes = borsh::to_vec(certificate).map_err(encode_error)?;
+        let generation = certificate
+            .statement
+            .next_validator_generation
+            .0
+            .to_be_bytes()
+            .to_vec();
+        self.transact(|transaction| {
+            if let Some(existing) =
+                transaction.get(COMMITTEE_TRANSITIONS_TABLE, generation.as_slice())?
+            {
+                if existing != certificate_bytes {
+                    return Err(BlossomError::InvalidConfiguration(
+                        "validator generation already commits another committee transition"
+                            .to_string(),
+                    ));
+                }
+            } else {
+                transaction.insert(COMMITTEE_TRANSITIONS_TABLE, generation, certificate_bytes)?;
+            }
+            transaction.insert(
+                ORDERED_METADATA_TABLE,
+                ORDERED_METADATA_KEY.as_bytes().to_vec(),
+                metadata_bytes,
+            )?;
+            Ok(())
+        })
+    }
+
     pub(super) fn load_ordered_state(&self) -> Result<Option<DurableOrderedState>> {
         let Some(metadata_bytes) = self
             .store
@@ -812,6 +893,29 @@ impl DurableAdmissionStore {
                 Ok((origin, tail))
             })
             .collect::<Result<BTreeMap<_, _>>>()?;
+        let committee_transitions = self
+            .store
+            .scan(COMMITTEE_TRANSITIONS_TABLE)?
+            .into_iter()
+            .map(|(generation, value)| {
+                let generation = ValidatorGeneration(decode_u64(
+                    &generation,
+                    "committee transition generation",
+                )?);
+                let certificate = borsh::from_slice::<CommitteeTransitionCertificate>(&value)
+                    .map_err(|error| {
+                        BlossomError::WireProtocol(format!(
+                            "decode committee transition certificate: {error}"
+                        ))
+                    })?;
+                if certificate.statement.next_validator_generation != generation {
+                    return Err(BlossomError::InvalidConfiguration(
+                        "committee transition table key does not match certificate".to_string(),
+                    ));
+                }
+                Ok((generation, certificate))
+            })
+            .collect::<Result<BTreeMap<_, _>>>()?;
         Ok(Some(DurableOrderedState {
             version: metadata.version,
             holder_membership_epoch: metadata.holder_membership_epoch,
@@ -825,6 +929,7 @@ impl DurableAdmissionStore {
             last_finalized_position: metadata.last_finalized_position,
             last_order_certificate_hash: metadata.last_order_certificate_hash,
             applied_watermark: metadata.applied_watermark,
+            committee_transitions,
         }))
     }
 }

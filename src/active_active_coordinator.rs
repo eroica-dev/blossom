@@ -14,9 +14,11 @@ use crate::{
     ActiveActiveCommand, ActiveActiveDurabilityMetrics, ActiveActiveHaCutoverManifest,
     ActiveActiveHaEngine, ActiveActiveHaLifecycleDurabilityMetrics, ActiveActiveHaRecoveryStatus,
     AvailabilityCertificate, BatchReference, BlossomError, CommandBatch, CommandIdentity,
-    CommandSpecVersion, GlobalOrderedEngine, HighAvailabilityRuntime, MilestoneEvent,
-    OrderCertificate, OrderStatement, OrderedApplication, PreparedActiveActiveHaShardBatch,
-    ReferenceStatus, Result, RouteGeneration, Transaction, WaitForOutcome, WriteMode,
+    CommandSpecVersion, CommitteeTransitionActivation, CommitteeTransitionCertificate,
+    CommitteeTransitionStatement, CommitteeTransitionVote, Epoch, GlobalOrderedEngine,
+    HighAvailabilityRuntime, MilestoneEvent, OrderCertificate, OrderStatement, OrderedApplication,
+    PreparedActiveActiveHaShardBatch, ReferenceStatus, Result, RouteGeneration, Transaction,
+    WaitForOutcome, WriteMode,
 };
 
 /// Process-local inspection of both durable halves of the active-active path.
@@ -79,6 +81,33 @@ impl ActiveActiveGlobalCoordinator {
         &self.ordered
     }
 
+    /// Atomically installs an old-validator-certified holder and validator
+    /// replacement at the current globally-applied boundary.
+    pub fn activate_committee_transition(
+        &mut self,
+        certificate: CommitteeTransitionCertificate,
+    ) -> Result<CommitteeTransitionActivation> {
+        self.ordered.activate_committee_transition(certificate)
+    }
+
+    /// Durably signs this node's one old-committee transition vote.
+    pub fn sign_committee_transition(
+        &self,
+        statement: &CommitteeTransitionStatement,
+    ) -> Result<CommitteeTransitionVote> {
+        self.ordered.sign_committee_transition(statement)
+    }
+
+    /// Persists one referenced batch through the coordinator-owned ordered
+    /// store and returns this holder's signed admission receipt.
+    pub fn store_batch(
+        &self,
+        reference: &BatchReference,
+        batch: &CommandBatch,
+    ) -> Result<crate::AuthenticatedAvailabilityReceipt> {
+        self.ordered.store_batch(reference, batch)
+    }
+
     /// Installs portable validator-signed finality without exposing unsafe
     /// independent application-contract activation.
     pub fn finalize(&mut self, certificate: OrderCertificate) -> Result<MilestoneEvent> {
@@ -89,6 +118,15 @@ impl ActiveActiveGlobalCoordinator {
     /// application-contract activation.
     pub fn finalize_trusted(&mut self, statement: OrderStatement) -> Result<MilestoneEvent> {
         self.ordered.finalize_trusted(statement)
+    }
+
+    /// Installs every active-active reference in one trusted, already
+    /// committed Blossom epoch.
+    ///
+    /// The ordered engine still validates the epoch's exact validator set,
+    /// reference availability, origin chains, and application contract.
+    pub fn finalize_trusted_epoch(&mut self, epoch: &Epoch) -> Result<Vec<MilestoneEvent>> {
+        self.ordered.finalize_trusted_epoch(epoch)
     }
 
     /// Mutably borrows the underlying HA protocol runtime.

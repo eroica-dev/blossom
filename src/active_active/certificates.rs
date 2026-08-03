@@ -388,7 +388,7 @@ impl AvailabilityTrust {
     }
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, BorshSerialize, BorshDeserialize, Debug, Clone, PartialEq, Eq)]
 /// Frozen three-site holder membership and durable store generations.
 pub struct HolderMembership {
     /// Holder membership generation.
@@ -432,6 +432,186 @@ impl HolderMembership {
             ));
         }
         Ok(())
+    }
+}
+
+#[derive(Serialize, Deserialize, BorshSerialize, BorshDeserialize, Debug, Clone, PartialEq, Eq)]
+/// Old-committee-authorized replacement of holders and ordering validators.
+pub struct CommitteeTransitionStatement {
+    /// Application cluster whose ordered stream changes committee.
+    pub cluster_id: HashType,
+    /// Blossom consensus group whose ordered stream changes committee.
+    pub consensus_group_id: ConsensusGroupId,
+    /// Holder membership epoch authorizing the transition.
+    pub previous_holder_membership_epoch: ReplicaMembershipEpoch,
+    /// Validator generation whose signatures authorize the transition.
+    pub previous_validator_generation: ValidatorGeneration,
+    /// Complete next holder membership.
+    pub next_holder_membership: HolderMembership,
+    /// Next validator generation.
+    pub next_validator_generation: ValidatorGeneration,
+    /// Complete next validator keys.
+    pub next_validators: BTreeSet<PubKey>,
+    /// Globally applied boundary at which activation is safe.
+    pub activated_at: Watermark,
+    /// Order-certificate hash at the activation boundary.
+    pub order_certificate_hash: HashType,
+}
+
+impl CommitteeTransitionStatement {
+    /// Validates monotonic generations, bounded validators, and holder shape.
+    pub fn validate(&self) -> Result<()> {
+        self.next_holder_membership.validate()?;
+        if self.cluster_id == HashType::default()
+            || self.next_holder_membership.epoch.0
+                != self
+                    .previous_holder_membership_epoch
+                    .0
+                    .checked_add(1)
+                    .ok_or_else(|| {
+                        BlossomError::InvalidConfiguration(
+                            "holder membership epoch overflow".to_string(),
+                        )
+                    })?
+            || self.next_validator_generation.0
+                != self
+                    .previous_validator_generation
+                    .0
+                    .checked_add(1)
+                    .ok_or_else(|| {
+                        BlossomError::InvalidConfiguration(
+                            "validator generation overflow".to_string(),
+                        )
+                    })?
+            || self.next_validators.is_empty()
+            || self.next_validators.len() > MAX_REFERENCES_PER_ORDERING_WINDOW
+            || (self.activated_at == Watermark::default())
+                != (self.order_certificate_hash == HashType::default())
+        {
+            return Err(BlossomError::InvalidConfiguration(
+                "committee transition generations, scope, boundary, or validators are invalid"
+                    .to_string(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Serialize, Deserialize, BorshSerialize, BorshDeserialize, Debug, Clone, PartialEq, Eq)]
+/// One old validator's signature authorizing an exact committee transition.
+pub struct CommitteeTransitionVote {
+    /// Transition statement shared by every signer.
+    pub statement: CommitteeTransitionStatement,
+    /// Current validator signing the replacement.
+    pub validator: PubKey,
+    /// Domain-separated signature.
+    pub signature: Signature,
+}
+
+impl CommitteeTransitionVote {
+    /// Signs an exact transition with one current validator.
+    pub(super) fn signed(
+        statement: CommitteeTransitionStatement,
+        signer: &SecretSigner,
+    ) -> Result<Self> {
+        statement.validate()?;
+        let validator = signer.public_key();
+        let signature = signer.sign(&CommitteeTransitionCertificate::signing_bytes(&statement)?);
+        Ok(Self {
+            statement,
+            validator,
+            signature,
+        })
+    }
+
+    /// Verifies the vote's signature and statement shape.
+    pub fn verify(&self) -> Result<()> {
+        self.statement.validate()?;
+        self.signature.verify(
+            &CommitteeTransitionCertificate::signing_bytes(&self.statement)?,
+            &self.validator,
+        )
+    }
+}
+
+#[derive(Serialize, Deserialize, BorshSerialize, BorshDeserialize, Debug, Clone, PartialEq, Eq)]
+/// Current-validator supermajority certificate for one committee replacement.
+pub struct CommitteeTransitionCertificate {
+    /// Exact replacement statement.
+    pub statement: CommitteeTransitionStatement,
+    /// Distinct signatures from the old validator committee.
+    pub signatures: BTreeMap<PubKey, Signature>,
+}
+
+impl CommitteeTransitionCertificate {
+    /// Returns the domain-separated bytes validators sign.
+    pub fn signing_bytes(statement: &CommitteeTransitionStatement) -> Result<Vec<u8>> {
+        signed_body_bytes(COMMITTEE_TRANSITION_STATEMENT_DOMAIN, statement)
+    }
+
+    /// Builds a certificate from distinct votes over identical bytes.
+    pub fn from_votes(
+        statement: CommitteeTransitionStatement,
+        votes: impl IntoIterator<Item = CommitteeTransitionVote>,
+    ) -> Result<Self> {
+        statement.validate()?;
+        let mut signatures = BTreeMap::new();
+        for vote in votes {
+            if vote.statement != statement {
+                return Err(BlossomError::InvalidConfiguration(
+                    "committee transition vote does not match the certificate statement"
+                        .to_string(),
+                ));
+            }
+            vote.verify()?;
+            if signatures.insert(vote.validator, vote.signature).is_some() {
+                return Err(BlossomError::InvalidConfiguration(
+                    "duplicate committee transition signer".to_string(),
+                ));
+            }
+        }
+        Ok(Self {
+            statement,
+            signatures,
+        })
+    }
+
+    /// Verifies scope, exact old generations, and an old-validator supermajority.
+    pub fn verify(
+        &self,
+        cluster_id: HashType,
+        consensus_group_id: ConsensusGroupId,
+        holder_membership: &HolderMembership,
+        validator_generation: ValidatorGeneration,
+        validators: &BTreeSet<PubKey>,
+    ) -> Result<()> {
+        self.statement.validate()?;
+        if self.statement.cluster_id != cluster_id
+            || self.statement.consensus_group_id != consensus_group_id
+            || self.statement.previous_holder_membership_epoch != holder_membership.epoch
+            || self.statement.previous_validator_generation != validator_generation
+            || self.signatures.len() > validators.len()
+        {
+            return Err(BlossomError::FailedConsensus);
+        }
+        let message = Self::signing_bytes(&self.statement)?;
+        let mut valid = 0usize;
+        for (validator, signature) in &self.signatures {
+            if !validators.contains(validator) {
+                return Err(BlossomError::UnknownSender);
+            }
+            signature.verify(&message, validator)?;
+            valid += 1;
+        }
+        if !has_supermajority(validators.len(), valid) {
+            return Err(BlossomError::FailedConsensus);
+        }
+        Ok(())
+    }
+
+    /// Computes the durable chain identity of this replacement.
+    pub fn hash(&self) -> Result<HashType> {
+        hash_borsh(COMMITTEE_TRANSITION_CERTIFICATE_DOMAIN, self)
     }
 }
 
@@ -947,4 +1127,21 @@ pub struct ApplicationContractActivation {
     pub command_spec_version: CommandSpecVersion,
     /// Applied boundary at which both generations changed.
     pub activated_at: Watermark,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+/// Durable result of one certified holder and validator replacement.
+pub struct CommitteeTransitionActivation {
+    /// Holder generation active before replacement.
+    pub previous_holder_membership_epoch: ReplicaMembershipEpoch,
+    /// Holder generation active after replacement.
+    pub holder_membership_epoch: ReplicaMembershipEpoch,
+    /// Validator generation active before replacement.
+    pub previous_validator_generation: ValidatorGeneration,
+    /// Validator generation active after replacement.
+    pub validator_generation: ValidatorGeneration,
+    /// Globally applied boundary at which the replacement became active.
+    pub activated_at: Watermark,
+    /// Hash of the durably installed transition certificate.
+    pub transition_hash: HashType,
 }

@@ -505,3 +505,51 @@ async fn multi_group_node_routes_grouped_requests_to_subnets() {
         Err(BlossomError::WireProtocol(message)) if message.contains("unknown consensus group")
     ));
 }
+
+#[tokio::test]
+async fn group_scoped_service_client_uses_one_multi_group_listener() {
+    let keypairs = (0..4).map(|_| Keypair::generate()).collect::<Vec<_>>();
+    let identities = keypairs
+        .iter()
+        .enumerate()
+        .map(|(index, keypair)| {
+            NodeIdentity::new(
+                keypair.public,
+                Some(keypair.secret.clone()),
+                "tcp",
+                "127.0.0.1",
+                19_000 + index as u16,
+                false,
+            )
+        })
+        .collect::<Vec<_>>();
+    let root_genesis = genesis_epoch(identities.clone());
+    let subnet_id = ConsensusGroupId::named("scoped-client-subnet");
+    let subnet_genesis = genesis_epoch_for_group(subnet_id, identities.clone());
+    let mut root_config = RuntimeConfig::new(identities[0].clone());
+    root_config.genesis = Some(root_genesis);
+    let mut subnet_config = RuntimeConfig::for_group(identities[0].clone(), subnet_id);
+    subnet_config.genesis = Some(subnet_genesis);
+    let node = TcpMultiGroupNode::new(MultiGroupRuntime::with_groups(
+        NodeRuntime::new(root_config),
+        [NodeRuntime::new(subnet_config)],
+    ));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(node.serve(listener));
+    let service = Service::new(
+        ServiceKind::Consensus,
+        keypairs[0].public,
+        "tcp",
+        address.ip().to_string(),
+        address.port(),
+    );
+    let pong = TcpServiceClient::new()
+        .for_group(subnet_id)
+        .ping(&service, crate::NodePing::new(91))
+        .await
+        .unwrap();
+    assert_eq!(pong.group_id, subnet_id);
+    assert_eq!(pong.nonce, 91);
+    server.abort();
+}

@@ -140,6 +140,10 @@ fn overlay_mode_rejects_consensus_entrypoints() {
         Err(BlossomError::WireProtocol(error)) if error.contains("consensus runtime mode")
     ));
     assert!(matches!(
+        runtime.submit_transaction(crate::Transaction::new("v1:transaction")),
+        Err(BlossomError::WireProtocol(error)) if error.contains("consensus runtime mode")
+    ));
+    assert!(matches!(
         runtime.receive_message(Msg::Ok),
         Err(BlossomError::WireProtocol(error)) if error.contains("consensus runtime mode")
     ));

@@ -30,6 +30,8 @@ pub type ApplicationHandler =
     Arc<dyn Fn(ApplicationRequest) -> ApplicationHandlerFuture + Send + Sync>;
 pub type ApplicationHandlerFuture =
     Pin<Box<dyn Future<Output = Result<ApplicationResponse>> + Send>>;
+pub type MultiGroupApplicationHandler =
+    Arc<dyn Fn(ConsensusGroupId, ApplicationRequest) -> ApplicationHandlerFuture + Send + Sync>;
 
 #[derive(Clone)]
 pub struct TcpNode {
@@ -838,6 +840,7 @@ fn counter_add_u128(counter: &Counter, value: u128) {
 pub struct TcpMultiGroupNode {
     pub runtime: MultiGroupRuntime,
     pub services: TcpServiceClient,
+    application_handler: Option<MultiGroupApplicationHandler>,
 }
 
 impl TcpMultiGroupNode {
@@ -845,11 +848,45 @@ impl TcpMultiGroupNode {
         Self {
             runtime,
             services: TcpServiceClient::new(),
+            application_handler: None,
         }
     }
 
     pub fn with_services(runtime: MultiGroupRuntime, services: TcpServiceClient) -> Self {
-        Self { runtime, services }
+        Self {
+            runtime,
+            services,
+            application_handler: None,
+        }
+    }
+
+    pub fn with_application_handler(
+        runtime: MultiGroupRuntime,
+        handler: impl Fn(ConsensusGroupId, ApplicationRequest) -> ApplicationHandlerFuture
+        + Send
+        + Sync
+        + 'static,
+    ) -> Self {
+        Self {
+            runtime,
+            services: TcpServiceClient::new(),
+            application_handler: Some(Arc::new(handler)),
+        }
+    }
+
+    pub fn with_services_and_application_handler(
+        runtime: MultiGroupRuntime,
+        services: TcpServiceClient,
+        handler: impl Fn(ConsensusGroupId, ApplicationRequest) -> ApplicationHandlerFuture
+        + Send
+        + Sync
+        + 'static,
+    ) -> Self {
+        Self {
+            runtime,
+            services,
+            application_handler: Some(Arc::new(handler)),
+        }
     }
 
     pub async fn serve(self, listener: TcpListener) -> Result<()> {
@@ -907,7 +944,28 @@ impl TcpMultiGroupNode {
                     .runtime
                     .group(&group_id)
                     .ok_or_else(|| unknown_group(group_id))?;
-                handle_runtime_request(&runtime, &self.services, *request).await
+                match *request {
+                    WireRequest::Application(request) => {
+                        let handler = self.application_handler.as_ref().ok_or_else(|| {
+                            BlossomError::WireProtocol(
+                                "application requests are not configured on this multi-group node"
+                                    .to_string(),
+                            )
+                        })?;
+                        Ok(WireResponse::Application(handler(group_id, request).await?))
+                    }
+                    request => handle_runtime_request(&runtime, &self.services, request).await,
+                }
+            }
+            WireRequest::Application(request) => {
+                let group_id = self.runtime.root_group();
+                let handler = self.application_handler.as_ref().ok_or_else(|| {
+                    BlossomError::WireProtocol(
+                        "application requests are not configured on this multi-group node"
+                            .to_string(),
+                    )
+                })?;
+                Ok(WireResponse::Application(handler(group_id, request).await?))
             }
             request => {
                 let runtime = self.runtime.root_runtime();
