@@ -531,6 +531,60 @@ async fn autonomous_tcp_driver_advances_all_nodes_through_epoch() {
     assert_eq!(block_count, 6);
 }
 
+#[tokio::test]
+async fn autonomous_tcp_driver_finalizes_small_committees() {
+    let _large_tcp_test_guard = LARGE_TCP_TEST_LOCK.lock().await;
+
+    for committee_size in [3, 5] {
+        let cluster = SimulatedCluster::spawn_manual_with_trust_mode_and_quorum(
+            committee_size,
+            TrustMode::Verified,
+            QuorumSize::DEFAULT,
+        )
+        .await
+        .unwrap();
+        let first_target = cluster.next_target(0).await.unwrap();
+
+        for index in 0..cluster.len() {
+            let block = cluster
+                .signed_block_for(
+                    index,
+                    index,
+                    [Transaction::new(format!(
+                        "small-committee-{committee_size}-{index}"
+                    ))],
+                )
+                .await
+                .unwrap();
+            match cluster
+                .request(index, WireRequest::SubmitBlock(block))
+                .await
+                .unwrap()
+            {
+                WireResponse::BlockAccepted(accepted) => {
+                    assert_eq!(accepted.nonce, first_target.nonce);
+                }
+                response => panic!("expected block accepted, got {}", response.kind()),
+            }
+        }
+
+        let mut drivers = start_consensus_drivers(
+            &cluster,
+            ConsensusDriverConfig {
+                interval: std::time::Duration::from_millis(25),
+                ..ConsensusDriverConfig::default()
+            },
+        );
+        let timeout_secs = if cfg!(debug_assertions) { 30 } else { 8 };
+        let (final_hash, block_count) =
+            wait_for_same_finalized_epoch(&cluster, first_target.nonce, timeout_secs, &mut drivers)
+                .await
+                .unwrap();
+        assert_ne!(final_hash, first_target.last_epoch);
+        assert_eq!(block_count, committee_size);
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn autonomous_tcp_driver_finalizes_36_node_v2_two_round_epoch() {
     let _large_tcp_test_guard = LARGE_TCP_TEST_LOCK.lock().await;

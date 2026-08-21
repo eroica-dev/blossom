@@ -658,7 +658,9 @@ impl TcpNode {
         targets: Vec<Service>,
         msg: Msg,
     ) -> Result<BroadcastReport> {
-        let frame = EncodedFrame::encode_wire_request(&WireRequest::Message(msg))?;
+        let frame = self
+            .services
+            .encode_request_frame(&WireRequest::Message(msg))?;
         let mut handles = Vec::with_capacity(targets.len());
         for service in targets {
             let client = self.services.clone();

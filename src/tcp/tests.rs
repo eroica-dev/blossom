@@ -553,3 +553,24 @@ async fn group_scoped_service_client_uses_one_multi_group_listener() {
     assert_eq!(pong.nonce, 91);
     server.abort();
 }
+
+#[test]
+fn group_scoped_service_client_retains_group_in_preencoded_consensus_frames() {
+    let group_id = ConsensusGroupId::named("preencoded-consensus-subnet");
+    let frame = TcpServiceClient::new()
+        .for_group(group_id)
+        .encode_request_frame(&WireRequest::Message(Msg::Ok))
+        .unwrap();
+    let request = crate::wire::decode_wire_request_payload(
+        &frame.as_bytes()[crate::wire::FRAME_PREFIX_BYTES..],
+    )
+    .unwrap();
+
+    assert!(matches!(
+        request,
+        WireRequest::Group {
+            group_id: actual,
+            request,
+        } if actual == group_id && matches!(*request, WireRequest::Message(Msg::Ok))
+    ));
+}
