@@ -85,6 +85,12 @@ per-recipient hint retries, exact dispatch replay after transient rejection,
 exact prefill replay and writer-payload inclusion, certified-suffix
 installation, and bounded manual-driver dissemination.
 
+The request-driven TCP regression uses the production combination of
+event-driven wakeups and the local-pending-block gate for 3-, 5-, and
+7-validator committees. It requires every validator to install the same
+certified epoch, then proves idle ticks do not dispatch a follow-on empty epoch.
+This distinguishes quorum request completion from eventual all-member recovery.
+
 The focused HA gate also includes 1,001+ epoch durability tests, authenticated
 subprocess kill/restart, ENOSPC and fsync atomicity, and Hegel properties:
 
