@@ -63,7 +63,8 @@ pub struct ConsensusDriverConfig {
     ///
     /// This is useful for request-driven deployments and benchmarks that must
     /// not create empty epochs while idle. The compatibility default remains
-    /// `false`.
+    /// `false`. Certified epoch announcement and catch-up remain eligible
+    /// after a local epoch commits because they cannot initiate another epoch.
     pub require_local_pending_block: bool,
     /// Keep serving and retry the next driver tick after a transient error.
     ///
@@ -205,29 +206,65 @@ impl TcpNode {
     pub async fn run_consensus_driver(self, config: ConsensusDriverConfig) -> Result<()> {
         let mut interval = tokio::time::interval(config.interval);
         let mut active_nonce = None;
+        // A gated driver performs one recovery assessment on startup. Later
+        // event-driven assessments run on protocol or epoch progress and
+        // remain active only while announcement/catch-up reports work. A
+        // polling driver has no notification wakeup, so it assesses recovery
+        // on its configured interval.
+        let mut drive_epoch_dissemination = config.require_local_pending_block;
+        let mut observed_next_nonce = None;
         interval.tick().await;
         loop {
-            if config.event_driven {
+            let notified = if config.event_driven {
                 tokio::select! {
-                    _ = interval.tick() => {}
-                    _ = self.driver_notify.notified() => {}
+                    _ = interval.tick() => false,
+                    _ = self.driver_notify.notified() => true,
                 }
             } else {
                 interval.tick().await;
+                false
+            };
+            if config.require_local_pending_block && (notified || !config.event_driven) {
+                drive_epoch_dissemination = true;
             }
-            if config.require_local_pending_block {
+            let drive_result = if config.require_local_pending_block {
                 let status = self.runtime.status()?;
+                if observed_next_nonce.is_some_and(|nonce| nonce != status.next_nonce) {
+                    drive_epoch_dissemination = true;
+                }
+                observed_next_nonce = Some(status.next_nonce);
                 if active_nonce.is_some_and(|nonce| nonce != status.next_nonce) {
                     active_nonce = None;
                 }
                 if active_nonce.is_none() {
                     if status.pending_blocks == 0 {
-                        continue;
+                        if !drive_epoch_dissemination {
+                            continue;
+                        }
+                        match self.runtime.epoch_started_catch_up_services() {
+                            Ok(catch_up_peers) => {
+                                let catch_up_pending = !catch_up_peers.is_empty();
+                                let result = self.drive_epoch_dissemination_once().await;
+                                if let Ok(tick) = &result {
+                                    drive_epoch_dissemination = catch_up_pending
+                                        || tick.epoch_started_broadcasts != 0
+                                        || tick.catch_up_updates != 0;
+                                }
+                                result
+                            }
+                            Err(error) => Err(error),
+                        }
+                    } else {
+                        active_nonce = Some(status.next_nonce);
+                        self.drive_consensus_once(&config).await
                     }
-                    active_nonce = Some(status.next_nonce);
+                } else {
+                    self.drive_consensus_once(&config).await
                 }
-            }
-            if let Err(error) = self.drive_consensus_once(&config).await {
+            } else {
+                self.drive_consensus_once(&config).await
+            };
+            if let Err(error) = drive_result {
                 if config.continue_after_error {
                     self.runtime.emit_telemetry_failure(
                         "service",
@@ -658,7 +695,9 @@ impl TcpNode {
         targets: Vec<Service>,
         msg: Msg,
     ) -> Result<BroadcastReport> {
-        let frame = EncodedFrame::encode_wire_request(&WireRequest::Message(msg))?;
+        let frame = self
+            .services
+            .encode_request_frame(&WireRequest::Message(msg))?;
         let mut handles = Vec::with_capacity(targets.len());
         for service in targets {
             let client = self.services.clone();

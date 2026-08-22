@@ -244,6 +244,14 @@ where
         None => return Vec::new(),
     };
 
+    if node_map.len() <= quorum_size.get() {
+        let mut quorum = (0..node_map.len())
+            .filter_map(|index| node_map.get_key_from_index(index).copied())
+            .collect::<Vec<_>>();
+        quorum.sort_unstable();
+        return vec![quorum];
+    }
+
     let (optimal_network_size, rounds) = find_round_number_with_size(node_map.len(), quorum_size);
     if optimal_network_size == 0 || rounds == 0 {
         return Vec::new();
@@ -617,6 +625,33 @@ mod tests {
                     .iter()
                     .all(|quorum| quorum.len() <= quorum_size.get() * 2)
             );
+        }
+    }
+
+    #[test]
+    fn committees_within_configured_quorum_select_every_member() {
+        let quorum_size = QuorumSize::DEFAULT;
+        let seed = HashType::hash(b"small-committee-quorum");
+
+        for node_count in [3_u8, 5, 6] {
+            let nodes = (0..node_count).map(key).collect::<Vec<_>>();
+            let mut expected = nodes.clone();
+            expected.sort_unstable();
+
+            for self_key in &nodes {
+                for shuffle in [false, true] {
+                    assert_eq!(
+                        select_quorums_with_size(
+                            nodes.iter().copied(),
+                            self_key,
+                            seed,
+                            shuffle,
+                            quorum_size,
+                        ),
+                        vec![expected.clone()]
+                    );
+                }
+            }
         }
     }
 

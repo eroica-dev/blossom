@@ -16,11 +16,12 @@ use crate::availability::{
 use crate::block::Block;
 use crate::error::{BlossomError, Result};
 use crate::group::ConsensusGroupId;
+use crate::messages::Msg;
 use crate::nonce::Nonce;
 use crate::tcp::TcpConnection;
 use crate::wire::{
     ApplicationRequest, ApplicationResponse, EncodedFrame, NodePing, NodePong, WireRequest,
-    WireResponse,
+    WireResponse, hot_wire_codec_enabled,
 };
 
 const CONNECT_ATTEMPTS: usize = 4;
@@ -91,23 +92,35 @@ impl TcpServiceClient {
     }
 
     pub async fn request(&self, service: &Service, request: &WireRequest) -> Result<WireResponse> {
-        let grouped;
-        let request = if let Some(group_id) = self.group_id {
-            if matches!(request, WireRequest::Group { .. }) {
-                return Err(BlossomError::WireProtocol(
-                    "a group-routed TCP client cannot wrap an already grouped request".to_string(),
-                ));
-            }
-            grouped = WireRequest::Group {
-                group_id,
-                request: Box::new(request.clone()),
-            };
-            &grouped
-        } else {
-            request
-        };
-        let frame = EncodedFrame::encode_wire_request(request)?;
+        let frame = self.encode_request_frame(request)?;
         self.request_frame(service, &frame).await
+    }
+
+    /// Encodes a request with this client's shared-listener group routing.
+    ///
+    /// Hot dispatch remains unwrapped because the multi-group listener routes
+    /// that specialized frame by its parent epoch. Every ordinary consensus
+    /// message must retain the explicit group envelope, including frames that
+    /// callers encode once before concurrent broadcast.
+    pub(crate) fn encode_request_frame(&self, request: &WireRequest) -> Result<EncodedFrame> {
+        if self.group_id.is_some()
+            && hot_wire_codec_enabled()
+            && matches!(request, WireRequest::Message(Msg::Dispatch(_)))
+        {
+            return EncodedFrame::encode_wire_request(request);
+        }
+        let Some(group_id) = self.group_id else {
+            return EncodedFrame::encode_wire_request(request);
+        };
+        if matches!(request, WireRequest::Group { .. }) {
+            return Err(BlossomError::WireProtocol(
+                "a group-routed TCP client cannot wrap an already grouped request".to_string(),
+            ));
+        }
+        EncodedFrame::encode_wire_request(&WireRequest::Group {
+            group_id,
+            request: Box::new(request.clone()),
+        })
     }
 
     pub async fn request_frame(

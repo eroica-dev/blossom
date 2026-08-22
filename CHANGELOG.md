@@ -22,6 +22,11 @@ public Rust APIs and separately versions consensus and durable wire formats.
 
 ### Fixed
 
+- Request-driven consensus drivers now continue certified epoch announcement
+  and catch-up after consuming their local block without allowing idle interval
+  ticks to dispatch empty epochs, and retain retries while an authenticated
+  newer-head hint remains unresolved. Three-, five-, and seven-validator TCP
+  regressions require eventual all-member convergence behind the same gate.
 - Membership-lease anti-equivocation and RPC rate-limit state now expires and
   is reclaimed instead of growing for the lifetime of the process. Snapshot
   restoration remains backward compatible and conservatively ages legacy

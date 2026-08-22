@@ -44,6 +44,13 @@ coverage.
 
 ## Production Notes
 
+Request-driven TCP deployments can set `require_local_pending_block` to avoid
+initiating empty epochs. The same driver still handles certified epoch
+announcement and catch-up after a commit, on a state-changing protocol wakeup,
+while a failed announcement remains retryable, or while an authenticated
+newer-head hint still needs catch-up. Those recovery-only ticks do not enter
+dispatch and therefore cannot create another epoch.
+
 Before public trustless deployment, operators should add deployment-specific key
 management, monitoring, alerting, public-join abuse controls, and multi-host
 soak testing.
