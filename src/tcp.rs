@@ -241,12 +241,19 @@ impl TcpNode {
                         if !drive_epoch_dissemination {
                             continue;
                         }
-                        let result = self.drive_epoch_dissemination_once().await;
-                        if let Ok(tick) = &result {
-                            drive_epoch_dissemination =
-                                tick.epoch_started_broadcasts != 0 || tick.catch_up_updates != 0;
+                        match self.runtime.epoch_started_catch_up_services() {
+                            Ok(catch_up_peers) => {
+                                let catch_up_pending = !catch_up_peers.is_empty();
+                                let result = self.drive_epoch_dissemination_once().await;
+                                if let Ok(tick) = &result {
+                                    drive_epoch_dissemination = catch_up_pending
+                                        || tick.epoch_started_broadcasts != 0
+                                        || tick.catch_up_updates != 0;
+                                }
+                                result
+                            }
+                            Err(error) => Err(error),
                         }
-                        result
                     } else {
                         active_nonce = Some(status.next_nonce);
                         self.drive_consensus_once(&config).await
