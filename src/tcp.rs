@@ -207,9 +207,10 @@ impl TcpNode {
         let mut interval = tokio::time::interval(config.interval);
         let mut active_nonce = None;
         // A gated driver performs one recovery assessment on startup. Later
-        // assessments are event- or epoch-driven and remain active only while
-        // an announcement/catch-up action reports work. This avoids polling
-        // the recovery path on every idle interval tick.
+        // event-driven assessments run on protocol or epoch progress and
+        // remain active only while announcement/catch-up reports work. A
+        // polling driver has no notification wakeup, so it assesses recovery
+        // on its configured interval.
         let mut drive_epoch_dissemination = config.require_local_pending_block;
         let mut observed_next_nonce = None;
         interval.tick().await;
@@ -223,7 +224,7 @@ impl TcpNode {
                 interval.tick().await;
                 false
             };
-            if notified && config.require_local_pending_block {
+            if config.require_local_pending_block && (notified || !config.event_driven) {
                 drive_epoch_dissemination = true;
             }
             let drive_result = if config.require_local_pending_block {
