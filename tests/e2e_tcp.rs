@@ -523,19 +523,24 @@ async fn autonomous_tcp_driver_advances_all_nodes_through_epoch() {
         },
     );
     let timeout_secs = if cfg!(debug_assertions) { 30 } else { 8 };
-    let (final_hash, block_count) =
-        wait_for_same_finalized_epoch(&cluster, first_target.nonce, timeout_secs, &mut drivers)
-            .await
-            .unwrap();
+    let (final_hash, block_count) = wait_for_same_finalized_epoch(
+        &cluster,
+        first_target.nonce,
+        cluster.len(),
+        timeout_secs,
+        &mut drivers,
+    )
+    .await
+    .unwrap();
     assert_ne!(final_hash, first_target.last_epoch);
     assert_eq!(block_count, 6);
 }
 
 #[tokio::test]
-async fn autonomous_tcp_driver_finalizes_small_committees() {
+async fn request_driven_tcp_driver_converges_small_committees() {
     let _large_tcp_test_guard = LARGE_TCP_TEST_LOCK.lock().await;
 
-    for committee_size in [3, 5] {
+    for committee_size in [3, 5, 7] {
         let cluster = SimulatedCluster::spawn_manual_with_trust_mode_and_quorum(
             committee_size,
             TrustMode::Verified,
@@ -572,16 +577,36 @@ async fn autonomous_tcp_driver_finalizes_small_committees() {
             &cluster,
             ConsensusDriverConfig {
                 interval: std::time::Duration::from_millis(25),
+                event_driven: true,
+                require_local_pending_block: true,
+                continue_after_error: true,
                 ..ConsensusDriverConfig::default()
             },
         );
         let timeout_secs = if cfg!(debug_assertions) { 30 } else { 8 };
-        let (final_hash, block_count) =
-            wait_for_same_finalized_epoch(&cluster, first_target.nonce, timeout_secs, &mut drivers)
-                .await
-                .unwrap();
+        let (final_hash, block_count) = wait_for_same_finalized_epoch(
+            &cluster,
+            first_target.nonce,
+            committee_size,
+            timeout_secs,
+            &mut drivers,
+        )
+        .await
+        .unwrap();
         assert_ne!(final_hash, first_target.last_epoch);
         assert_eq!(block_count, committee_size);
+
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        for index in 0..cluster.len() {
+            match cluster.request(index, WireRequest::State).await.unwrap() {
+                WireResponse::State(state) => {
+                    assert_eq!(state.last_epoch_nonce, first_target.nonce);
+                    assert_eq!(state.next_nonce, Nonce::new(2));
+                    assert_eq!(state.pending_blocks, 0);
+                }
+                response => panic!("expected state, got {}", response.kind()),
+            }
+        }
     }
 }
 
@@ -631,10 +656,15 @@ async fn autonomous_tcp_driver_finalizes_36_node_v2_two_round_epoch() {
         },
     );
     let timeout_secs = if cfg!(debug_assertions) { 240 } else { 8 };
-    let (_final_hash, block_count) =
-        wait_for_same_finalized_epoch(&cluster, first_target.nonce, timeout_secs, &mut drivers)
-            .await
-            .unwrap();
+    let (_final_hash, block_count) = wait_for_same_finalized_epoch(
+        &cluster,
+        first_target.nonce,
+        supermajority_count(cluster.len()),
+        timeout_secs,
+        &mut drivers,
+    )
+    .await
+    .unwrap();
     assert_eq!(block_count, 36);
 }
 
@@ -684,10 +714,15 @@ async fn autonomous_tcp_driver_finalizes_24_node_non_power_topology_epoch() {
         },
     );
     let timeout_secs = if cfg!(debug_assertions) { 120 } else { 8 };
-    let (_final_hash, block_count) =
-        wait_for_same_finalized_epoch(&cluster, first_target.nonce, timeout_secs, &mut drivers)
-            .await
-            .unwrap();
+    let (_final_hash, block_count) = wait_for_same_finalized_epoch(
+        &cluster,
+        first_target.nonce,
+        supermajority_count(cluster.len()),
+        timeout_secs,
+        &mut drivers,
+    )
+    .await
+    .unwrap();
     assert_eq!(block_count, 24);
 }
 
@@ -1300,6 +1335,7 @@ fn consensus_messages_for_round(
 async fn wait_for_same_finalized_epoch(
     cluster: &SimulatedCluster,
     nonce: Nonce,
+    required_finalized_nodes: usize,
     timeout_secs: u64,
     drivers: &mut ConsensusDriverTasks,
 ) -> blossom::Result<(HashType, usize)> {
@@ -1340,7 +1376,7 @@ async fn wait_for_same_finalized_epoch(
                 }
             }
         }
-        if finalized_nodes >= supermajority_count(cluster.len())
+        if finalized_nodes >= required_finalized_nodes
             && final_hashes.len() == 1
             && block_counts.len() == 1
         {
@@ -1365,8 +1401,9 @@ async fn wait_for_same_finalized_epoch(
                 })
                 .collect::<Vec<_>>();
             return Err(blossom::BlossomError::WireProtocol(format!(
-                "cluster did not finalize the same epoch before deadline: finalized_nodes={}, unique_hashes={}, block_counts={:?}, catch_up_hints={catch_up_hints:?}",
+                "cluster did not finalize the same epoch before deadline: finalized_nodes={}, required_finalized_nodes={}, unique_hashes={}, block_counts={:?}, catch_up_hints={catch_up_hints:?}",
                 finalized_nodes,
+                required_finalized_nodes,
                 final_hashes.len(),
                 block_counts
             )));
