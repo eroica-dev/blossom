@@ -89,7 +89,7 @@ impl NodeRuntime {
         }
         state.epochchain.epochchain.extend(suffix.epochs);
         drop(state);
-        self.persist_snapshot()?;
+        self.persist_verified_tip()?;
         self.publish_epoch_commit()?;
         let next_target = self.next_epoch_target()?;
         let self_key = self.self_node().public_key();
@@ -257,6 +257,21 @@ impl NodeRuntime {
             return Ok(());
         };
         self.write_snapshot(path)
+    }
+
+    /// Persists the current verified tip without rewriting prior epochs when
+    /// an append-only certified log is configured.
+    pub(super) fn persist_verified_tip(&self) -> Result<()> {
+        let Some(log) = self.inner.certified_epoch_log.as_ref() else {
+            return self.persist_snapshot();
+        };
+        if self.inner.trust_mode != TrustMode::Verified {
+            return Err(BlossomError::InvalidConfiguration(
+                "certified epoch persistence requires verified consensus mode".to_string(),
+            ));
+        }
+        let state = self.inner.state.read().expect("state lock poisoned");
+        log.synchronize(&state.epochchain)
     }
 
     /// Fetches the first durable block for `nonce`, when a block store is configured.

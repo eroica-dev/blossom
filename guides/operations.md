@@ -2,12 +2,19 @@
 
 ## Runtime Persistence
 
-`blossom-node` supports committed runtime snapshots and durable verified block
-storage:
+`blossom-node` supports committed runtime snapshots, an append-only verified
+epoch-certificate log, and durable verified block storage:
 
 - `BLOSSOM_STATE_SNAPSHOT`
+- `BLOSSOM_CERTIFIED_EPOCH_LOG`
 - `BLOSSOM_BLOCK_STORE`
 - `BLOSSOM_BOOTSTRAP_SERVICES`
+
+Verified production nodes should configure `BLOSSOM_CERTIFIED_EPOCH_LOG`. Each
+commit then synchronizes only the new certified epoch through ShardLog; the
+JSON snapshot remains a compatibility checkpoint and is no longer rewritten
+in proportion to complete chain history. Startup validates and replays the
+certificate log from its genesis identity.
 
 The node can sync bootstrap address-book metadata, but reachability metadata
 does not change validator membership.

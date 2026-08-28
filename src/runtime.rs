@@ -61,6 +61,7 @@ use crate::blossom::{
     RoundSkipVoteBody, RoundSkipVoteMessage, SignatureTree, TrustedAcknowledgement, Verification,
     VerificationBody,
 };
+use crate::certified_log::CertifiedEpochLog;
 use crate::crypto::{PubKey, SecretSigner, Signature};
 use crate::encounter::{EncounterOutcome, EncounterPhase, EncounterRecord, EncounterRecordBody};
 use crate::error::{BlossomError, Result};
@@ -145,6 +146,10 @@ pub struct RuntimeConfig {
     pub snapshot_path: Option<PathBuf>,
     /// Optional path for durable verified block storage.
     pub block_store_path: Option<PathBuf>,
+    /// Append-only verified epoch-certificate log. This avoids rewriting the
+    /// complete snapshot history on each verified commit while preserving
+    /// crash-safe recovery of the exact certified chain.
+    pub certified_epoch_log_path: Option<PathBuf>,
     /// Append-only trusted confirmation/epoch log. This is intentionally separate
     /// from verified snapshots so enabling trusted durability cannot alter the
     /// trustless protocol.
@@ -169,6 +174,7 @@ impl RuntimeConfig {
             telemetry: TelemetryHandle::default(),
             snapshot_path: None,
             block_store_path: None,
+            certified_epoch_log_path: None,
             trusted_epoch_log_path: None,
             membership_lease_watermarks: BTreeMap::new(),
         }
@@ -272,6 +278,7 @@ impl RuntimeConfig {
             telemetry: TelemetryHandle::default(),
             snapshot_path: None,
             block_store_path: None,
+            certified_epoch_log_path: None,
             trusted_epoch_log_path: None,
             membership_lease_watermarks,
         })
@@ -286,6 +293,12 @@ impl RuntimeConfig {
     /// Enables durable verified block storage at `path`.
     pub fn with_block_store_path(mut self, path: impl Into<PathBuf>) -> Self {
         self.block_store_path = Some(path.into());
+        self
+    }
+
+    /// Enables crash-safe append-only verified epoch storage at `path`.
+    pub fn with_certified_epoch_log_path(mut self, path: impl Into<PathBuf>) -> Self {
+        self.certified_epoch_log_path = Some(path.into());
         self
     }
 
@@ -367,6 +380,7 @@ struct RuntimeInner {
     consensus_node_removal_policy: ConsensusNodeRemovalPolicy,
     snapshot_path: Option<PathBuf>,
     durable_block_store: Option<DurableBlockStore>,
+    certified_epoch_log: Option<CertifiedEpochLog>,
     trusted_epoch_log: Option<TrustedEpochLog>,
     trusted_transition_lock: Mutex<()>,
     dispatch_production_lock: Mutex<()>,

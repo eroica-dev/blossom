@@ -66,6 +66,29 @@ impl NodeRuntime {
             }
             state.epochchain = epochchain;
         }
+        if config.certified_epoch_log_path.is_some() && config.trust_mode != TrustMode::Verified {
+            return Err(BlossomError::InvalidConfiguration(
+                "certified epoch log is only applicable to TrustMode::Verified".to_string(),
+            ));
+        }
+        if config.certified_epoch_log_path.is_some() && config.trusted_epoch_log_path.is_some() {
+            return Err(BlossomError::InvalidConfiguration(
+                "runtime cannot configure both certified and trusted epoch logs".to_string(),
+            ));
+        }
+        let certified_epoch_log = match config.certified_epoch_log_path.as_ref() {
+            Some(path) => {
+                let (store, recovered) = CertifiedEpochLog::open(
+                    path,
+                    state.self_node.public_key(),
+                    &state.epochchain,
+                    state.consensus_node_removal_policy,
+                )?;
+                state.epochchain = recovered;
+                Some(store)
+            }
+            None => None,
+        };
         if config.trusted_epoch_log_path.is_some() && !config.trust_mode.is_trusted() {
             return Err(BlossomError::InvalidConfiguration(
                 "trusted epoch log is only applicable to TrustMode::Trusted".to_string(),
@@ -209,6 +232,7 @@ impl NodeRuntime {
                 consensus_node_removal_policy: config.consensus_node_removal_policy,
                 snapshot_path: config.snapshot_path,
                 durable_block_store,
+                certified_epoch_log,
                 trusted_epoch_log,
                 trusted_transition_lock: Mutex::new(()),
                 dispatch_production_lock: Mutex::new(()),

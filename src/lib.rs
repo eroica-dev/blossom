@@ -41,6 +41,7 @@ pub mod block;
 pub mod block_store;
 /// Consensus protocol messages and their validation rules.
 pub mod blossom;
+mod certified_log;
 /// Public keys, signing keys, signatures, and verification helpers.
 pub mod crypto;
 /// Signed peer-encounter evidence.

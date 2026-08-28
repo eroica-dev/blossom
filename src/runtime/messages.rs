@@ -643,7 +643,7 @@ impl NodeRuntime {
             state.epochchain.epochchain.len() > before
         };
         if chain_extended {
-            self.persist_snapshot()?;
+            self.persist_verified_tip()?;
             self.publish_epoch_commit()?;
         }
         Ok(MessageReceipt::accepted("reconcile_commit"))
@@ -755,7 +755,7 @@ impl NodeRuntime {
             return Ok(MessageReceipt::accepted("verification"));
         }
         if chain_extended {
-            self.persist_snapshot()?;
+            self.persist_verified_tip()?;
             self.publish_epoch_commit()?;
         }
         Ok(MessageReceipt::accepted("verification"))
@@ -846,7 +846,7 @@ impl NodeRuntime {
             }
         }
         if chain_extended {
-            self.persist_snapshot()?;
+            self.persist_verified_tip()?;
             self.publish_epoch_commit()?;
         }
         Ok(MessageReceipt::accepted("proposal"))
@@ -883,7 +883,7 @@ impl NodeRuntime {
             }
         }
         if chain_extended {
-            self.persist_snapshot()?;
+            self.persist_verified_tip()?;
             self.publish_epoch_commit()?;
         }
         Ok(MessageReceipt::accepted("commit"))

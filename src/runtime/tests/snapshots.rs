@@ -37,6 +37,96 @@ fn runtime_snapshot_round_trips_committed_state_without_secret_key() {
 }
 
 #[test]
+fn verified_certified_epoch_log_recovers_new_tip_without_rewriting_snapshot_history() {
+    let keypairs = (0..6).map(|_| Keypair::generate()).collect::<Vec<_>>();
+    let nodes = keypairs
+        .iter()
+        .enumerate()
+        .map(|(index, keypair)| {
+            NodeIdentity::new(
+                keypair.public,
+                (index == 0).then_some(keypair.secret.clone()),
+                "tcp",
+                "127.0.0.1",
+                8_400 + index as u16,
+                false,
+            )
+        })
+        .collect::<Vec<_>>();
+    let genesis = genesis_epoch(nodes.clone());
+    let root = tempfile::tempdir().unwrap();
+    let snapshot_path = root.path().join("runtime-snapshot.json");
+    let certified_log_path = root.path().join("certified-epochs");
+    let lagging_log_path = root.path().join("lagging-certified-epochs");
+    let mut lagging_config = RuntimeConfig::new(nodes[0].clone());
+    lagging_config.genesis = Some(genesis.clone());
+    lagging_config.certified_epoch_log_path = Some(lagging_log_path.clone());
+    drop(NodeRuntime::try_new(lagging_config).unwrap());
+    let mut config = RuntimeConfig::new(nodes[0].clone());
+    config.genesis = Some(genesis.clone());
+    config.snapshot_path = Some(snapshot_path.clone());
+    config.certified_epoch_log_path = Some(certified_log_path.clone());
+    let runtime = NodeRuntime::try_new(config).unwrap();
+    runtime.write_snapshot(&snapshot_path).unwrap();
+
+    let target = runtime.next_epoch_target().unwrap();
+    receive_proposal_supermajority(&runtime, &keypairs, &target, b"certified-log-commit");
+    let round_peers = {
+        let mut state = runtime.inner.state.write().expect("state lock poisoned");
+        state
+            .get_mut_consensus(&target.last_epoch, target.nonce)
+            .peers(0)
+    };
+    for peer in round_peers.iter().take(4) {
+        let signer = keypairs
+            .iter()
+            .find(|keypair| keypair.public == *peer)
+            .unwrap();
+        let body = certified_commit_body(&runtime, signer, &target, 0);
+        runtime
+            .receive_message(Msg::Commit(Commit {
+                header: signed_test_header(signer, &target, MSGKey::Commit, &body),
+                body,
+            }))
+            .unwrap();
+    }
+    assert_eq!(runtime.epochchain().epochchain.len(), 2);
+    assert_eq!(
+        RuntimeSnapshotV1::read_json(&snapshot_path)
+            .unwrap()
+            .epochchain
+            .epochchain
+            .len(),
+        1,
+        "verified commit must not rewrite the full JSON history"
+    );
+    let ahead_snapshot_path = root.path().join("ahead-runtime-snapshot.json");
+    runtime.write_snapshot(&ahead_snapshot_path).unwrap();
+    let ahead_snapshot = RuntimeSnapshotV1::read_json(&ahead_snapshot_path).unwrap();
+    let mut upgraded = RuntimeConfig::from_snapshot(ahead_snapshot, nodes[0].clone()).unwrap();
+    upgraded.certified_epoch_log_path = Some(lagging_log_path.clone());
+    let upgraded = NodeRuntime::try_new(upgraded).unwrap();
+    assert_eq!(upgraded.epochchain().epochchain.len(), 2);
+    drop(upgraded);
+    drop(runtime);
+
+    let snapshot = RuntimeSnapshotV1::read_json(&snapshot_path).unwrap();
+    let mut restored = RuntimeConfig::from_snapshot(snapshot, nodes[0].clone()).unwrap();
+    restored.snapshot_path = Some(snapshot_path);
+    restored.certified_epoch_log_path = Some(certified_log_path);
+    let restored = NodeRuntime::try_new(restored).unwrap();
+    assert_eq!(restored.epochchain().epochchain.len(), 2);
+    assert_eq!(restored.status().unwrap().last_epoch_nonce, target.nonce);
+    drop(restored);
+
+    let mut recovered_lagging = RuntimeConfig::new(nodes[0].clone());
+    recovered_lagging.genesis = Some(genesis);
+    recovered_lagging.certified_epoch_log_path = Some(lagging_log_path);
+    let recovered_lagging = NodeRuntime::try_new(recovered_lagging).unwrap();
+    assert_eq!(recovered_lagging.epochchain().epochchain.len(), 2);
+}
+
+#[test]
 fn verified_membership_watch_is_quorum_renewed_and_fail_closed() {
     let (runtime, keypairs, _) = runtime_with_peers();
     let receiver = runtime.watch_verified_membership();

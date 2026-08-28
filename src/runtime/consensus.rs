@@ -1114,7 +1114,7 @@ impl NodeRuntime {
             }
         }
         if chain_extended {
-            self.persist_snapshot()?;
+            self.persist_verified_tip()?;
             self.publish_epoch_commit()?;
         }
         Ok(Some(message))

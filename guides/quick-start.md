@@ -32,6 +32,7 @@ cargo run --bin blossom-node -- \
   --port 8080 \
   --state-snapshot ./var/blossom-node-8080.snapshot.json \
   --block-store ./var/blossom-node-8080.blocks \
+  --certified-epoch-log ./var/blossom-node-8080.certified-epochs \
   --bootstrap-services ./var/bootstrap-services.json \
   --sync-bootstrap-address-books
 ```
@@ -57,6 +58,9 @@ blossom = { package = "blossom-consensus", version = "2.0.0" }
 ```
 
 - Use the default features for verified Global Blossom.
+- Use `RuntimeConfig::with_certified_epoch_log_path` in verified mode to append
+  each quorum-certified epoch durably without rewriting the complete JSON
+  snapshot history on every commit.
 - Use `default-features = false` for the minimal protocol core, then add only
   the features listed in [Feature Flags](feature-flags.md).
 - Add `active-active` for durable application commands, ordered application,

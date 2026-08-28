@@ -10,6 +10,9 @@ public Rust APIs and separately versions consensus and durable wire formats.
 
 ### Added
 
+- Verified runtimes can persist quorum-certified epochs in a crash-safe
+  append-only ShardLog via `RuntimeConfig::with_certified_epoch_log_path`,
+  avoiding an O(history) JSON snapshot rewrite on every commit.
 - Authenticated membership-lease vote and install RPCs can share the existing
   group-routed TCP listener. Requests bind the requester, group, epoch,
   challenge, and absolute expiry, with bounded payloads and independent
