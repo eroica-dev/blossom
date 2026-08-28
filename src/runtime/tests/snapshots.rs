@@ -516,6 +516,38 @@ fn catch_up_from_epoch_started_accepts_extending_chain_and_rejects_corruption() 
 }
 
 #[test]
+fn epochchain_range_returns_only_the_bounded_nonce_suffix() {
+    let (runtime, _keypairs, _) = runtime_with_peers();
+    let genesis = runtime.epochchain().epochchain[0].clone();
+    {
+        let mut state = runtime.inner.state.write().expect("state lock poisoned");
+        for nonce in 1..=6 {
+            let mut epoch = genesis.clone();
+            epoch.body.nonce = Nonce::new(nonce);
+            epoch.set_hash();
+            state.epochchain.epochchain.push(epoch);
+        }
+    }
+
+    let range = runtime.epochchain_range(Nonce::new(3), 2);
+
+    assert_eq!(
+        range
+            .epochchain
+            .iter()
+            .map(|epoch| epoch.body.nonce.value())
+            .collect::<Vec<_>>(),
+        vec![3, 4]
+    );
+    assert!(
+        runtime
+            .epochchain_range(Nonce::new(7), 2)
+            .epochchain
+            .is_empty()
+    );
+}
+
+#[test]
 fn durable_block_store_serves_submitted_blocks_by_nonce() {
     let keypair = Keypair::generate();
     let node = NodeIdentity::new(

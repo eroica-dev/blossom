@@ -20,12 +20,17 @@ impl NodeRuntime {
     pub fn epochchain_range(&self, from_nonce: Nonce, max_epochs: usize) -> EpochChain {
         let max_epochs = max_epochs.min(4096);
         let state = self.inner.state.read().expect("state lock poisoned");
+        let first = state
+            .epochchain
+            .epochchain
+            .partition_point(|epoch| epoch.body.nonce < from_nonce);
         EpochChain {
             epochchain: state
                 .epochchain
                 .epochchain
+                .get(first..)
+                .unwrap_or_default()
                 .iter()
-                .filter(|epoch| epoch.body.nonce.value() >= from_nonce.value())
                 .take(max_epochs)
                 .cloned()
                 .collect(),
