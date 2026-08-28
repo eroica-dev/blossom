@@ -204,6 +204,43 @@ async fn handle_request_returns_direct_pong_without_consensus() {
 }
 
 #[tokio::test]
+async fn event_driven_driver_wakes_from_a_distinct_runtime_view() {
+    let (node, keypair) = tcp_node();
+    let runtime = node.runtime.clone();
+    let target = runtime.next_epoch_target().unwrap();
+    let driver = TcpNode::new(runtime.clone());
+    let driver_task = tokio::spawn(driver.run_consensus_driver(ConsensusDriverConfig {
+        interval: Duration::from_secs(60),
+        event_driven: true,
+        require_local_pending_block: true,
+        ..ConsensusDriverConfig::default()
+    }));
+    tokio::task::yield_now().await;
+
+    let mut block = Block::default();
+    block.body.last_epoch = target.last_epoch;
+    block.body.nonce = target.nonce;
+    block
+        .body
+        .txs
+        .push(Transaction::new("shared-runtime-driver-wake"));
+    block.sign(&keypair.secret);
+    runtime.submit_block(block).unwrap();
+
+    tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            if runtime.status().unwrap().last_epoch_nonce == target.nonce {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .expect("direct submission should wake the event-driven runtime without polling");
+    driver_task.abort();
+}
+
+#[tokio::test]
 async fn handle_request_serves_durable_blocks_by_hash() {
     let keypair = Keypair::generate();
     let identity = NodeIdentity::new(

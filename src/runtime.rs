@@ -34,7 +34,7 @@ use std::sync::{Arc, Mutex, RwLock};
 use borsh::{BorshDeserialize, BorshSerialize};
 use indextreemap::IndexTreeMap;
 use serde::{Deserialize, Serialize};
-use tokio::sync::watch;
+use tokio::sync::{Notify, watch};
 
 use crate::address_book::{
     AddressBook, Service, ServiceKind, SignedServiceRecord,
@@ -386,6 +386,7 @@ struct RuntimeInner {
     dispatch_production_lock: Mutex<()>,
     telemetry: TelemetryHandle,
     next_telemetry_span_id: AtomicU64,
+    consensus_driver_notify: Notify,
     epoch_commit_tx: watch::Sender<Nonce>,
     verified_membership_tx: watch::Sender<Arc<VerifiedMembershipView>>,
     membership_lease_watermarks:

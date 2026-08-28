@@ -1433,6 +1433,9 @@ impl NodeRuntime {
             })
         })();
         self.finish_telemetry_span(span, &result);
+        if result.is_ok() {
+            self.notify_consensus_driver();
+        }
         result
     }
 

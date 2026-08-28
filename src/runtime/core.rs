@@ -238,6 +238,7 @@ impl NodeRuntime {
                 dispatch_production_lock: Mutex::new(()),
                 telemetry: config.telemetry,
                 next_telemetry_span_id: AtomicU64::new(1),
+                consensus_driver_notify: Notify::new(),
                 epoch_commit_tx,
                 verified_membership_tx,
                 membership_lease_watermarks: Mutex::new(config.membership_lease_watermarks),
@@ -258,6 +259,18 @@ impl NodeRuntime {
     /// Returns the runtime execution mode.
     pub fn mode(&self) -> RuntimeMode {
         self.inner.mode
+    }
+
+    /// Waits until local admission or an inbound protocol message makes the
+    /// consensus driver eligible to advance.
+    pub(crate) async fn consensus_driver_notified(&self) {
+        self.inner.consensus_driver_notify.notified().await;
+    }
+
+    /// Wakes the consensus driver shared by every transport view of this
+    /// runtime. `Notify` coalesces redundant protocol progress into one tick.
+    pub(crate) fn notify_consensus_driver(&self) {
+        self.inner.consensus_driver_notify.notify_one();
     }
 
     /// Returns the consensus group served by this runtime.

@@ -7,7 +7,6 @@ use std::time::{Duration, Instant};
 
 use fast_telemetry::Counter;
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::Notify;
 
 use crate::address_book::{Service, ServiceKind};
 #[cfg(feature = "availability-gossip")]
@@ -39,7 +38,6 @@ pub struct TcpNode {
     pub services: TcpServiceClient,
     metrics: Option<TcpNodeMetrics>,
     application_handler: Option<ApplicationHandler>,
-    driver_notify: Arc<Notify>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -122,7 +120,6 @@ impl TcpNode {
             services: TcpServiceClient::new(),
             metrics: None,
             application_handler: None,
-            driver_notify: Arc::new(Notify::new()),
         }
     }
 
@@ -132,7 +129,6 @@ impl TcpNode {
             services,
             metrics: None,
             application_handler: None,
-            driver_notify: Arc::new(Notify::new()),
         }
     }
 
@@ -142,7 +138,6 @@ impl TcpNode {
             services: TcpServiceClient::new(),
             metrics: Some(metrics),
             application_handler: None,
-            driver_notify: Arc::new(Notify::new()),
         }
     }
 
@@ -155,7 +150,6 @@ impl TcpNode {
             services: TcpServiceClient::new(),
             metrics: None,
             application_handler: Some(Arc::new(handler)),
-            driver_notify: Arc::new(Notify::new()),
         }
     }
 
@@ -218,7 +212,7 @@ impl TcpNode {
             let notified = if config.event_driven {
                 tokio::select! {
                     _ = interval.tick() => false,
-                    _ = self.driver_notify.notified() => true,
+                    _ = self.runtime.consensus_driver_notified() => true,
                 }
             } else {
                 interval.tick().await;
@@ -744,18 +738,11 @@ impl TcpNode {
 
     pub async fn handle_request_frame(&self, request: WireRequestFrame) -> Result<WireResponse> {
         match request {
-            WireRequestFrame::Request(request) => {
-                let drives_consensus = request_drives_consensus(&request);
-                let response = self.handle_request(request).await;
-                if drives_consensus && response.is_ok() {
-                    self.driver_notify.notify_one();
-                }
-                response
-            }
+            WireRequestFrame::Request(request) => self.handle_request(request).await,
             WireRequestFrame::HotDispatch(dispatch) => {
                 let response =
                     WireResponse::MessageReceipt(self.runtime.receive_hot_dispatch(dispatch)?);
-                self.driver_notify.notify_one();
+                self.runtime.notify_consensus_driver();
                 Ok(response)
             }
         }
@@ -969,9 +956,10 @@ impl TcpMultiGroupNode {
                     .runtime
                     .group_for_epoch(&dispatch.header.last_epoch)
                     .ok_or_else(|| unknown_epoch_group(dispatch.header.last_epoch))?;
-                Ok(WireResponse::MessageReceipt(
-                    runtime.receive_hot_dispatch(dispatch)?,
-                ))
+                let response =
+                    WireResponse::MessageReceipt(runtime.receive_hot_dispatch(dispatch)?);
+                runtime.notify_consensus_driver();
+                Ok(response)
             }
         }
     }
@@ -1019,7 +1007,8 @@ async fn handle_runtime_request(
     services: &TcpServiceClient,
     request: WireRequest,
 ) -> Result<WireResponse> {
-    match request {
+    let drives_consensus = request_drives_consensus(&request);
+    let response = match request {
         WireRequest::Health => Ok(WireResponse::Health(NodeHealth::new(
             "ok",
             runtime.self_node().public_key(),
@@ -1142,7 +1131,11 @@ async fn handle_runtime_request(
         WireRequest::Group { group_id, .. } => Err(BlossomError::WireProtocol(format!(
             "nested grouped request for group {group_id} is not allowed"
         ))),
+    };
+    if drives_consensus && response.is_ok() {
+        runtime.notify_consensus_driver();
     }
+    response
 }
 
 fn unknown_group(group_id: ConsensusGroupId) -> BlossomError {
