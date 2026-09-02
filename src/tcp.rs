@@ -204,7 +204,7 @@ impl TcpNode {
 
     pub async fn run_consensus_driver(self, config: ConsensusDriverConfig) -> Result<()> {
         let mut interval = tokio::time::interval(config.interval);
-        let mut active_nonce = None;
+        let mut active_target = None;
         interval.tick().await;
         loop {
             if config.event_driven {
@@ -215,19 +215,36 @@ impl TcpNode {
             } else {
                 interval.tick().await;
             }
-            if config.require_local_pending_block {
+            let drive_target = if config.require_local_pending_block {
                 let status = self.runtime.status()?;
-                if active_nonce.is_some_and(|nonce| nonce != status.next_nonce) {
-                    active_nonce = None;
+                let observed_target = EpochTarget {
+                    group_id: status.group_id,
+                    last_epoch: status.last_epoch,
+                    nonce: status.next_nonce,
+                };
+                if active_target
+                    .as_ref()
+                    .is_some_and(|target| target != &observed_target)
+                {
+                    active_target = None;
                 }
-                if active_nonce.is_none() {
+                if active_target.is_none() {
                     if status.pending_blocks == 0 {
                         continue;
                     }
-                    active_nonce = Some(status.next_nonce);
+                    active_target = Some(observed_target);
                 }
-            }
-            if let Err(error) = self.drive_consensus_once(&config).await {
+                let Some(target) = active_target.clone() else {
+                    continue;
+                };
+                target
+            } else {
+                self.runtime.next_epoch_target()?
+            };
+            if let Err(error) = self
+                .drive_consensus_once_for_target(&config, &drive_target)
+                .await
+            {
                 if config.continue_after_error {
                     self.runtime.emit_telemetry_failure(
                         "service",
@@ -247,8 +264,25 @@ impl TcpNode {
         &self,
         config: &ConsensusDriverConfig,
     ) -> Result<ConsensusDriverTick> {
-        let mut tick = ConsensusDriverTick::default();
         let drive_target = self.runtime.next_epoch_target()?;
+        self.drive_consensus_once_for_target(config, &drive_target)
+            .await
+    }
+
+    /// Drives one consensus tick only for the target selected by the caller.
+    ///
+    /// Autonomous and manually scheduled drivers bind their pending-work
+    /// authority before yielding so a delayed tick cannot resume on a later
+    /// epoch that has not crossed its application admission barrier.
+    pub async fn drive_consensus_once_for_target(
+        &self,
+        config: &ConsensusDriverConfig,
+        drive_target: &EpochTarget,
+    ) -> Result<ConsensusDriverTick> {
+        let mut tick = ConsensusDriverTick::default();
+        if self.runtime.next_epoch_target()? != *drive_target {
+            return Ok(tick);
+        }
         let catch_up_peers = self.runtime.epoch_started_catch_up_services()?;
         if !catch_up_peers.is_empty() {
             tick.catch_up_updates = self
@@ -276,7 +310,7 @@ impl TcpNode {
             );
             tick.epoch_started_broadcasts += 1;
         }
-        if self.runtime.next_epoch_target()? != drive_target {
+        if self.runtime.next_epoch_target()? != *drive_target {
             return Ok(tick);
         }
         let drive_prefill = config.drive_prefill
@@ -285,17 +319,20 @@ impl TcpNode {
             && config.max_round > 0
             && self
                 .runtime
-                .try_broadcast_prefill_dispatch()
+                .try_broadcast_prefill_dispatch_for_target(drive_target)
                 .await?
                 .is_some()
         {
             tick.prefill_broadcasts += 1;
         }
 
+        if self.runtime.next_epoch_target()? != *drive_target {
+            return Ok(tick);
+        }
         if drive_prefill && config.max_round > 0 && !self.runtime.try_activate_prefill_round()? {
             return Ok(tick);
         }
-        if self.runtime.next_epoch_target()? != drive_target {
+        if self.runtime.next_epoch_target()? != *drive_target {
             return Ok(tick);
         }
 
@@ -312,7 +349,7 @@ impl TcpNode {
         if config.drive_dispatch
             && let Some(dispatch) = self
                 .runtime
-                .try_produce_dispatch_for_target(round, Some(&drive_target))?
+                .try_produce_dispatch_for_target(round, Some(drive_target))?
         {
             let blocks_hash = dispatch.body.blocks_hash;
             let report = self
@@ -325,7 +362,7 @@ impl TcpNode {
             }
             tick.dispatch_broadcasts += 1;
         }
-        if self.runtime.next_epoch_target()? != drive_target {
+        if self.runtime.next_epoch_target()? != *drive_target {
             return Ok(tick);
         }
         if self.runtime.trust_mode().is_trusted()
@@ -342,7 +379,7 @@ impl TcpNode {
             }
             tick.trusted_acknowledgement_broadcasts += 1;
         }
-        if self.runtime.next_epoch_target()? != drive_target {
+        if self.runtime.next_epoch_target()? != *drive_target {
             return Ok(tick);
         }
         if let Some(verification) = self.runtime.try_produce_verification(round)? {
@@ -365,7 +402,7 @@ impl TcpNode {
                     .complete_trusted_verification(round, blocks_hash)?;
             }
         }
-        if self.runtime.next_epoch_target()? != drive_target {
+        if self.runtime.next_epoch_target()? != *drive_target {
             return Ok(tick);
         }
         if self.runtime.trust_mode().is_trusted() {
@@ -398,7 +435,7 @@ impl TcpNode {
             }
             tick.proposal_broadcasts += 1;
         }
-        if self.runtime.next_epoch_target()? != drive_target {
+        if self.runtime.next_epoch_target()? != *drive_target {
             return Ok(tick);
         }
         if let Some(proposal) = self.runtime.try_produce_false_proposal(round)? {
@@ -411,7 +448,7 @@ impl TcpNode {
             }
             tick.proposal_broadcasts += 1;
         }
-        if self.runtime.next_epoch_target()? != drive_target {
+        if self.runtime.next_epoch_target()? != *drive_target {
             return Ok(tick);
         }
         let finality_collectors = if self.runtime.is_final_consensus_round(round)? {

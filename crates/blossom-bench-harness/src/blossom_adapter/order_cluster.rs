@@ -721,7 +721,8 @@ impl BlossomTcpOrderCluster {
             }
             let node = node.clone();
             let config = config.clone();
-            drives.spawn(async move { node.drive_consensus_once(&config).await });
+            drives
+                .spawn(async move { node.drive_consensus_once_for_target(&config, &target).await });
         }
         let mut errors = Vec::new();
         while let Some(result) = drives.join_next().await {
