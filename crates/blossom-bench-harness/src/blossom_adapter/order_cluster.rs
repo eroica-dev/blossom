@@ -602,7 +602,10 @@ impl BlossomTcpOrderCluster {
             }
             let node = node.clone();
             let max_round = self.max_round;
-            drives.spawn(async move { node.drive_prefill_stage_once(max_round).await });
+            drives.spawn(async move {
+                node.drive_prefill_stage_once_for_target(max_round, &target)
+                    .await
+            });
         }
         let mut errors = Vec::new();
         while let Some(result) = drives.join_next().await {

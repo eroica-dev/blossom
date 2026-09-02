@@ -17,7 +17,7 @@ use crate::group::ConsensusGroupId;
 use crate::hash::HashType;
 use crate::messages::Msg;
 use crate::overlay::{BroadcastReceipt, BroadcastReport};
-use crate::runtime::{MultiGroupRuntime, NodeRuntime};
+use crate::runtime::{EpochTarget, MultiGroupRuntime, NodeRuntime};
 use crate::service_client::TcpServiceClient;
 use crate::wire::{
     AddressBookUpdate, ApplicationRequest, ApplicationResponse, EncodedFrame, NodeHealth, NodePong,
@@ -479,20 +479,33 @@ impl TcpNode {
     /// Manual protocol harnesses use this before ordinary round dispatch so a
     /// writer's queued block cannot be consumed twice.
     pub async fn drive_prefill_stage_once(&self, max_round: u8) -> Result<ConsensusDriverTick> {
+        let drive_target = self.runtime.next_epoch_target()?;
+        self.drive_prefill_stage_once_for_target(max_round, &drive_target)
+            .await
+    }
+
+    /// Drives verified v2 prefill only for the target selected by the caller.
+    ///
+    /// Cluster-wide manual drivers bind the target before spawning work so a
+    /// delayed task cannot emit an empty prefill for the following epoch.
+    pub async fn drive_prefill_stage_once_for_target(
+        &self,
+        max_round: u8,
+        drive_target: &EpochTarget,
+    ) -> Result<ConsensusDriverTick> {
         let mut tick = ConsensusDriverTick::default();
         if self.runtime.trust_mode().is_trusted() || max_round == 0 {
             return Ok(tick);
         }
-        let drive_target = self.runtime.next_epoch_target()?;
         if self
             .runtime
-            .try_broadcast_prefill_dispatch()
+            .try_broadcast_prefill_dispatch_for_target(drive_target)
             .await?
             .is_some()
         {
             tick.prefill_broadcasts = 1;
         }
-        if self.runtime.next_epoch_target()? != drive_target {
+        if self.runtime.next_epoch_target()? != *drive_target {
             return Ok(tick);
         }
         self.runtime.try_activate_prefill_round()?;
