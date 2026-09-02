@@ -172,6 +172,136 @@ async fn manual_driver_never_advances_beyond_the_requested_epoch() {
     }
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn scheduled_prefill_cannot_dispatch_after_its_target_advances() {
+    let _test_guard = NATIVE_CLUSTER_TEST_LOCK.lock().await;
+    let cluster = BlossomTcpOrderCluster::start_with_options(
+        6,
+        QuorumSize::new(3).unwrap(),
+        TrustMode::Verified,
+        ConsensusDriverConfig {
+            interval: Duration::from_millis(5),
+            event_driven: false,
+            max_round: 1,
+            drive_prefill: false,
+            drive_dispatch: true,
+            require_local_pending_block: false,
+            continue_after_error: true,
+        },
+        Duration::from_secs(30),
+    )
+    .await
+    .unwrap();
+    let scheduled_target = cluster.cluster.node(0).runtime.next_epoch_target().unwrap();
+    let (epoch, sample, _) = cluster
+        .finalize_transactions(&[vec![Transaction::new("scheduled-prefill")]])
+        .await
+        .unwrap();
+    cluster
+        .wait_for_converged_epoch(sample.nonce, epoch.hash)
+        .await
+        .unwrap();
+
+    let node = cluster.cluster.node(0);
+    let advanced_target = node.runtime.next_epoch_target().unwrap();
+    assert_eq!(advanced_target.nonce, scheduled_target.nonce.new_next());
+    let round = node.runtime.current_consensus_round().unwrap();
+    assert!(
+        node.runtime
+            .consensus_round_status(round)
+            .unwrap()
+            .dispatch_status
+            .is_none(),
+        "the next epoch must remain behind the application admission barrier"
+    );
+
+    let tick = cluster.drivers[0]
+        .drive_prefill_stage_once_for_target(cluster.max_round, &scheduled_target)
+        .await
+        .unwrap();
+
+    assert_eq!(tick.prefill_broadcasts, 0);
+    assert_eq!(node.runtime.next_epoch_target().unwrap(), advanced_target);
+    let round = node.runtime.current_consensus_round().unwrap();
+    assert!(
+        node.runtime
+            .consensus_round_status(round)
+            .unwrap()
+            .dispatch_status
+            .is_none(),
+        "stale scheduled work must not dispatch before next-epoch admission"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn autonomous_driver_keeps_pending_authority_bound_to_scheduled_target() {
+    let _test_guard = NATIVE_CLUSTER_TEST_LOCK.lock().await;
+    let cluster = BlossomTcpOrderCluster::start_with_options(
+        6,
+        QuorumSize::new(3).unwrap(),
+        TrustMode::Verified,
+        ConsensusDriverConfig {
+            interval: Duration::from_millis(5),
+            event_driven: false,
+            max_round: 1,
+            drive_prefill: false,
+            drive_dispatch: true,
+            require_local_pending_block: true,
+            continue_after_error: true,
+        },
+        Duration::from_secs(30),
+    )
+    .await
+    .unwrap();
+    let scheduled_target = cluster.cluster.node(0).runtime.next_epoch_target().unwrap();
+    let (epoch, sample, _) = cluster
+        .finalize_transactions(&[vec![Transaction::new("autonomous-target")]])
+        .await
+        .unwrap();
+    cluster
+        .wait_for_converged_epoch(sample.nonce, epoch.hash)
+        .await
+        .unwrap();
+
+    let node = cluster.cluster.node(0);
+    let advanced_target = node.runtime.next_epoch_target().unwrap();
+    assert_eq!(advanced_target.nonce, scheduled_target.nonce.new_next());
+
+    let tick = cluster.drivers[0]
+        .drive_consensus_once_for_target(&cluster.driver, &scheduled_target)
+        .await
+        .unwrap();
+
+    assert_eq!(tick.broadcasts(), 0);
+    assert_eq!(node.runtime.next_epoch_target().unwrap(), advanced_target);
+    let round = node.runtime.current_consensus_round().unwrap();
+    assert!(
+        node.runtime
+            .consensus_round_status(round)
+            .unwrap()
+            .dispatch_status
+            .is_none(),
+        "stale autonomous work must not dispatch before successor admission"
+    );
+
+    let successor_block = cluster
+        .cluster
+        .signed_block_for(0, 0, [Transaction::new("successor-admission")])
+        .await
+        .unwrap();
+    match cluster
+        .cluster
+        .request(0, WireRequest::SubmitBlock(successor_block))
+        .await
+        .unwrap()
+    {
+        WireResponse::BlockAccepted(accepted) => {
+            assert_eq!(accepted.nonce, advanced_target.nonce);
+        }
+        response => panic!("expected successor block accepted, got {}", response.kind()),
+    }
+}
+
 #[tokio::test]
 async fn trusted_tcp_cluster_orders_all_parallel_writer_blocks_by_hash() {
     let _test_guard = NATIVE_CLUSTER_TEST_LOCK.lock().await;

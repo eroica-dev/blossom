@@ -203,11 +203,24 @@ impl NodeRuntime {
         broadcast_wire_request_pooled(request, targets, &self.inner.network_client).await
     }
 
-    /// Builds and broadcasts this node's next prefill dispatch.
-    pub async fn broadcast_prefill_dispatch(&self) -> Result<PrefillDispatchBroadcastReport> {
+    async fn broadcast_prefill_dispatch_for_target(
+        &self,
+        required_target: Option<&EpochTarget>,
+    ) -> Result<Option<PrefillDispatchBroadcastReport>> {
         let mut plan = self.prefill_dispatch_plan()?;
         let target = plan.target.clone();
+        if required_target.is_some_and(|required| required != &target) {
+            return Ok(None);
+        }
         let (dispatch, pending_recipients) = {
+            let _production = self
+                .inner
+                .dispatch_production_lock
+                .lock()
+                .expect("dispatch production lock poisoned");
+            if self.next_epoch_target()? != target {
+                return Ok(None);
+            }
             let retry = self
                 .inner
                 .prefill_dispatch_retry
@@ -222,7 +235,7 @@ impl NodeRuntime {
             match retry {
                 Some(retry) => (retry.dispatch, retry.pending_recipients),
                 None => {
-                    let dispatch = self.dispatch_local_block(0)?;
+                    let dispatch = self.dispatch_local_block_locked(0, target.clone())?;
                     {
                         let mut state = self.inner.state.write().expect("state lock poisoned");
                         state.record_prefill_dispatch(&dispatch)?;
@@ -283,21 +296,43 @@ impl NodeRuntime {
             }
         }
 
-        Ok(PrefillDispatchBroadcastReport {
+        Ok(Some(PrefillDispatchBroadcastReport {
             plan,
             dispatch,
             broadcast,
-        })
+        }))
+    }
+
+    /// Builds and broadcasts this node's next prefill dispatch.
+    pub async fn broadcast_prefill_dispatch(&self) -> Result<PrefillDispatchBroadcastReport> {
+        loop {
+            if let Some(report) = self.broadcast_prefill_dispatch_for_target(None).await? {
+                return Ok(report);
+            }
+            tokio::task::yield_now().await;
+        }
     }
 
     /// Broadcasts prefill state only when the runtime has work to send.
     pub async fn try_broadcast_prefill_dispatch(
         &self,
     ) -> Result<Option<PrefillDispatchBroadcastReport>> {
+        let target = self.next_epoch_target()?;
+        self.try_broadcast_prefill_dispatch_for_target(&target)
+            .await
+    }
+
+    pub(crate) async fn try_broadcast_prefill_dispatch_for_target(
+        &self,
+        required_target: &EpochTarget,
+    ) -> Result<Option<PrefillDispatchBroadcastReport>> {
         if self.quorum_round_count()? <= 1 {
             return Ok(None);
         }
         let target = self.next_epoch_target()?;
+        if &target != required_target {
+            return Ok(None);
+        }
         let retry_complete = self
             .inner
             .prefill_dispatch_retry
@@ -312,7 +347,8 @@ impl NodeRuntime {
         if retry_complete {
             return Ok(None);
         }
-        self.broadcast_prefill_dispatch().await.map(Some)
+        self.broadcast_prefill_dispatch_for_target(Some(required_target))
+            .await
     }
 
     /// Seeds buffered prefill dispatches into the specified active round.
